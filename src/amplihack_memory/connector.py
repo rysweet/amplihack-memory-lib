@@ -1,23 +1,26 @@
-"""Memory connector for database lifecycle management."""
+"""Memory connector factory for database lifecycle management."""
 
-import sqlite3
 from pathlib import Path
+from typing import List
 
-from .exceptions import InvalidExperienceError
+from .backends.base import MemoryBackend
+from .backends.kuzu_backend import KuzuBackend
+from .backends.sqlite_backend import SQLiteBackend
 from .experience import Experience, ExperienceType
 
 
 class MemoryConnector:
     """Database connection management for agent memory.
 
-    Handles SQLite database creation, schema management, and
-    agent memory isolation.
+    Factory class that delegates to specific backend implementations.
+    Provides a unified interface regardless of storage backend.
 
     Attributes:
         agent_name: Name of the agent (used for isolation)
         storage_path: Directory for database files
         max_memory_mb: Maximum storage size in MB
         enable_compression: Whether to enable compression
+        backend: Backend type ('kuzu' or 'sqlite')
     """
 
     def __init__(
@@ -26,6 +29,7 @@ class MemoryConnector:
         storage_path: Path | None = None,
         max_memory_mb: int = 100,
         enable_compression: bool = True,
+        backend: str = "kuzu",
     ):
         """Initialize memory connector.
 
@@ -34,9 +38,10 @@ class MemoryConnector:
             storage_path: Storage directory (defaults to ~/.amplihack/memory/<agent>)
             max_memory_mb: Maximum storage size in MB
             enable_compression: Enable automatic compression
+            backend: Backend type ('kuzu' or 'sqlite', default: 'kuzu')
 
         Raises:
-            ValueError: If agent_name is invalid
+            ValueError: If agent_name is invalid or backend is unknown
             PermissionError: If storage_path is not writable
         """
         # Validate agent_name
@@ -46,6 +51,7 @@ class MemoryConnector:
         self.agent_name = agent_name.strip()
         self.max_memory_mb = max_memory_mb
         self.enable_compression = enable_compression
+        self.backend_type = backend
 
         # Validate max_memory_mb
         if max_memory_mb <= 0:
@@ -62,92 +68,28 @@ class MemoryConnector:
         except PermissionError as e:
             raise PermissionError(f"Cannot create storage directory: {storage_path}") from e
 
-        # Database file path
-        self.db_path = self.storage_path / "experiences.db"
-
-        # Initialize database
-        self._connection = None
-        self._initialize_database()
-
-    def _initialize_database(self):
-        """Initialize SQLite database with schema."""
-        try:
-            self._connection = sqlite3.connect(
-                str(self.db_path),
-                check_same_thread=False,
-                timeout=10.0,  # Wait up to 10 seconds for locks (concurrent access)
+        # Initialize backend
+        if backend == "kuzu":
+            db_path = self.storage_path / "kuzu_db"
+            self._backend: MemoryBackend = KuzuBackend(
+                db_path=db_path,
+                agent_name=agent_name,
+                max_memory_mb=max_memory_mb,
+                enable_compression=enable_compression,
             )
-            self._connection.row_factory = sqlite3.Row
-
-            # Enable Write-Ahead Logging for better concurrency
-            self._connection.execute("PRAGMA journal_mode=WAL")
-
-            # Create experiences table
-            self._connection.execute("""
-                CREATE TABLE IF NOT EXISTS experiences (
-                    experience_id TEXT PRIMARY KEY,
-                    agent_name TEXT NOT NULL,
-                    experience_type TEXT NOT NULL,
-                    context TEXT NOT NULL,
-                    outcome TEXT NOT NULL,
-                    confidence REAL NOT NULL,
-                    timestamp INTEGER NOT NULL,
-                    metadata TEXT,
-                    tags TEXT,
-                    compressed INTEGER DEFAULT 0
-                )
-            """)
-
-            # Create indexes
-            self._connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_agent_name ON experiences(agent_name)"
+        elif backend == "sqlite":
+            db_path = self.storage_path / "experiences.db"
+            self._backend: MemoryBackend = SQLiteBackend(
+                db_path=db_path,
+                agent_name=agent_name,
+                max_memory_mb=max_memory_mb,
+                enable_compression=enable_compression,
             )
-            self._connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_experience_type ON experiences(experience_type)"
-            )
-            self._connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_timestamp ON experiences(timestamp)"
-            )
-            self._connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_confidence ON experiences(confidence)"
-            )
-            self._connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_agent_type ON experiences(agent_name, experience_type)"
-            )
+        else:
+            raise ValueError(f"Unknown backend: {backend}. Use 'kuzu' or 'sqlite'.")
 
-            # Create FTS5 virtual table for full-text search
-            self._connection.execute("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS experiences_fts
-                USING fts5(experience_id, context, outcome, content='experiences')
-            """)
-
-            # Create triggers to keep FTS in sync
-            self._connection.execute("""
-                CREATE TRIGGER IF NOT EXISTS experiences_fts_insert AFTER INSERT ON experiences
-                BEGIN
-                    INSERT INTO experiences_fts(experience_id, context, outcome)
-                    VALUES (new.experience_id, new.context, new.outcome);
-                END
-            """)
-
-            self._connection.execute("""
-                CREATE TRIGGER IF NOT EXISTS experiences_fts_delete AFTER DELETE ON experiences
-                BEGIN
-                    DELETE FROM experiences_fts WHERE experience_id = old.experience_id;
-                END
-            """)
-
-            self._connection.commit()
-
-        except sqlite3.DatabaseError as e:
-            error_msg = str(e).lower()
-            if (
-                "corrupted" in error_msg
-                or "malformed" in error_msg
-                or "not a database" in error_msg
-            ):
-                raise Exception(f"Database corrupted: {e}")
-            raise
+        # Store db_path for compatibility
+        self.db_path = db_path
 
     def store_experience(self, experience: Experience) -> str:
         """Store an experience in the database.
@@ -161,50 +103,14 @@ class MemoryConnector:
         Raises:
             InvalidExperienceError: If experience is invalid
         """
-        import json
-
-        # Validate experience
-        if not experience.context.strip():
-            raise InvalidExperienceError("context cannot be empty")
-        if not experience.outcome.strip():
-            raise InvalidExperienceError("outcome cannot be empty")
-        if not (0.0 <= experience.confidence <= 1.0):
-            raise InvalidExperienceError("confidence must be between 0.0 and 1.0")
-
-        # Convert to database format
-        metadata_json = json.dumps(experience.metadata) if experience.metadata else "{}"
-        tags_json = json.dumps(experience.tags) if experience.tags else "[]"
-
-        self._connection.execute(
-            """
-            INSERT INTO experiences (
-                experience_id, agent_name, experience_type,
-                context, outcome, confidence, timestamp,
-                metadata, tags, compressed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-        """,
-            (
-                experience.experience_id,
-                self.agent_name,
-                experience.experience_type.value,
-                experience.context,
-                experience.outcome,
-                experience.confidence,
-                int(experience.timestamp.timestamp()),
-                metadata_json,
-                tags_json,
-            ),
-        )
-
-        self._connection.commit()
-        return experience.experience_id
+        return self._backend.store_experience(experience)
 
     def retrieve_experiences(
         self,
         limit: int | None = None,
         experience_type: ExperienceType | None = None,
         min_confidence: float = 0.0,
-    ) -> list[Experience]:
+    ) -> List[Experience]:
         """Retrieve experiences for this agent.
 
         Args:
@@ -215,50 +121,59 @@ class MemoryConnector:
         Returns:
             List of experiences sorted by recency
         """
-        import json
-        from datetime import datetime
+        return self._backend.retrieve_experiences(
+            limit=limit,
+            experience_type=experience_type,
+            min_confidence=min_confidence,
+        )
 
-        query = """
-            SELECT * FROM experiences
-            WHERE agent_name = ?
-            AND confidence >= ?
+    def search(
+        self,
+        query: str,
+        experience_type: ExperienceType | None = None,
+        min_confidence: float = 0.0,
+        limit: int = 10,
+    ) -> List[Experience]:
+        """Search experiences by text query.
+
+        Args:
+            query: Search query (text)
+            experience_type: Filter by experience type
+            min_confidence: Minimum confidence threshold
+            limit: Maximum results
+
+        Returns:
+            List of matching experiences
         """
-        params = [self.agent_name, min_confidence]
+        return self._backend.search(
+            query=query,
+            experience_type=experience_type,
+            min_confidence=min_confidence,
+            limit=limit,
+        )
 
-        if experience_type:
-            query += " AND experience_type = ?"
-            params.append(experience_type.value)
+    def get_statistics(self) -> dict:
+        """Get storage statistics.
 
-        query += " ORDER BY timestamp DESC"
-
-        if limit:
-            query += " LIMIT ?"
-            params.append(limit)
-
-        cursor = self._connection.execute(query, params)
-        rows = cursor.fetchall()
-
-        experiences = []
-        for row in rows:
-            exp = Experience(
-                experience_id=row["experience_id"],
-                experience_type=ExperienceType(row["experience_type"]),
-                context=row["context"],
-                outcome=row["outcome"],
-                confidence=row["confidence"],
-                timestamp=datetime.fromtimestamp(row["timestamp"]),
-                metadata=json.loads(row["metadata"]) if row["metadata"] else {},
-                tags=json.loads(row["tags"]) if row["tags"] else [],
-            )
-            experiences.append(exp)
-
-        return experiences
+        Returns:
+            Dictionary with statistics
+        """
+        return self._backend.get_statistics()
 
     def close(self) -> None:
         """Close database connection."""
-        if self._connection:
-            self._connection.close()
-            self._connection = None
+        if self._backend:
+            self._backend.close()
+            self._backend = None
+
+    @property
+    def _connection(self):
+        """Get underlying connection for backward compatibility.
+
+        Returns:
+            Database connection object (type depends on backend)
+        """
+        return self._backend.get_connection()
 
     def __enter__(self):
         """Context manager entry."""
