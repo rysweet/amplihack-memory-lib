@@ -508,6 +508,241 @@ class TestAgentIsolation:
 
 
 # ==================================================================
+# ENTITY EXTRACTION AND RETRIEVAL
+# ==================================================================
+
+
+class TestEntityExtraction:
+    """Tests for _extract_entity_name and entity-centric retrieval."""
+
+    def test_extract_multi_word_name(self, cm):
+        assert cm._extract_entity_name("", "Sarah Chen") == "sarah chen"
+
+    def test_extract_apostrophe_name(self, cm):
+        result = cm._extract_entity_name("Dr. O'Brien is a researcher", "")
+        assert "o'brien" in result
+
+    def test_extract_hyphenated_name(self, cm):
+        result = cm._extract_entity_name("Al-Hassan won the award", "")
+        assert "al-hassan" in result
+
+    def test_extract_from_concept_first(self, cm):
+        result = cm._extract_entity_name("some content", "Johannes Klaebo")
+        assert result == "johannes klaebo"
+
+    def test_extract_empty_returns_empty(self, cm):
+        assert cm._extract_entity_name("", "") == ""
+
+    def test_extract_no_proper_noun(self, cm):
+        # No capitalized word after position 0
+        assert cm._extract_entity_name("all lowercase text here", "") == ""
+
+    def test_store_fact_sets_entity_name(self, cm):
+        cm.store_fact("Sarah Chen", "Sarah Chen is a biologist", confidence=0.9)
+        facts = cm.get_all_facts()
+        assert len(facts) == 1
+        assert facts[0].entity_name == "sarah chen"
+
+    def test_retrieve_by_entity(self, cm):
+        cm.store_fact("Sarah Chen", "Sarah Chen is a biologist", confidence=0.9)
+        cm.store_fact("Sarah Chen hobbies", "Sarah Chen enjoys hiking", confidence=0.8)
+        cm.store_fact("Bob Smith", "Bob Smith is an engineer", confidence=0.7)
+
+        results = cm.retrieve_by_entity("Sarah Chen")
+        assert len(results) == 2
+        concepts = {r.concept for r in results}
+        assert "Sarah Chen" in concepts or "Sarah Chen hobbies" in concepts
+
+    def test_retrieve_by_entity_case_insensitive(self, cm):
+        cm.store_fact("Sarah Chen", "Sarah Chen is a biologist", confidence=0.9)
+        results = cm.retrieve_by_entity("sarah chen")
+        assert len(results) == 1
+
+    def test_retrieve_by_entity_fallback_to_content(self, cm):
+        # Store a fact where the entity name extraction might not work
+        # but the entity appears in content/concept
+        cm.store_fact("biology", "study of living organisms", confidence=0.8)
+        results = cm.retrieve_by_entity("biology")
+        assert len(results) == 1
+
+    def test_retrieve_by_entity_empty_returns_empty(self, cm):
+        assert cm.retrieve_by_entity("") == []
+        assert cm.retrieve_by_entity("   ") == []
+
+
+# ==================================================================
+# CONCEPT SEARCH
+# ==================================================================
+
+
+class TestConceptSearch:
+    def test_search_by_concept_basic(self, cm):
+        cm.store_fact("Python", "Python is interpreted", confidence=0.9)
+        cm.store_fact("Rust", "Rust is compiled", confidence=0.8)
+        cm.store_fact("Go", "Go has goroutines", confidence=0.7)
+
+        results = cm.search_by_concept(["Python"])
+        assert len(results) >= 1
+        assert any("Python" in r.concept or "python" in r.content.lower() for r in results)
+
+    def test_search_by_concept_multiple_keywords(self, cm):
+        cm.store_fact("Python", "Python is interpreted", confidence=0.9)
+        cm.store_fact("Rust", "Rust is compiled", confidence=0.8)
+
+        results = cm.search_by_concept(["Python", "Rust"])
+        assert len(results) == 2
+
+    def test_search_by_concept_deduplicates(self, cm):
+        cm.store_fact("Python language", "Python is popular", confidence=0.9)
+        # "Python" and "language" should both match the same fact
+        results = cm.search_by_concept(["Python", "language"])
+        assert len(results) == 1
+
+    def test_search_by_concept_skips_short_keywords(self, cm):
+        cm.store_fact("Python", "Python is interpreted", confidence=0.9)
+        results = cm.search_by_concept(["it", "is"])
+        assert len(results) == 0  # "it" and "is" are <= 2 chars
+
+    def test_search_by_concept_empty_returns_empty(self, cm):
+        assert cm.search_by_concept([]) == []
+
+
+# ==================================================================
+# AGGREGATION QUERIES
+# ==================================================================
+
+
+class TestAggregation:
+    def test_count_total(self, cm):
+        cm.store_fact("A", "fact 1")
+        cm.store_fact("B", "fact 2")
+        cm.store_fact("C", "fact 3")
+
+        result = cm.execute_aggregation("count_total")
+        assert result["count"] == 3
+        assert result["query_type"] == "count_total"
+
+    def test_count_total_empty(self, cm):
+        result = cm.execute_aggregation("count_total")
+        assert result["count"] == 0
+
+    def test_count_entities(self, cm):
+        cm.store_fact("Sarah Chen", "Sarah Chen is a biologist", confidence=0.9)
+        cm.store_fact("Bob Smith", "Bob Smith is an engineer", confidence=0.8)
+        cm.store_fact("generic", "no entity here", confidence=0.7)
+
+        result = cm.execute_aggregation("count_entities")
+        assert result["count"] >= 2
+
+    def test_list_entities(self, cm):
+        cm.store_fact("Sarah Chen", "Sarah Chen is a biologist", confidence=0.9)
+        cm.store_fact("Bob Smith", "Bob Smith is an engineer", confidence=0.8)
+
+        result = cm.execute_aggregation("list_entities")
+        assert result["count"] >= 2
+        assert "items" in result
+
+    def test_count_concepts(self, cm):
+        cm.store_fact("Python", "Python is interpreted")
+        cm.store_fact("Rust", "Rust is compiled")
+        cm.store_fact("Go", "Go has goroutines")
+
+        result = cm.execute_aggregation("count_concepts")
+        assert result["count"] == 3
+
+    def test_list_concepts(self, cm):
+        cm.store_fact("Python", "Python is interpreted")
+        cm.store_fact("Rust", "Rust is compiled")
+
+        result = cm.execute_aggregation("list_concepts")
+        assert result["count"] == 2
+        assert "Python" in result["items"]
+        assert "Rust" in result["items"]
+
+    def test_list_concepts_with_filter(self, cm):
+        cm.store_fact("Python", "Python is interpreted")
+        cm.store_fact("Rust", "Rust is compiled")
+
+        result = cm.execute_aggregation("list_concepts", entity_filter="python")
+        assert result["count"] == 1
+        assert "Python" in result["items"]
+
+    def test_count_by_concept(self, cm):
+        cm.store_fact("Python", "fact 1")
+        cm.store_fact("Python", "fact 2")
+        cm.store_fact("Rust", "fact 3")
+
+        result = cm.execute_aggregation("count_by_concept")
+        assert result["count"] == 2
+        assert result["items"]["Python"] == 2
+        assert result["items"]["Rust"] == 1
+        assert result["total_facts"] == 3
+
+    def test_unknown_query_type_returns_error(self, cm):
+        result = cm.execute_aggregation("unknown_type")
+        assert result["count"] == 0
+        assert "error" in result
+
+
+# ==================================================================
+# SUPERSEDES DETECTION
+# ==================================================================
+
+
+class TestSupersedesDetection:
+    def test_detect_contradiction(self, cm):
+        result = cm._detect_contradiction(
+            "Klaebo has 10 golds", "Klaebo has 9 golds",
+            "Klaebo medals", "Klaebo medals",
+        )
+        assert result.get("contradiction") is True
+        assert "conflicting_values" in result
+
+    def test_no_contradiction_same_numbers(self, cm):
+        result = cm._detect_contradiction(
+            "Klaebo has 10 golds", "Klaebo has 10 golds",
+            "Klaebo medals", "Klaebo medals",
+        )
+        assert result == {}
+
+    def test_no_contradiction_different_concepts(self, cm):
+        result = cm._detect_contradiction(
+            "Klaebo has 10 golds", "Python version 3",
+            "Klaebo", "Python",
+        )
+        assert result == {}
+
+    def test_supersedes_edge_created(self, cm):
+        # Store old fact with temporal_index=1
+        cm.store_fact(
+            "Klaebo medals", "Klaebo has 9 golds",
+            temporal_metadata={"temporal_index": 1},
+        )
+        # Store new fact with temporal_index=2 (should supersede)
+        cm.store_fact(
+            "Klaebo medals", "Klaebo has 10 golds",
+            temporal_metadata={"temporal_index": 2},
+        )
+
+        # Check that SUPERSEDES edge exists
+        result = cm._conn.execute(
+            """
+            MATCH (a:SemanticMemory)-[r:SUPERSEDES]->(b:SemanticMemory)
+            WHERE a.agent_id = $aid
+            RETURN a.content, b.content, r.reason
+            """,
+            {"aid": cm.agent_name},
+        )
+        rows = []
+        while result.has_next():
+            rows.append(result.get_next())
+        assert len(rows) >= 1
+        # The newer fact should supersede the older one
+        assert "10" in rows[0][0]  # new fact
+        assert "9" in rows[0][1]   # old fact
+
+
+# ==================================================================
 # BACKWARD COMPATIBILITY
 # ==================================================================
 

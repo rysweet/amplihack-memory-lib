@@ -9,11 +9,12 @@ node table.
 """
 
 import json
+import re
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import kuzu
 
@@ -109,6 +110,7 @@ _NODE_TABLES = [
         tags STRING,
         metadata STRING,
         created_at INT64,
+        entity_name STRING DEFAULT '',
         PRIMARY KEY(node_id)
     )
     """,
@@ -178,6 +180,13 @@ _REL_TABLES = [
     CREATE REL TABLE IF NOT EXISTS ATTENDED_TO(
         FROM SensoryMemory TO EpisodicMemory,
         attended_at INT64
+    )
+    """,
+    """
+    CREATE REL TABLE IF NOT EXISTS SUPERSEDES(
+        FROM SemanticMemory TO SemanticMemory,
+        reason STRING,
+        temporal_delta STRING
     )
     """,
 ]
@@ -725,13 +734,18 @@ class CognitiveMemory:
     ) -> str:
         """Store a semantic fact.
 
+        Auto-extracts entity name for entity-centric indexing.
+        Detects and creates SUPERSEDES edges when newer temporal data
+        updates an existing fact about the same entity.
+
         Args:
             concept: The concept or topic.
             content: Factual content.
             confidence: Confidence score (0.0 - 1.0).
             source_id: Origin reference.
             tags: Categorisation tags.
-            temporal_metadata: Optional structured metadata.
+            temporal_metadata: Optional structured metadata with keys like
+                source_date, temporal_order, temporal_index.
 
         Returns:
             node_id of the stored fact.
@@ -740,6 +754,9 @@ class CognitiveMemory:
         now = _ts_now()
         tags_json = json.dumps(tags) if tags else "[]"
         meta_json = json.dumps(temporal_metadata) if temporal_metadata else "{}"
+
+        # Extract entity name for entity-centric indexing
+        entity_name = self._extract_entity_name(content, concept)
 
         self._conn.execute(
             """
@@ -752,7 +769,8 @@ class CognitiveMemory:
                 source_id: $src,
                 tags: $tags,
                 metadata: $meta,
-                created_at: $ts
+                created_at: $ts,
+                entity_name: $ename
             })
             """,
             {
@@ -765,8 +783,14 @@ class CognitiveMemory:
                 "tags": tags_json,
                 "meta": meta_json,
                 "ts": now,
+                "ename": entity_name,
             },
         )
+
+        # Detect and create SUPERSEDES edges for temporal updates
+        if temporal_metadata and temporal_metadata.get("temporal_index", 0) > 0:
+            self._detect_supersedes(node_id, content, concept, temporal_metadata)
+
         return node_id
 
     def search_facts(
@@ -812,7 +836,8 @@ class CognitiveMemory:
               AND s.confidence >= $minc
               AND ({where_kw})
             RETURN s.node_id, s.concept, s.content, s.confidence,
-                   s.source_id, s.tags, s.metadata, s.created_at
+                   s.source_id, s.tags, s.metadata, s.created_at,
+                   s.entity_name
             ORDER BY s.confidence DESC
             LIMIT $lim
             """,
@@ -834,7 +859,8 @@ class CognitiveMemory:
             MATCH (s:SemanticMemory)
             WHERE s.agent_id = $aid
             RETURN s.node_id, s.concept, s.content, s.confidence,
-                   s.source_id, s.tags, s.metadata, s.created_at
+                   s.source_id, s.tags, s.metadata, s.created_at,
+                   s.entity_name
             ORDER BY s.confidence DESC
             LIMIT $lim
             """,
@@ -859,6 +885,7 @@ class CognitiveMemory:
                     meta = json.loads(row[6])
                 except (json.JSONDecodeError, TypeError):
                     pass
+            entity_name = row[8] if len(row) > 8 else ""
             facts.append(SemanticFact(
                 node_id=row[0],
                 concept=row[1],
@@ -868,8 +895,429 @@ class CognitiveMemory:
                 tags=tags,
                 metadata=meta,
                 created_at=datetime.fromtimestamp(row[7]),
+                entity_name=entity_name or "",
             ))
         return facts
+
+    # ------------------------------------------------------------------
+    # Entity-centric retrieval and concept search
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_entity_name(content: str, concept: str) -> str:
+        """Extract the primary entity name from content or concept.
+
+        Uses simple heuristics to find proper nouns (capitalized multi-word
+        names) in the concept field first, then the content. Handles
+        apostrophe names (O'Brien), hyphenated names (Al-Hassan), and
+        multi-word proper nouns (Sarah Chen).
+
+        Args:
+            content: Fact content text.
+            concept: Concept/topic label.
+
+        Returns:
+            Lowercased entity name, or empty string if none found.
+        """
+        for text in [concept, content]:
+            if not text:
+                continue
+            # Multi-word proper nouns, including apostrophe/hyphenated names
+            matches = re.findall(
+                r"\b("
+                r"[A-Z][a-z]*(?:['\u2019\-][A-Z]?[a-z]+)+(?:\s+(?:[A-Z][a-z]+(?:['\u2019\-][A-Z]?[a-z]+)?))*"
+                r"|"
+                r"[A-Z][a-z]+(?:\s+(?:[A-Z][a-z]+(?:['\u2019\-][A-Z]?[a-z]+)?))+)"
+                r"\b",
+                text,
+            )
+            if matches:
+                best = max(matches, key=len)
+                return best.lower()
+
+            # Single capitalized word not at start of sentence
+            words = text.split()
+            for i, word in enumerate(words):
+                if i > 0 and word[0:1].isupper() and len(word) > 2:
+                    cleaned = word.strip(".,;:!?()[]{}\"'")
+                    if cleaned and cleaned[0].isupper():
+                        return cleaned.lower()
+
+        return ""
+
+    def retrieve_by_entity(
+        self,
+        entity_name: str,
+        limit: int = 50,
+    ) -> list[SemanticFact]:
+        """Retrieve ALL facts associated with a specific entity.
+
+        Uses the entity_name index for fast lookup. Falls back to
+        content/concept text search if entity_name field is empty
+        (backward compatibility with facts stored before entity extraction).
+
+        Args:
+            entity_name: Entity name to search for (case-insensitive).
+            limit: Maximum nodes to return.
+
+        Returns:
+            List of SemanticFact matching the entity.
+        """
+        if not entity_name or not entity_name.strip():
+            return []
+
+        entity_lower = entity_name.strip().lower()
+
+        # Primary: use entity_name index
+        result = self._conn.execute(
+            """
+            MATCH (s:SemanticMemory)
+            WHERE s.agent_id = $aid
+              AND LOWER(s.entity_name) CONTAINS $entity
+            RETURN s.node_id, s.concept, s.content, s.confidence,
+                   s.source_id, s.tags, s.metadata, s.created_at,
+                   s.entity_name
+            ORDER BY s.created_at DESC
+            LIMIT $lim
+            """,
+            {"aid": self.agent_name, "entity": entity_lower, "lim": limit},
+        )
+        facts = self._rows_to_facts(result)
+
+        # Fallback: text search on content/concept
+        if not facts:
+            result = self._conn.execute(
+                """
+                MATCH (s:SemanticMemory)
+                WHERE s.agent_id = $aid
+                  AND (LOWER(s.content) CONTAINS $entity
+                       OR LOWER(s.concept) CONTAINS $entity)
+                RETURN s.node_id, s.concept, s.content, s.confidence,
+                       s.source_id, s.tags, s.metadata, s.created_at,
+                       s.entity_name
+                ORDER BY s.created_at DESC
+                LIMIT $lim
+                """,
+                {"aid": self.agent_name, "entity": entity_lower, "lim": limit},
+            )
+            facts = self._rows_to_facts(result)
+
+        return facts
+
+    def search_by_concept(
+        self,
+        keywords: list[str],
+        limit: int = 30,
+    ) -> list[SemanticFact]:
+        """Search for facts by concept/content keyword matching.
+
+        Runs a Cypher query matching keywords against both the concept and
+        content fields (case-insensitive). Useful for concept-based retrieval
+        when entity names are not available in the question.
+
+        Args:
+            keywords: List of keyword strings to search for.
+            limit: Maximum nodes to return per keyword.
+
+        Returns:
+            List of SemanticFact matching any of the keywords, deduplicated.
+        """
+        if not keywords:
+            return []
+
+        facts: list[SemanticFact] = []
+        seen: set[str] = set()
+
+        for kw in keywords:
+            kw_lower = kw.strip().lower()
+            if len(kw_lower) <= 2:
+                continue
+            result = self._conn.execute(
+                """
+                MATCH (s:SemanticMemory)
+                WHERE s.agent_id = $aid
+                  AND (LOWER(s.concept) CONTAINS $kw
+                       OR LOWER(s.content) CONTAINS $kw)
+                RETURN s.node_id, s.concept, s.content, s.confidence,
+                       s.source_id, s.tags, s.metadata, s.created_at,
+                       s.entity_name
+                ORDER BY s.created_at DESC
+                LIMIT $lim
+                """,
+                {"aid": self.agent_name, "kw": kw_lower, "lim": limit},
+            )
+            for fact in self._rows_to_facts(result):
+                if fact.node_id not in seen:
+                    seen.add(fact.node_id)
+                    facts.append(fact)
+
+        return facts
+
+    def execute_aggregation(
+        self,
+        query_type: str,
+        entity_filter: str = "",
+    ) -> dict[str, Any]:
+        """Execute Cypher aggregation queries for meta-memory questions.
+
+        Supports counting, listing, and enumerating entities stored in memory.
+        Bypasses text search entirely and uses graph aggregation.
+
+        Args:
+            query_type: Type of aggregation:
+                - "count_entities": Count distinct entity names
+                - "count_concepts": Count distinct concept values
+                - "count_by_concept": Count facts grouped by concept
+                - "list_entities": List all distinct entity names
+                - "list_concepts": List all distinct concept values
+                - "count_total": Total number of facts
+            entity_filter: Optional filter string for narrowing results.
+
+        Returns:
+            Dict with aggregation results.
+        """
+        try:
+            if query_type == "count_total":
+                result = self._conn.execute(
+                    "MATCH (s:SemanticMemory) WHERE s.agent_id = $aid RETURN COUNT(s)",
+                    {"aid": self.agent_name},
+                )
+                if result.has_next():
+                    return {"count": result.get_next()[0], "query_type": query_type}
+
+            elif query_type == "count_entities":
+                result = self._conn.execute(
+                    """
+                    MATCH (s:SemanticMemory)
+                    WHERE s.agent_id = $aid AND s.entity_name <> ''
+                    RETURN COUNT(DISTINCT s.entity_name)
+                    """,
+                    {"aid": self.agent_name},
+                )
+                if result.has_next():
+                    return {"count": result.get_next()[0], "query_type": query_type}
+
+            elif query_type == "list_entities":
+                result = self._conn.execute(
+                    """
+                    MATCH (s:SemanticMemory)
+                    WHERE s.agent_id = $aid AND s.entity_name <> ''
+                    RETURN DISTINCT s.entity_name
+                    ORDER BY s.entity_name
+                    """,
+                    {"aid": self.agent_name},
+                )
+                items: list[str] = []
+                while result.has_next():
+                    items.append(result.get_next()[0])
+                return {"count": len(items), "items": items, "query_type": query_type}
+
+            elif query_type == "count_concepts":
+                result = self._conn.execute(
+                    """
+                    MATCH (s:SemanticMemory)
+                    WHERE s.agent_id = $aid AND s.concept <> ''
+                          AND s.concept <> 'SUMMARY'
+                    RETURN COUNT(DISTINCT s.concept)
+                    """,
+                    {"aid": self.agent_name},
+                )
+                if result.has_next():
+                    return {"count": result.get_next()[0], "query_type": query_type}
+
+            elif query_type == "list_concepts":
+                filter_clause = ""
+                params: dict[str, Any] = {"aid": self.agent_name}
+                if entity_filter:
+                    filter_clause = " AND LOWER(s.concept) CONTAINS $filter"
+                    params["filter"] = entity_filter.lower()
+
+                result = self._conn.execute(
+                    f"""
+                    MATCH (s:SemanticMemory)
+                    WHERE s.agent_id = $aid AND s.concept <> ''
+                          AND s.concept <> 'SUMMARY'
+                    {filter_clause}
+                    RETURN DISTINCT s.concept
+                    ORDER BY s.concept
+                    """,
+                    params,
+                )
+                items = []
+                while result.has_next():
+                    items.append(result.get_next()[0])
+                return {"count": len(items), "items": items, "query_type": query_type}
+
+            elif query_type == "count_by_concept":
+                filter_clause = ""
+                params = {"aid": self.agent_name}
+                if entity_filter:
+                    filter_clause = " AND LOWER(s.concept) CONTAINS $filter"
+                    params["filter"] = entity_filter.lower()
+
+                result = self._conn.execute(
+                    f"""
+                    MATCH (s:SemanticMemory)
+                    WHERE s.agent_id = $aid AND s.concept <> ''
+                          AND s.concept <> 'SUMMARY'
+                    {filter_clause}
+                    RETURN s.concept, COUNT(s) AS cnt
+                    ORDER BY cnt DESC
+                    """,
+                    params,
+                )
+                concept_counts: dict[str, int] = {}
+                while result.has_next():
+                    row = result.get_next()
+                    concept_counts[row[0]] = row[1]
+                return {
+                    "count": len(concept_counts),
+                    "items": concept_counts,
+                    "total_facts": sum(concept_counts.values()),
+                    "query_type": query_type,
+                }
+
+        except Exception:
+            pass
+
+        return {"count": 0, "query_type": query_type, "error": "Query failed"}
+
+    # ------------------------------------------------------------------
+    # Temporal supersede detection
+    # ------------------------------------------------------------------
+
+    def _detect_supersedes(
+        self,
+        new_node_id: str,
+        content: str,
+        concept: str,
+        temporal_metadata: dict,
+    ) -> None:
+        """Detect if a new fact supersedes an existing fact about the same entity.
+
+        At STORAGE time, checks for older facts with the same concept that have
+        a lower temporal_index. If found with conflicting numbers, creates a
+        SUPERSEDES edge (new -> old).
+
+        Args:
+            new_node_id: ID of the newly stored fact.
+            content: Content of the new fact.
+            concept: Concept label of the new fact.
+            temporal_metadata: Must contain temporal_index > 0.
+        """
+        new_temporal_idx = temporal_metadata.get("temporal_index", 0)
+        if new_temporal_idx <= 0:
+            return
+
+        try:
+            concept_key = concept.split()[0] if concept else ""
+            if not concept_key:
+                return
+
+            result = self._conn.execute(
+                """
+                MATCH (s:SemanticMemory)
+                WHERE s.agent_id = $aid
+                  AND s.node_id <> $new_id
+                  AND (LOWER(s.concept) CONTAINS LOWER($ckey)
+                       OR LOWER($ckey) CONTAINS LOWER(s.concept))
+                RETURN s.node_id, s.content, s.concept, s.metadata
+                LIMIT 20
+                """,
+                {
+                    "aid": self.agent_name,
+                    "new_id": new_node_id,
+                    "ckey": concept_key,
+                },
+            )
+
+            while result.has_next():
+                row = result.get_next()
+                old_id = row[0]
+                old_content = row[1]
+                old_meta_str = row[3]
+
+                old_meta = json.loads(old_meta_str) if old_meta_str else {}
+                old_temporal_idx = old_meta.get("temporal_index", 0)
+
+                if old_temporal_idx <= 0 or old_temporal_idx >= new_temporal_idx:
+                    continue
+
+                contradiction = self._detect_contradiction(
+                    content, old_content, concept, row[2]
+                )
+                if contradiction.get("contradiction"):
+                    temporal_delta = f"index {old_temporal_idx} -> {new_temporal_idx}"
+                    self._conn.execute(
+                        """
+                        MATCH (new_s:SemanticMemory {node_id: $new_id})
+                        MATCH (old_s:SemanticMemory {node_id: $old_id})
+                        CREATE (new_s)-[:SUPERSEDES {
+                            reason: $reason,
+                            temporal_delta: $delta
+                        }]->(old_s)
+                        """,
+                        {
+                            "new_id": new_node_id,
+                            "old_id": old_id,
+                            "reason": f"Updated values: {contradiction.get('conflicting_values', '')}",
+                            "delta": temporal_delta,
+                        },
+                    )
+        except Exception:
+            pass  # supersede detection is best-effort
+
+    @staticmethod
+    def _detect_contradiction(
+        content_a: str, content_b: str, concept_a: str, concept_b: str
+    ) -> dict:
+        """Detect if two facts about the same concept contain contradictory numbers.
+
+        Simple heuristic: if two facts share a concept and contain different
+        numbers for what appears to be the same measurement, flag as
+        contradiction.
+
+        Args:
+            content_a: Content of first fact.
+            content_b: Content of second fact.
+            concept_a: Concept of first fact.
+            concept_b: Concept of second fact.
+
+        Returns:
+            Dict with contradiction info, or empty dict if none found.
+        """
+        concept_words_a = set(concept_a.lower().split()) if concept_a else set()
+        concept_words_b = set(concept_b.lower().split()) if concept_b else set()
+
+        if not concept_words_a or not concept_words_b:
+            return {}
+
+        common = concept_words_a & concept_words_b
+        common = {w for w in common if len(w) > 2}
+        if not common:
+            return {}
+
+        nums_a = re.findall(r"\b\d+(?:\.\d+)?\b", content_a)
+        nums_b = re.findall(r"\b\d+(?:\.\d+)?\b", content_b)
+
+        if not nums_a or not nums_b:
+            return {}
+
+        nums_a_set = set(nums_a)
+        nums_b_set = set(nums_b)
+        unique_to_a = nums_a_set - nums_b_set
+        unique_to_b = nums_b_set - nums_a_set
+
+        if unique_to_a and unique_to_b:
+            return {
+                "contradiction": True,
+                "conflicting_values": (
+                    f"{', '.join(sorted(unique_to_a))} vs "
+                    f"{', '.join(sorted(unique_to_b))}"
+                ),
+            }
+
+        return {}
 
     # ==================================================================
     # PROCEDURAL MEMORY

@@ -104,6 +104,8 @@ class SemanticFact:
         tags: Categorisation tags.
         metadata: Additional structured metadata.
         created_at: When the fact was stored.
+        entity_name: Lowercased entity name extracted from content/concept
+            for entity-centric indexing.
     """
 
     node_id: str
@@ -114,6 +116,7 @@ class SemanticFact:
     tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
+    entity_name: str = ""
 
 
 @dataclass
