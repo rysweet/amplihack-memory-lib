@@ -1618,6 +1618,782 @@ class CognitiveMemory:
         stats["total"] = total
         return stats
 
+    # ==================================================================
+    # EXPORT / IMPORT
+    # ==================================================================
+
+    def export_to_json(self) -> dict[str, Any]:
+        """Export all memory nodes and edges to a JSON-serializable dict.
+
+        Queries all node tables (SemanticMemory, EpisodicMemory, ProceduralMemory,
+        ProspectiveMemory, SensoryMemory, WorkingMemory, ConsolidatedEpisode) and
+        all edge types (SIMILAR_TO, DERIVES_FROM, SUPERSEDES, CONSOLIDATES,
+        ATTENDED_TO, PROCEDURE_DERIVES_FROM) for this agent.
+
+        Returns a portable dict that can be serialized to JSON and imported into
+        another CognitiveMemory instance via ``import_from_json()``.
+
+        Returns:
+            Dict with keys for each node type, each edge type, metadata, and
+            statistics.
+        """
+        export_data: dict[str, Any] = {
+            "agent_name": self.agent_name,
+            "exported_at": datetime.now().isoformat(),
+            "format_version": "1.0",
+            "semantic_nodes": [],
+            "episodic_nodes": [],
+            "procedural_nodes": [],
+            "prospective_nodes": [],
+            "sensory_nodes": [],
+            "working_nodes": [],
+            "consolidated_nodes": [],
+            "similar_to_edges": [],
+            "derives_from_edges": [],
+            "supersedes_edges": [],
+            "consolidates_edges": [],
+            "attended_to_edges": [],
+            "procedure_derives_from_edges": [],
+            "statistics": {},
+        }
+
+        # -- Semantic nodes --
+        try:
+            result = self._conn.execute(
+                """
+                MATCH (s:SemanticMemory)
+                WHERE s.agent_id = $aid
+                RETURN s.node_id, s.concept, s.content, s.confidence,
+                       s.source_id, s.tags, s.metadata, s.created_at,
+                       s.entity_name
+                ORDER BY s.created_at ASC
+                """,
+                {"aid": self.agent_name},
+            )
+            while result.has_next():
+                row = result.get_next()
+                export_data["semantic_nodes"].append({
+                    "node_id": row[0],
+                    "concept": row[1],
+                    "content": row[2],
+                    "confidence": row[3],
+                    "source_id": row[4] or "",
+                    "tags": json.loads(row[5]) if row[5] else [],
+                    "metadata": json.loads(row[6]) if row[6] else {},
+                    "created_at": row[7],
+                    "entity_name": row[8] or "",
+                })
+        except Exception:
+            pass
+
+        # -- Episodic nodes --
+        try:
+            result = self._conn.execute(
+                """
+                MATCH (e:EpisodicMemory)
+                WHERE e.agent_id = $aid
+                RETURN e.node_id, e.content, e.source_label,
+                       e.temporal_index, e.compressed, e.metadata,
+                       e.created_at
+                ORDER BY e.temporal_index ASC
+                """,
+                {"aid": self.agent_name},
+            )
+            while result.has_next():
+                row = result.get_next()
+                export_data["episodic_nodes"].append({
+                    "node_id": row[0],
+                    "content": row[1],
+                    "source_label": row[2] or "",
+                    "temporal_index": row[3],
+                    "compressed": bool(row[4]),
+                    "metadata": json.loads(row[5]) if row[5] else {},
+                    "created_at": row[6],
+                })
+        except Exception:
+            pass
+
+        # -- Procedural nodes --
+        try:
+            result = self._conn.execute(
+                """
+                MATCH (p:ProceduralMemory)
+                WHERE p.agent_id = $aid
+                RETURN p.node_id, p.name, p.steps, p.prerequisites,
+                       p.usage_count, p.created_at
+                ORDER BY p.created_at ASC
+                """,
+                {"aid": self.agent_name},
+            )
+            while result.has_next():
+                row = result.get_next()
+                export_data["procedural_nodes"].append({
+                    "node_id": row[0],
+                    "name": row[1],
+                    "steps": json.loads(row[2]) if row[2] else [],
+                    "prerequisites": json.loads(row[3]) if row[3] else [],
+                    "usage_count": row[4],
+                    "created_at": row[5],
+                })
+        except Exception:
+            pass
+
+        # -- Prospective nodes --
+        try:
+            result = self._conn.execute(
+                """
+                MATCH (p:ProspectiveMemory)
+                WHERE p.agent_id = $aid
+                RETURN p.node_id, p.desc_text, p.trigger_condition,
+                       p.action_on_trigger, p.status, p.priority,
+                       p.created_at
+                ORDER BY p.created_at ASC
+                """,
+                {"aid": self.agent_name},
+            )
+            while result.has_next():
+                row = result.get_next()
+                export_data["prospective_nodes"].append({
+                    "node_id": row[0],
+                    "description": row[1],
+                    "trigger_condition": row[2],
+                    "action_on_trigger": row[3],
+                    "status": row[4],
+                    "priority": row[5],
+                    "created_at": row[6],
+                })
+        except Exception:
+            pass
+
+        # -- Sensory nodes --
+        try:
+            result = self._conn.execute(
+                """
+                MATCH (s:SensoryMemory)
+                WHERE s.agent_id = $aid
+                RETURN s.node_id, s.modality, s.raw_data,
+                       s.observation_order, s.expires_at, s.created_at
+                ORDER BY s.observation_order ASC
+                """,
+                {"aid": self.agent_name},
+            )
+            while result.has_next():
+                row = result.get_next()
+                export_data["sensory_nodes"].append({
+                    "node_id": row[0],
+                    "modality": row[1],
+                    "raw_data": row[2],
+                    "observation_order": row[3],
+                    "expires_at": row[4],
+                    "created_at": row[5],
+                })
+        except Exception:
+            pass
+
+        # -- Working memory nodes --
+        try:
+            result = self._conn.execute(
+                """
+                MATCH (w:WorkingMemory)
+                WHERE w.agent_id = $aid
+                RETURN w.node_id, w.slot_type, w.content,
+                       w.relevance, w.task_id, w.created_at
+                ORDER BY w.created_at ASC
+                """,
+                {"aid": self.agent_name},
+            )
+            while result.has_next():
+                row = result.get_next()
+                export_data["working_nodes"].append({
+                    "node_id": row[0],
+                    "slot_type": row[1],
+                    "content": row[2],
+                    "relevance": row[3],
+                    "task_id": row[4],
+                    "created_at": row[5],
+                })
+        except Exception:
+            pass
+
+        # -- Consolidated episode nodes --
+        try:
+            result = self._conn.execute(
+                """
+                MATCH (c:ConsolidatedEpisode)
+                WHERE c.agent_id = $aid
+                RETURN c.node_id, c.summary, c.original_count, c.created_at
+                ORDER BY c.created_at ASC
+                """,
+                {"aid": self.agent_name},
+            )
+            while result.has_next():
+                row = result.get_next()
+                export_data["consolidated_nodes"].append({
+                    "node_id": row[0],
+                    "summary": row[1],
+                    "original_count": row[2],
+                    "created_at": row[3],
+                })
+        except Exception:
+            pass
+
+        # -- SIMILAR_TO edges --
+        try:
+            result = self._conn.execute(
+                """
+                MATCH (a:SemanticMemory)-[r:SIMILAR_TO]->(b:SemanticMemory)
+                WHERE a.agent_id = $aid
+                RETURN a.node_id, b.node_id, r.similarity_score
+                """,
+                {"aid": self.agent_name},
+            )
+            while result.has_next():
+                row = result.get_next()
+                export_data["similar_to_edges"].append({
+                    "source_id": row[0],
+                    "target_id": row[1],
+                    "similarity_score": row[2],
+                })
+        except Exception:
+            pass
+
+        # -- DERIVES_FROM edges --
+        try:
+            result = self._conn.execute(
+                """
+                MATCH (s:SemanticMemory)-[r:DERIVES_FROM]->(e:EpisodicMemory)
+                WHERE s.agent_id = $aid
+                RETURN s.node_id, e.node_id, r.derived_at
+                """,
+                {"aid": self.agent_name},
+            )
+            while result.has_next():
+                row = result.get_next()
+                export_data["derives_from_edges"].append({
+                    "source_id": row[0],
+                    "target_id": row[1],
+                    "derived_at": row[2],
+                })
+        except Exception:
+            pass
+
+        # -- SUPERSEDES edges --
+        try:
+            result = self._conn.execute(
+                """
+                MATCH (newer:SemanticMemory)-[r:SUPERSEDES]->(older:SemanticMemory)
+                WHERE newer.agent_id = $aid
+                RETURN newer.node_id, older.node_id, r.reason, r.temporal_delta
+                """,
+                {"aid": self.agent_name},
+            )
+            while result.has_next():
+                row = result.get_next()
+                export_data["supersedes_edges"].append({
+                    "source_id": row[0],
+                    "target_id": row[1],
+                    "reason": row[2] or "",
+                    "temporal_delta": row[3] or "",
+                })
+        except Exception:
+            pass
+
+        # -- CONSOLIDATES edges --
+        try:
+            result = self._conn.execute(
+                """
+                MATCH (c:ConsolidatedEpisode)-[r:CONSOLIDATES]->(e:EpisodicMemory)
+                WHERE c.agent_id = $aid
+                RETURN c.node_id, e.node_id, r.consolidated_at
+                """,
+                {"aid": self.agent_name},
+            )
+            while result.has_next():
+                row = result.get_next()
+                export_data["consolidates_edges"].append({
+                    "source_id": row[0],
+                    "target_id": row[1],
+                    "consolidated_at": row[2],
+                })
+        except Exception:
+            pass
+
+        # -- ATTENDED_TO edges --
+        try:
+            result = self._conn.execute(
+                """
+                MATCH (s:SensoryMemory)-[r:ATTENDED_TO]->(e:EpisodicMemory)
+                WHERE s.agent_id = $aid
+                RETURN s.node_id, e.node_id, r.attended_at
+                """,
+                {"aid": self.agent_name},
+            )
+            while result.has_next():
+                row = result.get_next()
+                export_data["attended_to_edges"].append({
+                    "source_id": row[0],
+                    "target_id": row[1],
+                    "attended_at": row[2],
+                })
+        except Exception:
+            pass
+
+        # -- PROCEDURE_DERIVES_FROM edges --
+        try:
+            result = self._conn.execute(
+                """
+                MATCH (p:ProceduralMemory)-[r:PROCEDURE_DERIVES_FROM]->(e:EpisodicMemory)
+                WHERE p.agent_id = $aid
+                RETURN p.node_id, e.node_id, r.derived_at
+                """,
+                {"aid": self.agent_name},
+            )
+            while result.has_next():
+                row = result.get_next()
+                export_data["procedure_derives_from_edges"].append({
+                    "source_id": row[0],
+                    "target_id": row[1],
+                    "derived_at": row[2],
+                })
+        except Exception:
+            pass
+
+        # Compute statistics
+        export_data["statistics"] = {
+            "semantic_count": len(export_data["semantic_nodes"]),
+            "episodic_count": len(export_data["episodic_nodes"]),
+            "procedural_count": len(export_data["procedural_nodes"]),
+            "prospective_count": len(export_data["prospective_nodes"]),
+            "sensory_count": len(export_data["sensory_nodes"]),
+            "working_count": len(export_data["working_nodes"]),
+            "consolidated_count": len(export_data["consolidated_nodes"]),
+            "total_nodes": sum(
+                len(export_data[k])
+                for k in [
+                    "semantic_nodes", "episodic_nodes", "procedural_nodes",
+                    "prospective_nodes", "sensory_nodes", "working_nodes",
+                    "consolidated_nodes",
+                ]
+            ),
+            "total_edges": sum(
+                len(export_data[k])
+                for k in [
+                    "similar_to_edges", "derives_from_edges",
+                    "supersedes_edges", "consolidates_edges",
+                    "attended_to_edges", "procedure_derives_from_edges",
+                ]
+            ),
+        }
+
+        return export_data
+
+    def import_from_json(
+        self,
+        data: dict[str, Any],
+        merge: bool = False,
+    ) -> dict[str, Any]:
+        """Import memory from a JSON-serializable dict into this agent's graph.
+
+        Reconstructs all node types and edge types from a previously exported
+        dict (as produced by ``export_to_json()``).
+
+        Args:
+            data: Dict matching the format produced by ``export_to_json()``.
+            merge: If True, adds imported nodes to existing memory (skipping
+                   duplicates). If False, clears existing memory first.
+
+        Returns:
+            Dict with import statistics:
+                - nodes_imported: Total nodes created
+                - edges_imported: Total edges created
+                - skipped: Count of nodes skipped (already exist in merge mode)
+                - errors: Count of individual import errors
+        """
+        stats: dict[str, Any] = {
+            "nodes_imported": 0,
+            "edges_imported": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
+
+        # Validate format version
+        fmt_version = data.get("format_version", "")
+        if fmt_version and fmt_version != "1.0":
+            pass  # attempt import anyway
+
+        # Clear existing data if not merging
+        if not merge:
+            self._clear_agent_data()
+
+        # Build set of existing node IDs for merge dedup
+        existing_ids: set[str] = set()
+        if merge:
+            existing_ids = self._get_existing_node_ids()
+
+        # Helper for safe node import
+        def _import_node(query: str, params: dict, node_id: str) -> bool:
+            if node_id in existing_ids:
+                stats["skipped"] += 1
+                return False
+            try:
+                self._conn.execute(query, params)
+                stats["nodes_imported"] += 1
+                return True
+            except Exception:
+                stats["errors"] += 1
+                return False
+
+        def _import_edge(query: str, params: dict) -> bool:
+            try:
+                self._conn.execute(query, params)
+                stats["edges_imported"] += 1
+                return True
+            except Exception:
+                stats["errors"] += 1
+                return False
+
+        # -- Import EpisodicMemory nodes first (referenced by edges) --
+        for node in data.get("episodic_nodes", []):
+            nid = node.get("node_id", "")
+            if not nid:
+                stats["errors"] += 1
+                continue
+            _import_node(
+                """
+                CREATE (:EpisodicMemory {
+                    node_id: $nid, agent_id: $aid, content: $cnt,
+                    source_label: $src, temporal_index: $tidx,
+                    compressed: $comp, metadata: $meta, created_at: $ts
+                })
+                """,
+                {
+                    "nid": nid,
+                    "aid": self.agent_name,
+                    "cnt": node.get("content", ""),
+                    "src": node.get("source_label", ""),
+                    "tidx": node.get("temporal_index", 0),
+                    "comp": node.get("compressed", False),
+                    "meta": json.dumps(node.get("metadata", {})),
+                    "ts": node.get("created_at", 0),
+                },
+                nid,
+            )
+
+        # -- Import SemanticMemory nodes --
+        for node in data.get("semantic_nodes", []):
+            nid = node.get("node_id", "")
+            if not nid:
+                stats["errors"] += 1
+                continue
+            _import_node(
+                """
+                CREATE (:SemanticMemory {
+                    node_id: $nid, agent_id: $aid, concept: $con,
+                    content: $cnt, confidence: $conf, source_id: $src,
+                    tags: $tags, metadata: $meta, created_at: $ts,
+                    entity_name: $ename
+                })
+                """,
+                {
+                    "nid": nid,
+                    "aid": self.agent_name,
+                    "con": node.get("concept", ""),
+                    "cnt": node.get("content", ""),
+                    "conf": node.get("confidence", 0.8),
+                    "src": node.get("source_id", ""),
+                    "tags": json.dumps(node.get("tags", [])),
+                    "meta": json.dumps(node.get("metadata", {})),
+                    "ts": node.get("created_at", 0),
+                    "ename": node.get("entity_name", ""),
+                },
+                nid,
+            )
+
+        # -- Import ProceduralMemory nodes --
+        for node in data.get("procedural_nodes", []):
+            nid = node.get("node_id", "")
+            if not nid:
+                stats["errors"] += 1
+                continue
+            _import_node(
+                """
+                CREATE (:ProceduralMemory {
+                    node_id: $nid, agent_id: $aid, name: $name,
+                    steps: $steps, prerequisites: $prereqs,
+                    usage_count: $uc, created_at: $ts
+                })
+                """,
+                {
+                    "nid": nid,
+                    "aid": self.agent_name,
+                    "name": node.get("name", ""),
+                    "steps": json.dumps(node.get("steps", [])),
+                    "prereqs": json.dumps(node.get("prerequisites", [])),
+                    "uc": node.get("usage_count", 0),
+                    "ts": node.get("created_at", 0),
+                },
+                nid,
+            )
+
+        # -- Import ProspectiveMemory nodes --
+        for node in data.get("prospective_nodes", []):
+            nid = node.get("node_id", "")
+            if not nid:
+                stats["errors"] += 1
+                continue
+            _import_node(
+                """
+                CREATE (:ProspectiveMemory {
+                    node_id: $nid, agent_id: $aid, desc_text: $dtxt,
+                    trigger_condition: $trig, action_on_trigger: $act,
+                    status: $stat, priority: $pri, created_at: $ts
+                })
+                """,
+                {
+                    "nid": nid,
+                    "aid": self.agent_name,
+                    "dtxt": node.get("description", ""),
+                    "trig": node.get("trigger_condition", ""),
+                    "act": node.get("action_on_trigger", ""),
+                    "stat": node.get("status", "pending"),
+                    "pri": node.get("priority", 1),
+                    "ts": node.get("created_at", 0),
+                },
+                nid,
+            )
+
+        # -- Import SensoryMemory nodes --
+        for node in data.get("sensory_nodes", []):
+            nid = node.get("node_id", "")
+            if not nid:
+                stats["errors"] += 1
+                continue
+            _import_node(
+                """
+                CREATE (:SensoryMemory {
+                    node_id: $nid, agent_id: $aid, modality: $mod,
+                    raw_data: $data, observation_order: $ord,
+                    expires_at: $exp, created_at: $ts
+                })
+                """,
+                {
+                    "nid": nid,
+                    "aid": self.agent_name,
+                    "mod": node.get("modality", ""),
+                    "data": node.get("raw_data", ""),
+                    "ord": node.get("observation_order", 0),
+                    "exp": node.get("expires_at", 0),
+                    "ts": node.get("created_at", 0),
+                },
+                nid,
+            )
+
+        # -- Import WorkingMemory nodes --
+        for node in data.get("working_nodes", []):
+            nid = node.get("node_id", "")
+            if not nid:
+                stats["errors"] += 1
+                continue
+            _import_node(
+                """
+                CREATE (:WorkingMemory {
+                    node_id: $nid, agent_id: $aid, slot_type: $st,
+                    content: $cnt, relevance: $rel,
+                    task_id: $tid, created_at: $ts
+                })
+                """,
+                {
+                    "nid": nid,
+                    "aid": self.agent_name,
+                    "st": node.get("slot_type", ""),
+                    "cnt": node.get("content", ""),
+                    "rel": node.get("relevance", 1.0),
+                    "tid": node.get("task_id", ""),
+                    "ts": node.get("created_at", 0),
+                },
+                nid,
+            )
+
+        # -- Import ConsolidatedEpisode nodes --
+        for node in data.get("consolidated_nodes", []):
+            nid = node.get("node_id", "")
+            if not nid:
+                stats["errors"] += 1
+                continue
+            _import_node(
+                """
+                CREATE (:ConsolidatedEpisode {
+                    node_id: $nid, agent_id: $aid, summary: $sum,
+                    original_count: $cnt, created_at: $ts
+                })
+                """,
+                {
+                    "nid": nid,
+                    "aid": self.agent_name,
+                    "sum": node.get("summary", ""),
+                    "cnt": node.get("original_count", 0),
+                    "ts": node.get("created_at", 0),
+                },
+                nid,
+            )
+
+        # -- Import edges --
+        for edge in data.get("similar_to_edges", []):
+            _import_edge(
+                """
+                MATCH (a:SemanticMemory {node_id: $sid})
+                MATCH (b:SemanticMemory {node_id: $tid})
+                CREATE (a)-[:SIMILAR_TO {similarity_score: $score}]->(b)
+                """,
+                {
+                    "sid": edge["source_id"],
+                    "tid": edge["target_id"],
+                    "score": edge.get("similarity_score", 0.0),
+                },
+            )
+
+        for edge in data.get("derives_from_edges", []):
+            _import_edge(
+                """
+                MATCH (s:SemanticMemory {node_id: $sid})
+                MATCH (e:EpisodicMemory {node_id: $tid})
+                CREATE (s)-[:DERIVES_FROM {derived_at: $ts}]->(e)
+                """,
+                {
+                    "sid": edge["source_id"],
+                    "tid": edge["target_id"],
+                    "ts": edge.get("derived_at", 0),
+                },
+            )
+
+        for edge in data.get("supersedes_edges", []):
+            _import_edge(
+                """
+                MATCH (newer:SemanticMemory {node_id: $sid})
+                MATCH (older:SemanticMemory {node_id: $tid})
+                CREATE (newer)-[:SUPERSEDES {
+                    reason: $reason, temporal_delta: $delta
+                }]->(older)
+                """,
+                {
+                    "sid": edge["source_id"],
+                    "tid": edge["target_id"],
+                    "reason": edge.get("reason", ""),
+                    "delta": edge.get("temporal_delta", ""),
+                },
+            )
+
+        for edge in data.get("consolidates_edges", []):
+            _import_edge(
+                """
+                MATCH (c:ConsolidatedEpisode {node_id: $sid})
+                MATCH (e:EpisodicMemory {node_id: $tid})
+                CREATE (c)-[:CONSOLIDATES {consolidated_at: $ts}]->(e)
+                """,
+                {
+                    "sid": edge["source_id"],
+                    "tid": edge["target_id"],
+                    "ts": edge.get("consolidated_at", 0),
+                },
+            )
+
+        for edge in data.get("attended_to_edges", []):
+            _import_edge(
+                """
+                MATCH (s:SensoryMemory {node_id: $sid})
+                MATCH (e:EpisodicMemory {node_id: $tid})
+                CREATE (s)-[:ATTENDED_TO {attended_at: $ts}]->(e)
+                """,
+                {
+                    "sid": edge["source_id"],
+                    "tid": edge["target_id"],
+                    "ts": edge.get("attended_at", 0),
+                },
+            )
+
+        for edge in data.get("procedure_derives_from_edges", []):
+            _import_edge(
+                """
+                MATCH (p:ProceduralMemory {node_id: $sid})
+                MATCH (e:EpisodicMemory {node_id: $tid})
+                CREATE (p)-[:PROCEDURE_DERIVES_FROM {derived_at: $ts}]->(e)
+                """,
+                {
+                    "sid": edge["source_id"],
+                    "tid": edge["target_id"],
+                    "ts": edge.get("derived_at", 0),
+                },
+            )
+
+        # Update internal monotonic counters after import
+        self._sensory_order = self._load_max_order("SensoryMemory", "observation_order")
+        self._temporal_index = self._load_max_order("EpisodicMemory", "temporal_index")
+
+        return stats
+
+    def _clear_agent_data(self) -> None:
+        """Delete all nodes and edges belonging to this agent.
+
+        Used by ``import_from_json`` when ``merge=False`` to start fresh.
+        Deletes edges first (Kuzu requires this before node deletion),
+        then deletes all nodes.
+        """
+        # Delete edges referencing this agent's nodes
+        edge_queries = [
+            "MATCH (a:SemanticMemory {agent_id: $aid})-[r:SIMILAR_TO]->() DELETE r",
+            "MATCH ()-[r:SIMILAR_TO]->(b:SemanticMemory {agent_id: $aid}) DELETE r",
+            "MATCH (s:SemanticMemory {agent_id: $aid})-[r:DERIVES_FROM]->() DELETE r",
+            "MATCH (n:SemanticMemory {agent_id: $aid})-[r:SUPERSEDES]->() DELETE r",
+            "MATCH ()-[r:SUPERSEDES]->(o:SemanticMemory {agent_id: $aid}) DELETE r",
+            "MATCH (c:ConsolidatedEpisode {agent_id: $aid})-[r:CONSOLIDATES]->() DELETE r",
+            "MATCH (s:SensoryMemory {agent_id: $aid})-[r:ATTENDED_TO]->() DELETE r",
+            "MATCH (p:ProceduralMemory {agent_id: $aid})-[r:PROCEDURE_DERIVES_FROM]->() DELETE r",
+        ]
+        for query in edge_queries:
+            try:
+                self._conn.execute(query, {"aid": self.agent_name})
+            except Exception:
+                pass  # edge table may not exist yet
+
+        # Delete nodes from all tables
+        node_tables = [
+            "SemanticMemory", "EpisodicMemory", "ProceduralMemory",
+            "ProspectiveMemory", "SensoryMemory", "WorkingMemory",
+            "ConsolidatedEpisode",
+        ]
+        for table in node_tables:
+            try:
+                self._conn.execute(
+                    f"MATCH (n:{table} {{agent_id: $aid}}) DELETE n",
+                    {"aid": self.agent_name},
+                )
+            except Exception:
+                pass  # table may not exist yet
+
+    def _get_existing_node_ids(self) -> set[str]:
+        """Get all existing node IDs for this agent (for merge dedup).
+
+        Returns:
+            Set of node_id strings across all node tables.
+        """
+        ids: set[str] = set()
+        tables = [
+            "SemanticMemory", "EpisodicMemory", "ProceduralMemory",
+            "ProspectiveMemory", "SensoryMemory", "WorkingMemory",
+            "ConsolidatedEpisode",
+        ]
+        for table in tables:
+            try:
+                result = self._conn.execute(
+                    f"MATCH (n:{table} {{agent_id: $aid}}) RETURN n.node_id",
+                    {"aid": self.agent_name},
+                )
+                while result.has_next():
+                    ids.add(result.get_next()[0])
+            except Exception:
+                pass
+        return ids
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
