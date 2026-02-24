@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url>
+         <loc>https://rysweet.github.io/amplihack-memory-lib/</loc>
+         <lastmod>2026-02-24</lastmod>
+    </url>
+    <url>
+         <loc>https://rysweet.github.io/amplihack-memory-lib/api_reference/</loc>
+         <lastmod>2026-02-24</lastmod>
+    </url>
+    <url>
+         <loc>https://rysweet.github.io/amplihack-memory-lib/architecture/</loc>
+         <lastmod>2026-02-24</lastmod>
+    </url>
+    <url>
+         <loc>https://rysweet.github.io/amplihack-memory-lib/cognitive_memory/</loc>
+         <lastmod>2026-02-24</lastmod>
+    </url>
+    <url>
+         <loc>https://rysweet.github.io/amplihack-memory-lib/extending/</loc>
+         <lastmod>2026-02-24</lastmod>
+    </url>
+    <url>
+         <loc>https://rysweet.github.io/amplihack-memory-lib/hierarchical_memory/</loc>
+         <lastmod>2026-02-24</lastmod>
+    </url>
+    <url>
+         <loc>https://rysweet.github.io/amplihack-memory-lib/kuzu_backend/</loc>
+         <lastmod>2026-02-24</lastmod>
+    </url>
+</urlset>
