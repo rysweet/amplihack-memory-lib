@@ -1906,6 +1906,40 @@ class HierarchicalMemory:
 
         return ids
 
+    @staticmethod
+    def _extract_entity_name(content: str, concept: str) -> str:
+        """Extract entity name (backward-compatible static method).
+
+        Delegates to the standalone extract_entity_name() function.
+
+        Args:
+            content: Fact content text
+            concept: Concept/topic label
+
+        Returns:
+            Lowercased entity name, or empty string if none found.
+        """
+        return extract_entity_name(content, concept)
+
+    @staticmethod
+    def _detect_contradiction(
+        content_a: str, content_b: str, concept_a: str, concept_b: str
+    ) -> dict:
+        """Detect contradiction (backward-compatible static method).
+
+        Delegates to the standalone detect_contradiction() function.
+
+        Args:
+            content_a: Content of first fact
+            content_b: Content of second fact
+            concept_a: Concept of first fact
+            concept_b: Concept of second fact
+
+        Returns:
+            Dict with contradiction info, or empty dict.
+        """
+        return detect_contradiction(content_a, content_b, concept_a, concept_b)
+
     def close(self) -> None:
         """Close database connection and release resources."""
         try:
