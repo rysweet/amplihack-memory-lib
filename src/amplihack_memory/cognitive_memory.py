@@ -9,16 +9,18 @@ node table.
 """
 
 import json
+import logging
 import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 import kuzu
 
+logger = logging.getLogger(__name__)
+
 from .memory_types import (
-    ConsolidatedEpisode,
     EpisodicMemory,
     MemoryCategory,
     ProceduralMemory,
@@ -39,6 +41,7 @@ WORKING_MEMORY_CAPACITY = 20
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _new_id(prefix: str = "mem") -> str:
     """Generate a short unique id with a human-readable prefix."""
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
@@ -47,13 +50,6 @@ def _new_id(prefix: str = "mem") -> str:
 def _ts_now() -> int:
     """Current Unix timestamp as integer."""
     return int(time.time())
-
-
-def _safe_execute(conn: kuzu.Connection, query: str, params: dict | None = None):
-    """Execute a Kuzu query, returning the QueryResult or None on error."""
-    if params is None:
-        params = {}
-    return conn.execute(query, params)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +183,7 @@ _REL_TABLES = [
 # Main class
 # ---------------------------------------------------------------------------
 
+
 class CognitiveMemory:
     """Six-type cognitive memory backed by Kuzu.
 
@@ -228,8 +225,7 @@ class CognitiveMemory:
 
     def _load_max_order(self, table: str, column: str) -> int:
         result = self._conn.execute(
-            f"MATCH (n:{table}) WHERE n.agent_id = $aid "
-            f"RETURN max(n.{column})",
+            f"MATCH (n:{table}) WHERE n.agent_id = $aid RETURN max(n.{column})",
             {"aid": self.agent_name},
         )
         if result.has_next():
@@ -309,14 +305,16 @@ class CognitiveMemory:
         items: list[SensoryItem] = []
         while result.has_next():
             row = result.get_next()
-            items.append(SensoryItem(
-                node_id=row[0],
-                modality=row[1],
-                raw_data=row[2],
-                observation_order=int(row[3]),
-                expires_at=float(row[4]),
-                created_at=datetime.fromtimestamp(row[5]),
-            ))
+            items.append(
+                SensoryItem(
+                    node_id=row[0],
+                    modality=row[1],
+                    raw_data=row[2],
+                    observation_order=int(row[3]),
+                    expires_at=float(row[4]),
+                    created_at=datetime.fromtimestamp(row[5]),
+                )
+            )
         return items
 
     def attend_to_sensory(self, sensory_id: str, reason: str) -> str | None:
@@ -358,8 +356,8 @@ class CognitiveMemory:
                 """,
                 {"sid": sensory_id, "eid": ep_id, "ts": now},
             )
-        except Exception:
-            pass  # edge creation is best-effort
+        except Exception as exc:
+            logger.debug("ATTENDED_TO edge creation failed (best-effort): %s", exc)
 
         return ep_id
 
@@ -477,14 +475,16 @@ class CognitiveMemory:
         slots: list[WorkingMemorySlot] = []
         while result.has_next():
             row = result.get_next()
-            slots.append(WorkingMemorySlot(
-                node_id=row[0],
-                slot_type=row[1],
-                content=row[2],
-                relevance=float(row[3]),
-                task_id=row[4],
-                created_at=datetime.fromtimestamp(row[5]),
-            ))
+            slots.append(
+                WorkingMemorySlot(
+                    node_id=row[0],
+                    slot_type=row[1],
+                    content=row[2],
+                    relevance=float(row[3]),
+                    task_id=row[4],
+                    created_at=datetime.fromtimestamp(row[5]),
+                )
+            )
         return slots
 
     def clear_working(self, task_id: str) -> int:
@@ -659,8 +659,8 @@ class CognitiveMemory:
                     """,
                     {"cid": cons_id, "eid": ep_id, "ts": now},
                 )
-            except Exception:
-                pass  # edge creation is best-effort
+            except Exception as exc:
+                logger.debug("CONSOLIDATES edge creation failed (best-effort): %s", exc)
 
         return cons_id
 
@@ -698,16 +698,18 @@ class CognitiveMemory:
                 try:
                     meta = json.loads(row[6])
                 except (json.JSONDecodeError, TypeError):
-                    pass
-            episodes.append(EpisodicMemory(
-                node_id=row[0],
-                content=row[1],
-                source_label=row[2],
-                temporal_index=int(row[3]),
-                compressed=bool(row[4]),
-                created_at=datetime.fromtimestamp(row[5]),
-                metadata=meta,
-            ))
+                    logger.debug("Failed to parse episode metadata: %s", row[6])
+            episodes.append(
+                EpisodicMemory(
+                    node_id=row[0],
+                    content=row[1],
+                    source_label=row[2],
+                    temporal_index=int(row[3]),
+                    compressed=bool(row[4]),
+                    created_at=datetime.fromtimestamp(row[5]),
+                    metadata=meta,
+                )
+            )
         return episodes
 
     # ==================================================================
@@ -852,23 +854,25 @@ class CognitiveMemory:
                 try:
                     tags = json.loads(row[5])
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    logger.debug("Failed to parse fact tags: %s", row[5])
             meta: dict = {}
             if row[6]:
                 try:
                     meta = json.loads(row[6])
                 except (json.JSONDecodeError, TypeError):
-                    pass
-            facts.append(SemanticFact(
-                node_id=row[0],
-                concept=row[1],
-                content=row[2],
-                confidence=float(row[3]),
-                source_id=row[4] or "",
-                tags=tags,
-                metadata=meta,
-                created_at=datetime.fromtimestamp(row[7]),
-            ))
+                    logger.debug("Failed to parse fact metadata: %s", row[6])
+            facts.append(
+                SemanticFact(
+                    node_id=row[0],
+                    concept=row[1],
+                    content=row[2],
+                    confidence=float(row[3]),
+                    source_id=row[4] or "",
+                    tags=tags,
+                    metadata=meta,
+                    created_at=datetime.fromtimestamp(row[7]),
+                )
+            )
         return facts
 
     # ==================================================================
@@ -880,8 +884,6 @@ class CognitiveMemory:
         name: str,
         steps: list[str],
         prerequisites: list[str] | None = None,
-        source_id: str = "",
-        tags: list[str] | None = None,
     ) -> str:
         """Store a reusable procedure.
 
@@ -889,8 +891,6 @@ class CognitiveMemory:
             name: Human-readable procedure name.
             steps: Ordered list of step descriptions.
             prerequisites: Conditions required before executing.
-            source_id: Origin reference (unused in storage but kept for API compat).
-            tags: Categorisation tags (unused in storage but kept for API compat).
 
         Returns:
             node_id of the stored procedure.
@@ -983,21 +983,23 @@ class CognitiveMemory:
                 try:
                     steps = json.loads(row[2])
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    logger.debug("Failed to parse procedure steps: %s", row[2])
             prereqs: list[str] = []
             if row[3]:
                 try:
                     prereqs = json.loads(row[3])
                 except (json.JSONDecodeError, TypeError):
-                    pass
-            procs.append(ProceduralMemory(
-                node_id=row[0],
-                name=row[1],
-                steps=steps,
-                prerequisites=prereqs,
-                usage_count=int(row[4]),
-                created_at=datetime.fromtimestamp(row[5]),
-            ))
+                    logger.debug("Failed to parse procedure prereqs: %s", row[3])
+            procs.append(
+                ProceduralMemory(
+                    node_id=row[0],
+                    name=row[1],
+                    steps=steps,
+                    prerequisites=prereqs,
+                    usage_count=int(row[4]),
+                    created_at=datetime.fromtimestamp(row[5]),
+                )
+            )
 
         # Increment usage_count for all recalled procedures
         for proc in procs:
@@ -1090,15 +1092,17 @@ class CognitiveMemory:
         candidates: list[ProspectiveMemory] = []
         while result.has_next():
             row = result.get_next()
-            candidates.append(ProspectiveMemory(
-                node_id=row[0],
-                description=row[1],
-                trigger_condition=row[2],
-                action_on_trigger=row[3],
-                status=row[4],
-                priority=int(row[5]),
-                created_at=datetime.fromtimestamp(row[6]),
-            ))
+            candidates.append(
+                ProspectiveMemory(
+                    node_id=row[0],
+                    description=row[1],
+                    trigger_condition=row[2],
+                    action_on_trigger=row[3],
+                    status=row[4],
+                    priority=int(row[5]),
+                    created_at=datetime.fromtimestamp(row[6]),
+                )
+            )
 
         content_lower = content.lower()
         triggered: list[ProspectiveMemory] = []
