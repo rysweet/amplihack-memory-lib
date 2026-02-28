@@ -508,6 +508,241 @@ class TestAgentIsolation:
 
 
 # ==================================================================
+# ENTITY EXTRACTION AND RETRIEVAL
+# ==================================================================
+
+
+class TestEntityExtraction:
+    """Tests for _extract_entity_name and entity-centric retrieval."""
+
+    def test_extract_multi_word_name(self, cm):
+        assert cm._extract_entity_name("", "Sarah Chen") == "sarah chen"
+
+    def test_extract_apostrophe_name(self, cm):
+        result = cm._extract_entity_name("Dr. O'Brien is a researcher", "")
+        assert "o'brien" in result
+
+    def test_extract_hyphenated_name(self, cm):
+        result = cm._extract_entity_name("Al-Hassan won the award", "")
+        assert "al-hassan" in result
+
+    def test_extract_from_concept_first(self, cm):
+        result = cm._extract_entity_name("some content", "Johannes Klaebo")
+        assert result == "johannes klaebo"
+
+    def test_extract_empty_returns_empty(self, cm):
+        assert cm._extract_entity_name("", "") == ""
+
+    def test_extract_no_proper_noun(self, cm):
+        # No capitalized word after position 0
+        assert cm._extract_entity_name("all lowercase text here", "") == ""
+
+    def test_store_fact_sets_entity_name(self, cm):
+        cm.store_fact("Sarah Chen", "Sarah Chen is a biologist", confidence=0.9)
+        facts = cm.get_all_facts()
+        assert len(facts) == 1
+        assert facts[0].entity_name == "sarah chen"
+
+    def test_retrieve_by_entity(self, cm):
+        cm.store_fact("Sarah Chen", "Sarah Chen is a biologist", confidence=0.9)
+        cm.store_fact("Sarah Chen hobbies", "Sarah Chen enjoys hiking", confidence=0.8)
+        cm.store_fact("Bob Smith", "Bob Smith is an engineer", confidence=0.7)
+
+        results = cm.retrieve_by_entity("Sarah Chen")
+        assert len(results) == 2
+        concepts = {r.concept for r in results}
+        assert "Sarah Chen" in concepts or "Sarah Chen hobbies" in concepts
+
+    def test_retrieve_by_entity_case_insensitive(self, cm):
+        cm.store_fact("Sarah Chen", "Sarah Chen is a biologist", confidence=0.9)
+        results = cm.retrieve_by_entity("sarah chen")
+        assert len(results) == 1
+
+    def test_retrieve_by_entity_fallback_to_content(self, cm):
+        # Store a fact where the entity name extraction might not work
+        # but the entity appears in content/concept
+        cm.store_fact("biology", "study of living organisms", confidence=0.8)
+        results = cm.retrieve_by_entity("biology")
+        assert len(results) == 1
+
+    def test_retrieve_by_entity_empty_returns_empty(self, cm):
+        assert cm.retrieve_by_entity("") == []
+        assert cm.retrieve_by_entity("   ") == []
+
+
+# ==================================================================
+# CONCEPT SEARCH
+# ==================================================================
+
+
+class TestConceptSearch:
+    def test_search_by_concept_basic(self, cm):
+        cm.store_fact("Python", "Python is interpreted", confidence=0.9)
+        cm.store_fact("Rust", "Rust is compiled", confidence=0.8)
+        cm.store_fact("Go", "Go has goroutines", confidence=0.7)
+
+        results = cm.search_by_concept(["Python"])
+        assert len(results) >= 1
+        assert any("Python" in r.concept or "python" in r.content.lower() for r in results)
+
+    def test_search_by_concept_multiple_keywords(self, cm):
+        cm.store_fact("Python", "Python is interpreted", confidence=0.9)
+        cm.store_fact("Rust", "Rust is compiled", confidence=0.8)
+
+        results = cm.search_by_concept(["Python", "Rust"])
+        assert len(results) == 2
+
+    def test_search_by_concept_deduplicates(self, cm):
+        cm.store_fact("Python language", "Python is popular", confidence=0.9)
+        # "Python" and "language" should both match the same fact
+        results = cm.search_by_concept(["Python", "language"])
+        assert len(results) == 1
+
+    def test_search_by_concept_skips_short_keywords(self, cm):
+        cm.store_fact("Python", "Python is interpreted", confidence=0.9)
+        results = cm.search_by_concept(["it", "is"])
+        assert len(results) == 0  # "it" and "is" are <= 2 chars
+
+    def test_search_by_concept_empty_returns_empty(self, cm):
+        assert cm.search_by_concept([]) == []
+
+
+# ==================================================================
+# AGGREGATION QUERIES
+# ==================================================================
+
+
+class TestAggregation:
+    def test_count_total(self, cm):
+        cm.store_fact("A", "fact 1")
+        cm.store_fact("B", "fact 2")
+        cm.store_fact("C", "fact 3")
+
+        result = cm.execute_aggregation("count_total")
+        assert result["count"] == 3
+        assert result["query_type"] == "count_total"
+
+    def test_count_total_empty(self, cm):
+        result = cm.execute_aggregation("count_total")
+        assert result["count"] == 0
+
+    def test_count_entities(self, cm):
+        cm.store_fact("Sarah Chen", "Sarah Chen is a biologist", confidence=0.9)
+        cm.store_fact("Bob Smith", "Bob Smith is an engineer", confidence=0.8)
+        cm.store_fact("generic", "no entity here", confidence=0.7)
+
+        result = cm.execute_aggregation("count_entities")
+        assert result["count"] >= 2
+
+    def test_list_entities(self, cm):
+        cm.store_fact("Sarah Chen", "Sarah Chen is a biologist", confidence=0.9)
+        cm.store_fact("Bob Smith", "Bob Smith is an engineer", confidence=0.8)
+
+        result = cm.execute_aggregation("list_entities")
+        assert result["count"] >= 2
+        assert "items" in result
+
+    def test_count_concepts(self, cm):
+        cm.store_fact("Python", "Python is interpreted")
+        cm.store_fact("Rust", "Rust is compiled")
+        cm.store_fact("Go", "Go has goroutines")
+
+        result = cm.execute_aggregation("count_concepts")
+        assert result["count"] == 3
+
+    def test_list_concepts(self, cm):
+        cm.store_fact("Python", "Python is interpreted")
+        cm.store_fact("Rust", "Rust is compiled")
+
+        result = cm.execute_aggregation("list_concepts")
+        assert result["count"] == 2
+        assert "Python" in result["items"]
+        assert "Rust" in result["items"]
+
+    def test_list_concepts_with_filter(self, cm):
+        cm.store_fact("Python", "Python is interpreted")
+        cm.store_fact("Rust", "Rust is compiled")
+
+        result = cm.execute_aggregation("list_concepts", entity_filter="python")
+        assert result["count"] == 1
+        assert "Python" in result["items"]
+
+    def test_count_by_concept(self, cm):
+        cm.store_fact("Python", "fact 1")
+        cm.store_fact("Python", "fact 2")
+        cm.store_fact("Rust", "fact 3")
+
+        result = cm.execute_aggregation("count_by_concept")
+        assert result["count"] == 2
+        assert result["items"]["Python"] == 2
+        assert result["items"]["Rust"] == 1
+        assert result["total_facts"] == 3
+
+    def test_unknown_query_type_returns_error(self, cm):
+        result = cm.execute_aggregation("unknown_type")
+        assert result["count"] == 0
+        assert "error" in result
+
+
+# ==================================================================
+# SUPERSEDES DETECTION
+# ==================================================================
+
+
+class TestSupersedesDetection:
+    def test_detect_contradiction(self, cm):
+        result = cm._detect_contradiction(
+            "Klaebo has 10 golds", "Klaebo has 9 golds",
+            "Klaebo medals", "Klaebo medals",
+        )
+        assert result.get("contradiction") is True
+        assert "conflicting_values" in result
+
+    def test_no_contradiction_same_numbers(self, cm):
+        result = cm._detect_contradiction(
+            "Klaebo has 10 golds", "Klaebo has 10 golds",
+            "Klaebo medals", "Klaebo medals",
+        )
+        assert result == {}
+
+    def test_no_contradiction_different_concepts(self, cm):
+        result = cm._detect_contradiction(
+            "Klaebo has 10 golds", "Python version 3",
+            "Klaebo", "Python",
+        )
+        assert result == {}
+
+    def test_supersedes_edge_created(self, cm):
+        # Store old fact with temporal_index=1
+        cm.store_fact(
+            "Klaebo medals", "Klaebo has 9 golds",
+            temporal_metadata={"temporal_index": 1},
+        )
+        # Store new fact with temporal_index=2 (should supersede)
+        cm.store_fact(
+            "Klaebo medals", "Klaebo has 10 golds",
+            temporal_metadata={"temporal_index": 2},
+        )
+
+        # Check that SUPERSEDES edge exists
+        result = cm._conn.execute(
+            """
+            MATCH (a:SemanticMemory)-[r:SUPERSEDES]->(b:SemanticMemory)
+            WHERE a.agent_id = $aid
+            RETURN a.content, b.content, r.reason
+            """,
+            {"aid": cm.agent_name},
+        )
+        rows = []
+        while result.has_next():
+            rows.append(result.get_next())
+        assert len(rows) >= 1
+        # The newer fact should supersede the older one
+        assert "10" in rows[0][0]  # new fact
+        assert "9" in rows[0][1]   # old fact
+
+
+# ==================================================================
 # BACKWARD COMPATIBILITY
 # ==================================================================
 
@@ -549,3 +784,277 @@ class TestBackwardCompatibility:
         exp_id = conn.store_experience(exp)
         assert exp_id is not None
         conn.close()
+
+
+# ==================================================================
+# EXPORT / IMPORT
+# ==================================================================
+
+
+class TestExportImport:
+    """Tests for export_to_json() and import_from_json()."""
+
+    def test_export_empty_memory(self, cm):
+        data = cm.export_to_json()
+        assert data["agent_name"] == "test-agent"
+        assert data["format_version"] == "1.0"
+        assert data["statistics"]["total_nodes"] == 0
+        assert data["statistics"]["total_edges"] == 0
+        for key in [
+            "semantic_nodes", "episodic_nodes", "procedural_nodes",
+            "prospective_nodes", "sensory_nodes", "working_nodes",
+            "consolidated_nodes",
+        ]:
+            assert data[key] == []
+
+    def test_export_semantic_nodes(self, cm):
+        cm.store_fact("Biology", "Photosynthesis converts light", confidence=0.9)
+        cm.store_fact("Physics", "E equals mc squared", confidence=0.95)
+
+        data = cm.export_to_json()
+        assert len(data["semantic_nodes"]) == 2
+        assert data["statistics"]["semantic_count"] == 2
+        # Verify fields are present
+        node = data["semantic_nodes"][0]
+        assert "node_id" in node
+        assert "concept" in node
+        assert "content" in node
+        assert "confidence" in node
+        assert "entity_name" in node
+
+    def test_export_episodic_nodes(self, cm):
+        cm.store_episode("User asked about photosynthesis", "session-1")
+        cm.store_episode("System analyzed code", "session-2")
+
+        data = cm.export_to_json()
+        assert len(data["episodic_nodes"]) == 2
+        assert data["statistics"]["episodic_count"] == 2
+
+    def test_export_procedural_nodes(self, cm):
+        cm.store_procedure("Deploy service", ["build", "test", "push", "deploy"])
+
+        data = cm.export_to_json()
+        assert len(data["procedural_nodes"]) == 1
+        assert data["procedural_nodes"][0]["name"] == "Deploy service"
+        assert len(data["procedural_nodes"][0]["steps"]) == 4
+
+    def test_export_prospective_nodes(self, cm):
+        cm.store_prospective(
+            "Remind about tests",
+            "code change detected",
+            "run test suite",
+            priority=2,
+        )
+
+        data = cm.export_to_json()
+        assert len(data["prospective_nodes"]) == 1
+        assert data["prospective_nodes"][0]["description"] == "Remind about tests"
+        assert data["prospective_nodes"][0]["priority"] == 2
+
+    def test_export_sensory_nodes(self, cm):
+        cm.record_sensory("text", "Hello world", ttl_seconds=3600)
+
+        data = cm.export_to_json()
+        assert len(data["sensory_nodes"]) == 1
+        assert data["sensory_nodes"][0]["modality"] == "text"
+
+    def test_export_working_nodes(self, cm):
+        cm.push_working("goal", "Implement auth", task_id="task-1")
+
+        data = cm.export_to_json()
+        assert len(data["working_nodes"]) == 1
+        assert data["working_nodes"][0]["task_id"] == "task-1"
+
+    def test_export_supersedes_edges(self, cm):
+        cm.store_fact(
+            "Klaebo medals",
+            "Klaebo has 9 gold medals",
+            temporal_metadata={"temporal_index": 1},
+        )
+        cm.store_fact(
+            "Klaebo medals",
+            "Klaebo has 10 gold medals",
+            temporal_metadata={"temporal_index": 2},
+        )
+
+        data = cm.export_to_json()
+        assert len(data["supersedes_edges"]) == 1
+
+    def test_roundtrip_semantic(self, cm, tmp_path):
+        """Export from one instance, import into another, verify data."""
+        # Populate source
+        cm.store_fact("Math", "Pi is approximately 3.14159", confidence=0.99)
+        cm.store_fact("History", "Rome was founded in 753 BC", confidence=0.85)
+        cm.store_episode("Session started", "test-session")
+
+        # Export
+        data = cm.export_to_json()
+
+        # Create a new instance and import
+        target_db = tmp_path / "import_target"
+        target = CognitiveMemory(agent_name="imported-agent", db_path=target_db)
+        try:
+            stats = target.import_from_json(data)
+            assert stats["nodes_imported"] == 3  # 2 semantic + 1 episodic
+            assert stats["errors"] == 0
+            assert stats["skipped"] == 0
+
+            # Verify data exists in target
+            facts = target.get_all_facts(limit=10)
+            assert len(facts) == 2
+            contents = {f.content for f in facts}
+            assert "Pi is approximately 3.14159" in contents
+            assert "Rome was founded in 753 BC" in contents
+        finally:
+            target.close()
+
+    def test_import_merge_mode(self, cm, tmp_path):
+        """Merge import should skip existing nodes and add new ones."""
+        # Store initial fact
+        cm.store_fact("Science", "Water boils at 100C")
+
+        # Create export data with different facts
+        export_data = {
+            "format_version": "1.0",
+            "semantic_nodes": [
+                {
+                    "node_id": "new-fact-1",
+                    "concept": "Chemistry",
+                    "content": "H2O is water",
+                    "confidence": 0.9,
+                    "source_id": "",
+                    "tags": [],
+                    "metadata": {},
+                    "created_at": 1000,
+                    "entity_name": "",
+                },
+            ],
+            "episodic_nodes": [],
+        }
+
+        stats = cm.import_from_json(export_data, merge=True)
+        assert stats["nodes_imported"] == 1
+        assert stats["skipped"] == 0
+
+        # Should have 2 facts now
+        facts = cm.get_all_facts(limit=10)
+        assert len(facts) == 2
+
+    def test_import_replace_mode(self, cm):
+        """Non-merge import should clear existing data first."""
+        # Store initial facts
+        cm.store_fact("Science", "Water boils at 100C")
+        cm.store_fact("Science", "Ice melts at 0C")
+
+        # Import with merge=False (replace)
+        export_data = {
+            "format_version": "1.0",
+            "semantic_nodes": [
+                {
+                    "node_id": "replacement-1",
+                    "concept": "Music",
+                    "content": "Bach was a composer",
+                    "confidence": 0.95,
+                    "source_id": "",
+                    "tags": [],
+                    "metadata": {},
+                    "created_at": 2000,
+                    "entity_name": "bach",
+                },
+            ],
+            "episodic_nodes": [],
+        }
+
+        stats = cm.import_from_json(export_data, merge=False)
+        assert stats["nodes_imported"] == 1
+
+        # Should have only 1 fact (the old ones were cleared)
+        facts = cm.get_all_facts(limit=10)
+        assert len(facts) == 1
+        assert facts[0].content == "Bach was a composer"
+
+    def test_import_handles_missing_keys(self, cm):
+        """Import should handle partial data gracefully."""
+        export_data = {
+            "format_version": "1.0",
+            "semantic_nodes": [
+                {
+                    "node_id": "sparse-1",
+                    "concept": "Test",
+                    "content": "Sparse data",
+                    "confidence": 0.5,
+                    "created_at": 3000,
+                },
+            ],
+        }
+
+        stats = cm.import_from_json(export_data, merge=False)
+        assert stats["nodes_imported"] == 1
+        assert stats["errors"] == 0
+
+    def test_import_skips_empty_node_ids(self, cm):
+        """Nodes without node_id should be counted as errors."""
+        export_data = {
+            "format_version": "1.0",
+            "semantic_nodes": [
+                {"concept": "Bad", "content": "No ID"},  # missing node_id
+            ],
+            "episodic_nodes": [],
+        }
+
+        stats = cm.import_from_json(export_data, merge=False)
+        assert stats["errors"] == 1
+        assert stats["nodes_imported"] == 0
+
+    def test_export_statistics_correct(self, cm):
+        """Verify statistics block counts match actual data."""
+        cm.store_fact("A", "fact 1")
+        cm.store_fact("B", "fact 2")
+        cm.store_episode("ep 1", "src-1")
+        cm.store_procedure("proc 1", ["step1"])
+        cm.store_prospective("remind", "trigger", "action")
+        cm.record_sensory("text", "observation")
+        cm.push_working("goal", "do thing", task_id="t1")
+
+        data = cm.export_to_json()
+        s = data["statistics"]
+        assert s["semantic_count"] == 2
+        assert s["episodic_count"] == 1
+        assert s["procedural_count"] == 1
+        assert s["prospective_count"] == 1
+        assert s["sensory_count"] == 1
+        assert s["working_count"] == 1
+        assert s["total_nodes"] == 7
+
+    def test_roundtrip_all_node_types(self, cm, tmp_path):
+        """Full roundtrip of all 6 memory types + consolidated episodes."""
+        # Store one of each type
+        cm.store_fact("Biology", "Cells divide")
+        cm.store_episode("Session happened", "src")
+        cm.store_procedure("Deploy", ["build", "test"])
+        cm.store_prospective("reminder", "trigger", "action")
+        cm.record_sensory("text", "raw data", ttl_seconds=9999)
+        cm.push_working("goal", "task content", task_id="t1")
+
+        # Export
+        data = cm.export_to_json()
+        assert data["statistics"]["total_nodes"] == 6
+
+        # Import into new instance
+        target_db = tmp_path / "full_roundtrip"
+        target = CognitiveMemory(agent_name="roundtrip-agent", db_path=target_db)
+        try:
+            stats = target.import_from_json(data)
+            assert stats["nodes_imported"] == 6
+            assert stats["errors"] == 0
+
+            # Verify each type
+            target_stats = target.get_statistics()
+            assert target_stats["semantic"] == 1
+            assert target_stats["episodic"] == 1
+            assert target_stats["procedural"] == 1
+            assert target_stats["prospective"] == 1
+            assert target_stats["sensory"] == 1
+            assert target_stats["working"] == 1
+        finally:
+            target.close()
