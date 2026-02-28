@@ -1,9 +1,11 @@
 """amplihack-memory-lib: Standalone memory system for goal-seeking agents."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .cognitive_memory import CognitiveMemory
 from .connector import MemoryConnector
+from .contradiction import detect_contradiction
+from .entity_extraction import extract_entity_name
 from .exceptions import (
     ExperienceNotFoundError,
     InvalidExperienceError,
@@ -11,6 +13,13 @@ from .exceptions import (
     MemoryQuotaExceededError,
 )
 from .experience import Experience, ExperienceType
+from .hierarchical_memory import (
+    HierarchicalMemory,
+    KnowledgeEdge,
+    KnowledgeNode,
+    KnowledgeSubgraph,
+    MemoryClassifier,
+)
 from .memory_types import (
     ConsolidatedEpisode,
     EpisodicMemory,
@@ -30,10 +39,29 @@ from .security import (
     SecureMemoryBackend,
     SecurityViolationError,
 )
+from .similarity import (
+    compute_similarity,
+    compute_tag_similarity,
+    compute_word_similarity,
+    rerank_facts_by_query,
+)
 from .store import ExperienceStore
 
 __all__ = [
-    # Cognitive memory (new)
+    # Hierarchical memory (Graph RAG)
+    "HierarchicalMemory",
+    "KnowledgeNode",
+    "KnowledgeEdge",
+    "KnowledgeSubgraph",
+    "MemoryClassifier",
+    # Shared utilities
+    "extract_entity_name",
+    "detect_contradiction",
+    "compute_similarity",
+    "compute_word_similarity",
+    "compute_tag_similarity",
+    "rerank_facts_by_query",
+    # Cognitive memory
     "CognitiveMemory",
     "MemoryCategory",
     "SensoryItem",
