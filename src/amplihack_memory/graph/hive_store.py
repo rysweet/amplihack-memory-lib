@@ -54,8 +54,8 @@ class HiveGraphStore(KuzuGraphStore):
         "detected_at": "STRING",
     }
 
-    def __init__(self, db_path: str) -> None:
-        super().__init__(db_path=db_path, store_id="__hive__")
+    def __init__(self, db_path: str, buffer_pool_size: int = 256 * 1024 * 1024) -> None:
+        super().__init__(db_path=db_path, store_id="__hive__", buffer_pool_size=buffer_pool_size)
         self._setup_hive_schema()
 
     def _setup_hive_schema(self) -> None:
