@@ -75,7 +75,7 @@ class KuzuGraphStore:
         # Track which tables we have already ensured so we don't
         # issue redundant DDL on every operation.
         self._known_node_tables: set[str] = set()
-        self._known_rel_tables: set[str] = set()
+        self._known_rel_tables: set[tuple[str, str, str]] = set()
 
         # Track known columns per node table for schema evolution.
         self._node_table_columns: dict[str, set[str]] = {}

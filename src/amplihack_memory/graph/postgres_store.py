@@ -336,6 +336,14 @@ class InMemoryGraphStore:
     # ── lifecycle ────────────────────────────────────────────
 
     def close(self) -> None:
+        """No-op: in-memory store has no external resources to release.
+
+        Data is preserved so that references to this store remain valid
+        after close().  Use clear() to explicitly wipe data.
+        """
+
+    def clear(self) -> None:
+        """Explicitly destroy all in-memory data."""
         with self._lock:
             self._nodes.clear()
             self._edges.clear()

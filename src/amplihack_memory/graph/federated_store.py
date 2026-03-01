@@ -78,14 +78,27 @@ def _content_hash(node: GraphNode) -> str:
 
 
 def _deduplicate_nodes(nodes: list[GraphNode]) -> list[GraphNode]:
-    """Remove duplicate nodes by content hash, keeping the first occurrence."""
-    seen: set[str] = set()
+    """Remove duplicate nodes, keeping the first occurrence.
+
+    Uses two-level dedup:
+    1. By node_id (exact identity -- same node in different stores)
+    2. By content hash (same content with different node_ids)
+    """
+    seen_ids: set[str] = set()
+    seen_hashes: set[str] = set()
     unique: list[GraphNode] = []
     for node in nodes:
+        # Level 1: exact identity by node_id
+        if node.node_id and node.node_id in seen_ids:
+            continue
+        # Level 2: content-based dedup
         h = _content_hash(node)
-        if h not in seen:
-            seen.add(h)
-            unique.append(node)
+        if h in seen_hashes:
+            continue
+        if node.node_id:
+            seen_ids.add(node.node_id)
+        seen_hashes.add(h)
+        unique.append(node)
     return unique
 
 
