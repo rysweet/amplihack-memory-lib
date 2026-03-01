@@ -33,19 +33,10 @@ class KuzuGraphStore:
 
     # ── construction / lifecycle ──────────────────────────────
 
-    def __init__(
-        self,
-        db_path: Path | str,
-        store_id: str | None = None,
-        buffer_pool_size: int = 256 * 1024 * 1024,
-        db: "kuzu.Database | None" = None,
-    ) -> None:
+    def __init__(self, db_path: Path | str, store_id: str | None = None) -> None:
         self._db_path = Path(db_path)
         self._store_id = store_id or f"kuzu-{uuid.uuid4().hex[:8]}"
-        if db is not None:
-            self._db = db
-        else:
-            self._db = kuzu.Database(str(self._db_path), buffer_pool_size=buffer_pool_size)
+        self._db = kuzu.Database(str(self._db_path))
         self._conn = kuzu.Connection(self._db)
 
         # Track which tables we have already ensured so we don't
