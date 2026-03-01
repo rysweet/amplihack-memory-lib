@@ -9,6 +9,8 @@ Public API:
 
 from __future__ import annotations
 
+import re
+import threading
 import uuid
 from collections import deque
 from pathlib import Path
@@ -17,6 +19,27 @@ from typing import Any
 import kuzu
 
 from .types import Direction, GraphEdge, GraphNode, TraversalResult
+
+# Regex for safe Cypher identifiers: must start with letter or underscore,
+# followed by alphanumerics/underscores only.
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_identifier(name: str) -> None:
+    """Validate that *name* is a safe Cypher identifier.
+
+    Prevents injection via table names, column names, edge types, etc.
+    that are interpolated into Cypher strings.
+
+    Raises:
+        ValueError: If *name* contains characters outside ``[A-Za-z0-9_]``
+            or does not start with a letter/underscore.
+    """
+    if not _IDENTIFIER_RE.match(name):
+        raise ValueError(
+            f"Invalid identifier: {name!r}. "
+            f"Must match [A-Za-z_][A-Za-z0-9_]*"
+        )
 
 
 class KuzuGraphStore:
@@ -47,6 +70,7 @@ class KuzuGraphStore:
         else:
             self._db = kuzu.Database(str(self._db_path), buffer_pool_size=buffer_pool_size)
         self._conn = kuzu.Connection(self._db)
+        self._lock = threading.RLock()
 
         # Track which tables we have already ensured so we don't
         # issue redundant DDL on every operation.
@@ -66,8 +90,9 @@ class KuzuGraphStore:
 
     def close(self) -> None:
         """Release Kuzu resources."""
-        self._conn = None  # type: ignore[assignment]
-        self._db = None  # type: ignore[assignment]
+        with self._lock:
+            self._conn = None  # type: ignore[assignment]
+            self._db = None  # type: ignore[assignment]
 
     # ── schema management ─────────────────────────────────────
 
@@ -88,38 +113,42 @@ class KuzuGraphStore:
             table_name: Name of the node table (e.g. "Agent").
             columns: Extra columns as ``{"col_name": "KUZU_TYPE"}``.
         """
+        _validate_identifier(table_name)
         extra_cols = {
             k: v for k, v in (columns or {}).items()
             if k not in ("node_id", "graph_origin")
         }
+        for col_name in extra_cols:
+            _validate_identifier(col_name)
 
-        if table_name in self._known_node_tables:
-            # Table exists -- add any new columns via ALTER TABLE.
-            known = self._node_table_columns.get(table_name, set())
+        with self._lock:
+            if table_name in self._known_node_tables:
+                # Table exists -- add any new columns via ALTER TABLE.
+                known = self._node_table_columns.get(table_name, set())
+                for col_name, col_type in extra_cols.items():
+                    if col_name not in known:
+                        try:
+                            self._conn.execute(
+                                f"ALTER TABLE {table_name} ADD {col_name} {col_type} DEFAULT ''"
+                            )
+                        except RuntimeError:
+                            pass  # Column may already exist from a prior session.
+                        known.add(col_name)
+                self._node_table_columns[table_name] = known
+                return
+
+            col_defs = ["node_id STRING", "graph_origin STRING"]
             for col_name, col_type in extra_cols.items():
-                if col_name not in known:
-                    try:
-                        self._conn.execute(
-                            f"ALTER TABLE {table_name} ADD {col_name} {col_type} DEFAULT ''"
-                        )
-                    except RuntimeError:
-                        pass  # Column may already exist from a prior session.
-                    known.add(col_name)
-            self._node_table_columns[table_name] = known
-            return
+                col_defs.append(f"{col_name} {col_type}")
 
-        col_defs = ["node_id STRING", "graph_origin STRING"]
-        for col_name, col_type in extra_cols.items():
-            col_defs.append(f"{col_name} {col_type}")
-
-        col_defs_str = ", ".join(col_defs)
-        ddl = (
-            f"CREATE NODE TABLE IF NOT EXISTS {table_name}"
-            f"({col_defs_str}, PRIMARY KEY(node_id))"
-        )
-        self._conn.execute(ddl)
-        self._known_node_tables.add(table_name)
-        self._node_table_columns[table_name] = set(extra_cols.keys())
+            col_defs_str = ", ".join(col_defs)
+            ddl = (
+                f"CREATE NODE TABLE IF NOT EXISTS {table_name}"
+                f"({col_defs_str}, PRIMARY KEY(node_id))"
+            )
+            self._conn.execute(ddl)
+            self._known_node_tables.add(table_name)
+            self._node_table_columns[table_name] = set(extra_cols.keys())
 
     def ensure_rel_table(
         self,
@@ -142,26 +171,34 @@ class KuzuGraphStore:
             to_table: Target node table.
             columns: Extra columns as ``{"col_name": "KUZU_TYPE"}``.
         """
-        key = (table_name, from_table, to_table)
-        if key in self._known_rel_tables:
-            return
-
-        # Ensure source / target tables exist (minimal schema).
-        self.ensure_node_table(from_table)
-        self.ensure_node_table(to_table)
-
-        col_defs = ["edge_id STRING", "graph_origin STRING"]
-        for col_name, col_type in (columns or {}).items():
+        _validate_identifier(table_name)
+        _validate_identifier(from_table)
+        _validate_identifier(to_table)
+        for col_name in (columns or {}):
             if col_name not in ("edge_id", "graph_origin"):
-                col_defs.append(f"{col_name} {col_type}")
+                _validate_identifier(col_name)
 
-        col_defs_str = ", ".join(col_defs)
-        ddl = (
-            f"CREATE REL TABLE IF NOT EXISTS {table_name}"
-            f"(FROM {from_table} TO {to_table}, {col_defs_str})"
-        )
-        self._conn.execute(ddl)
-        self._known_rel_tables.add(key)
+        key = (table_name, from_table, to_table)
+        with self._lock:
+            if key in self._known_rel_tables:
+                return
+
+            # Ensure source / target tables exist (minimal schema).
+            self.ensure_node_table(from_table)
+            self.ensure_node_table(to_table)
+
+            col_defs = ["edge_id STRING", "graph_origin STRING"]
+            for col_name, col_type in (columns or {}).items():
+                if col_name not in ("edge_id", "graph_origin"):
+                    col_defs.append(f"{col_name} {col_type}")
+
+            col_defs_str = ", ".join(col_defs)
+            ddl = (
+                f"CREATE REL TABLE IF NOT EXISTS {table_name}"
+                f"(FROM {from_table} TO {to_table}, {col_defs_str})"
+            )
+            self._conn.execute(ddl)
+            self._known_rel_tables.add(key)
 
     # ── node CRUD ─────────────────────────────────────────────
 
@@ -176,6 +213,10 @@ class KuzuGraphStore:
         Automatically ensures the node table exists with columns matching
         the supplied *properties* (all stored as STRING for flexibility).
         """
+        _validate_identifier(node_type)
+        for k in properties:
+            _validate_identifier(k)
+
         nid = node_id or uuid.uuid4().hex
         self.ensure_node_table(
             node_type,
@@ -195,9 +236,10 @@ class KuzuGraphStore:
 
         set_clause = ", ".join(set_parts)
         cypher = f"CREATE (:{node_type} {{{set_clause}}})"
-        self._conn.execute(cypher, params)
+        with self._lock:
+            self._conn.execute(cypher, params)
+            self._id_table_cache[nid] = node_type
 
-        self._id_table_cache[nid] = node_type
         return GraphNode(
             node_id=nid,
             node_type=node_type,
@@ -207,26 +249,30 @@ class KuzuGraphStore:
 
     def get_node(self, node_id: str) -> GraphNode | None:
         """Fetch a node by ID, searching all known tables."""
-        # Try cached table first.
-        cached_table = self._id_table_cache.get(node_id)
-        if cached_table:
-            node = self._get_node_from_table(node_id, cached_table)
-            if node is not None:
-                return node
+        with self._lock:
+            # Try cached table first.
+            cached_table = self._id_table_cache.get(node_id)
+            if cached_table:
+                node = self._get_node_from_table(node_id, cached_table)
+                if node is not None:
+                    return node
 
-        # Fall back to scanning all known tables.
-        for table in list(self._known_node_tables):
-            if table == cached_table:
-                continue
-            node = self._get_node_from_table(node_id, table)
-            if node is not None:
-                self._id_table_cache[node_id] = table
-                return node
+            # Fall back to scanning all known tables.
+            for table in list(self._known_node_tables):
+                if table == cached_table:
+                    continue
+                node = self._get_node_from_table(node_id, table)
+                if node is not None:
+                    self._id_table_cache[node_id] = table
+                    return node
 
         return None
 
     def _get_node_from_table(self, node_id: str, table: str) -> GraphNode | None:
-        """Fetch a node from a specific table by ID."""
+        """Fetch a node from a specific table by ID.
+
+        Caller must hold self._lock.
+        """
         cypher = (
             f"MATCH (n:{table}) WHERE n.node_id = $nid "
             f"RETURN n"
@@ -245,26 +291,31 @@ class KuzuGraphStore:
         limit: int = 50,
     ) -> list[GraphNode]:
         """Query nodes of a given type with optional equality filters."""
-        if node_type not in self._known_node_tables:
-            return []
+        _validate_identifier(node_type)
+        for k in (filters or {}):
+            _validate_identifier(k)
 
-        where_parts: list[str] = []
-        params: dict[str, Any] = {}
+        with self._lock:
+            if node_type not in self._known_node_tables:
+                return []
 
-        for idx, (k, v) in enumerate((filters or {}).items()):
-            pname = f"f{idx}"
-            where_parts.append(f"n.{k} = ${pname}")
-            params[pname] = str(v)
+            where_parts: list[str] = []
+            params: dict[str, Any] = {}
 
-        where_clause = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
-        cypher = f"MATCH (n:{node_type}){where_clause} RETURN n LIMIT {limit}"
-        result = self._conn.execute(cypher, params)
+            for idx, (k, v) in enumerate((filters or {}).items()):
+                pname = f"f{idx}"
+                where_parts.append(f"n.{k} = ${pname}")
+                params[pname] = str(v)
 
-        nodes: list[GraphNode] = []
-        while result.has_next():
-            row = result.get_next()
-            nodes.append(self._row_to_node(row[0], node_type))
-        return nodes
+            where_clause = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+            cypher = f"MATCH (n:{node_type}){where_clause} RETURN n LIMIT {limit}"
+            result = self._conn.execute(cypher, params)
+
+            nodes: list[GraphNode] = []
+            while result.has_next():
+                row = result.get_next()
+                nodes.append(self._row_to_node(row[0], node_type))
+            return nodes
 
     def search_nodes(
         self,
@@ -275,73 +326,85 @@ class KuzuGraphStore:
         limit: int = 10,
     ) -> list[GraphNode]:
         """Keyword search across text fields using CONTAINS."""
-        if node_type not in self._known_node_tables:
-            return []
+        _validate_identifier(node_type)
+        for field in text_fields:
+            _validate_identifier(field)
+        for k in (filters or {}):
+            _validate_identifier(k)
 
-        where_parts: list[str] = []
-        params: dict[str, Any] = {"query": query.lower()}
+        with self._lock:
+            if node_type not in self._known_node_tables:
+                return []
 
-        # Text search across specified fields (OR).
-        text_clauses = [
-            f"lower(n.{field}) CONTAINS $query" for field in text_fields
-        ]
-        if text_clauses:
-            where_parts.append(f"({' OR '.join(text_clauses)})")
+            where_parts: list[str] = []
+            params: dict[str, Any] = {"query": query.lower()}
 
-        # Extra equality filters.
-        for idx, (k, v) in enumerate((filters or {}).items()):
-            pname = f"f{idx}"
-            where_parts.append(f"n.{k} = ${pname}")
-            params[pname] = str(v)
+            # Text search across specified fields (OR).
+            text_clauses = [
+                f"lower(n.{field}) CONTAINS $query" for field in text_fields
+            ]
+            if text_clauses:
+                where_parts.append(f"({' OR '.join(text_clauses)})")
 
-        where_clause = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
-        cypher = f"MATCH (n:{node_type}){where_clause} RETURN n LIMIT {limit}"
-        result = self._conn.execute(cypher, params)
+            # Extra equality filters.
+            for idx, (k, v) in enumerate((filters or {}).items()):
+                pname = f"f{idx}"
+                where_parts.append(f"n.{k} = ${pname}")
+                params[pname] = str(v)
 
-        nodes: list[GraphNode] = []
-        while result.has_next():
-            row = result.get_next()
-            nodes.append(self._row_to_node(row[0], node_type))
-        return nodes
+            where_clause = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+            cypher = f"MATCH (n:{node_type}){where_clause} RETURN n LIMIT {limit}"
+            result = self._conn.execute(cypher, params)
+
+            nodes: list[GraphNode] = []
+            while result.has_next():
+                row = result.get_next()
+                nodes.append(self._row_to_node(row[0], node_type))
+            return nodes
 
     def update_node(self, node_id: str, properties: dict[str, Any]) -> bool:
         """Update properties on an existing node."""
-        table = self._id_table_cache.get(node_id)
-        if table is None:
-            # Try to find it.
-            node = self.get_node(node_id)
-            if node is None:
-                return False
-            table = node.node_type
+        for k in properties:
+            _validate_identifier(k)
 
-        set_parts: list[str] = []
-        params: dict[str, Any] = {"nid": node_id}
-        for idx, (k, v) in enumerate(properties.items()):
-            pname = f"u{idx}"
-            set_parts.append(f"n.{k} = ${pname}")
-            params[pname] = str(v)
+        with self._lock:
+            table = self._id_table_cache.get(node_id)
+            if table is None:
+                # Try to find it.
+                node = self.get_node(node_id)
+                if node is None:
+                    return False
+                table = node.node_type
 
-        if not set_parts:
-            return True  # nothing to update
+            set_parts: list[str] = []
+            params: dict[str, Any] = {"nid": node_id}
+            for idx, (k, v) in enumerate(properties.items()):
+                pname = f"u{idx}"
+                set_parts.append(f"n.{k} = ${pname}")
+                params[pname] = str(v)
 
-        set_clause = ", ".join(set_parts)
-        cypher = f"MATCH (n:{table}) WHERE n.node_id = $nid SET {set_clause}"
-        self._conn.execute(cypher, params)
-        return True
+            if not set_parts:
+                return True  # nothing to update
+
+            set_clause = ", ".join(set_parts)
+            cypher = f"MATCH (n:{table}) WHERE n.node_id = $nid SET {set_clause}"
+            self._conn.execute(cypher, params)
+            return True
 
     def delete_node(self, node_id: str) -> bool:
         """Delete a node by ID from its table."""
-        table = self._id_table_cache.get(node_id)
-        if table is None:
-            node = self.get_node(node_id)
-            if node is None:
-                return False
-            table = node.node_type
+        with self._lock:
+            table = self._id_table_cache.get(node_id)
+            if table is None:
+                node = self.get_node(node_id)
+                if node is None:
+                    return False
+                table = node.node_type
 
-        cypher = f"MATCH (n:{table}) WHERE n.node_id = $nid DETACH DELETE n"
-        self._conn.execute(cypher, {"nid": node_id})
-        self._id_table_cache.pop(node_id, None)
-        return True
+            cypher = f"MATCH (n:{table}) WHERE n.node_id = $nid DETACH DELETE n"
+            self._conn.execute(cypher, {"nid": node_id})
+            self._id_table_cache.pop(node_id, None)
+            return True
 
     # ── edge operations ───────────────────────────────────────
 
@@ -357,6 +420,11 @@ class KuzuGraphStore:
         Raises:
             KeyError: If source or target node does not exist.
         """
+        _validate_identifier(edge_type)
+        props = properties or {}
+        for k in props:
+            _validate_identifier(k)
+
         src_node = self.get_node(source_id)
         tgt_node = self.get_node(target_id)
         if src_node is None:
@@ -364,7 +432,6 @@ class KuzuGraphStore:
         if tgt_node is None:
             raise KeyError(f"Target node not found: {target_id}")
 
-        props = properties or {}
         eid = uuid.uuid4().hex
 
         self.ensure_rel_table(
@@ -393,7 +460,8 @@ class KuzuGraphStore:
             f"WHERE a.node_id = $sid AND b.node_id = $tid "
             f"CREATE (a)-[:{edge_type} {{{set_clause}}}]->(b)"
         )
-        self._conn.execute(cypher, params)
+        with self._lock:
+            self._conn.execute(cypher, params)
 
         return GraphEdge(
             edge_id=eid,
@@ -412,35 +480,39 @@ class KuzuGraphStore:
         limit: int = 50,
     ) -> list[tuple[GraphEdge, GraphNode]]:
         """Return edges and neighbor nodes adjacent to node_id."""
+        if edge_type is not None:
+            _validate_identifier(edge_type)
+
         node = self.get_node(node_id)
         if node is None:
             return []
 
-        results: list[tuple[GraphEdge, GraphNode]] = []
+        with self._lock:
+            results: list[tuple[GraphEdge, GraphNode]] = []
 
-        # Determine which rel tables to scan.
-        rel_tables = self._get_rel_tables_for(edge_type)
+            # Determine which rel tables to scan.
+            rel_tables = self._get_rel_tables_for(edge_type)
 
-        for rel_name, from_table, to_table in rel_tables:
-            # Outgoing: source is our node
-            if direction in (Direction.OUTGOING, Direction.BOTH):
-                if from_table == node.node_type:
-                    results.extend(
-                        self._query_directed_neighbors(
-                            node_id, node.node_type, to_table,
-                            rel_name, "outgoing", limit,
+            for rel_name, from_table, to_table in rel_tables:
+                # Outgoing: source is our node
+                if direction in (Direction.OUTGOING, Direction.BOTH):
+                    if from_table == node.node_type:
+                        results.extend(
+                            self._query_directed_neighbors(
+                                node_id, node.node_type, to_table,
+                                rel_name, "outgoing", limit,
+                            )
                         )
-                    )
 
-            # Incoming: target is our node
-            if direction in (Direction.INCOMING, Direction.BOTH):
-                if to_table == node.node_type:
-                    results.extend(
-                        self._query_directed_neighbors(
-                            node_id, node.node_type, from_table,
-                            rel_name, "incoming", limit,
+                # Incoming: target is our node
+                if direction in (Direction.INCOMING, Direction.BOTH):
+                    if to_table == node.node_type:
+                        results.extend(
+                            self._query_directed_neighbors(
+                                node_id, node.node_type, from_table,
+                                rel_name, "incoming", limit,
+                            )
                         )
-                    )
 
         return results[:limit]
 
@@ -453,7 +525,10 @@ class KuzuGraphStore:
         direction: str,
         limit: int,
     ) -> list[tuple[GraphEdge, GraphNode]]:
-        """Query neighbors in a specific direction for a single rel table."""
+        """Query neighbors in a specific direction for a single rel table.
+
+        Caller must hold self._lock.
+        """
         params: dict[str, Any] = {"nid": node_id}
 
         if direction == "outgoing":
@@ -475,8 +550,8 @@ class KuzuGraphStore:
             rel_dict = row[0]
             neighbor_dict = row[1]
 
-            edge = self._rel_to_edge(rel_dict, rel_name, node_id, direction)
             neighbor = self._row_to_node(neighbor_dict, neighbor_table)
+            edge = self._rel_to_edge(rel_dict, rel_name, node_id, direction, neighbor.node_id)
             self._id_table_cache[neighbor.node_id] = neighbor_table
             pairs.append((edge, neighbor))
 
@@ -489,6 +564,8 @@ class KuzuGraphStore:
         edge_type: str,
     ) -> bool:
         """Delete a specific edge between two nodes."""
+        _validate_identifier(edge_type)
+
         src_node = self.get_node(source_id)
         tgt_node = self.get_node(target_id)
         if src_node is None or tgt_node is None:
@@ -498,7 +575,8 @@ class KuzuGraphStore:
             f"MATCH (a:{src_node.node_type})-[r:{edge_type}]->(b:{tgt_node.node_type}) "
             f"WHERE a.node_id = $sid AND b.node_id = $tid DELETE r"
         )
-        self._conn.execute(cypher, {"sid": source_id, "tid": target_id})
+        with self._lock:
+            self._conn.execute(cypher, {"sid": source_id, "tid": target_id})
         return True
 
     # ── traversal ─────────────────────────────────────────────
@@ -599,8 +677,19 @@ class KuzuGraphStore:
         rel_name: str,
         anchor_id: str,
         direction: str,
+        neighbor_id: str = "",
     ) -> GraphEdge:
-        """Convert a Kuzu relationship dict to a GraphEdge."""
+        """Convert a Kuzu relationship dict to a GraphEdge.
+
+        Args:
+            rel_data: Raw relationship dict from Kuzu result.
+            rel_name: Relationship table name.
+            anchor_id: The node_id we queried from.
+            direction: "outgoing" or "incoming".
+            neighbor_id: The node_id of the neighbor node, used to
+                populate the source/target that cannot be derived
+                from the anchor alone.
+        """
         eid = str(rel_data.get("edge_id", ""))
         graph_origin = str(rel_data.get("graph_origin", ""))
 
@@ -608,12 +697,13 @@ class KuzuGraphStore:
         props = {k: v for k, v in rel_data.items() if k not in skip}
 
         # Kuzu _src/_dst are internal IDs, not our node_ids.
-        # We reconstruct source/target from the anchor and direction.
+        # We reconstruct source/target from the anchor, direction,
+        # and neighbor_id.
         if direction == "outgoing":
             source_id = anchor_id
-            target_id = ""  # filled from the neighbor context
+            target_id = neighbor_id
         else:
-            source_id = ""  # filled from the neighbor context
+            source_id = neighbor_id
             target_id = anchor_id
 
         return GraphEdge(

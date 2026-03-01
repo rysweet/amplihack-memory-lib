@@ -417,10 +417,11 @@ class PostgresGraphStore:
                 )
 
         # AGE requires SET search_path and explicit ag_catalog usage.
+        # Use a custom dollar-quote tag to reduce collision risk.
         sql = (
-            f"SELECT * FROM cypher('{self._graph_name}', $$ "
+            f"SELECT * FROM cypher('{self._graph_name}', $_hive_cypher$ "
             f"{safe_cypher} "
-            f"$$) AS (result agtype);"
+            f"$_hive_cypher$) AS (result agtype);"
         )
 
         with self._lock:
@@ -469,14 +470,17 @@ class PostgresGraphStore:
         node_id: str | None = None,
     ) -> GraphNode:
         nid = node_id or uuid.uuid4().hex
-        props = {
-            "node_id": nid,
-            "graph_origin": self._store_id,
-            **{k: str(v) for k, v in properties.items()},
-        }
-        props_json = json.dumps(props)
+        # Build property assignments using _age_literal for safe escaping
+        # instead of raw json.dumps (which bypasses injection protection).
+        prop_parts = [
+            f"node_id: {_age_literal(nid)}",
+            f"graph_origin: {_age_literal(self._store_id)}",
+        ]
+        for k, v in properties.items():
+            prop_parts.append(f"{k}: {_age_literal(str(v))}")
+        props_str = ", ".join(prop_parts)
 
-        cypher = f"CREATE (n:{node_type} {props_json}) RETURN n"
+        cypher = f"CREATE (n:{node_type} {{{props_str}}}) RETURN n"
         self._execute_cypher(cypher)
 
         self._known_labels.add(node_type)
@@ -598,18 +602,21 @@ class PostgresGraphStore:
             raise KeyError(f"Target node not found: {target_id}")
 
         eid = uuid.uuid4().hex
-        props = {
-            "edge_id": eid,
-            "graph_origin": self._store_id,
-            **{k: str(v) for k, v in (properties or {}).items()},
-        }
-        props_json = json.dumps(props)
+        # Build property assignments using _age_literal for safe escaping
+        # instead of raw json.dumps (which bypasses injection protection).
+        prop_parts = [
+            f"edge_id: {_age_literal(eid)}",
+            f"graph_origin: {_age_literal(self._store_id)}",
+        ]
+        for k, v in (properties or {}).items():
+            prop_parts.append(f"{k}: {_age_literal(str(v))}")
+        props_str = ", ".join(prop_parts)
 
         cypher = (
             f"MATCH (a:{src.node_type}), (b:{tgt.node_type}) "
             f"WHERE a.node_id = {_age_literal(source_id)} "
             f"AND b.node_id = {_age_literal(target_id)} "
-            f"CREATE (a)-[r:{edge_type} {props_json}]->(b) RETURN r"
+            f"CREATE (a)-[r:{edge_type} {{{props_str}}}]->(b) RETURN r"
         )
         self._execute_cypher(cypher)
 
@@ -869,19 +876,26 @@ def _age_literal(value: Any) -> str:
     AGE does not support native parameter binding like psycopg2 ``%s``
     placeholders, so we JSON-encode values and wrap strings in single
     quotes for the Cypher layer.
+
+    Values containing ``$$`` (or the custom dollar-quote tag) are rejected
+    to prevent escaping out of the SQL dollar-quoted block.
     """
-    if isinstance(value, str):
-        # Escape single quotes for Cypher string literals.
-        escaped = value.replace("\\", "\\\\").replace("'", "\\'")
-        return f"'{escaped}'"
-    elif isinstance(value, bool):
+    if isinstance(value, bool):
         return "true" if value else "false"
     elif isinstance(value, (int, float)):
         return str(value)
     elif value is None:
         return "null"
     else:
-        escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
+        text = str(value)
+        # Reject values that could break out of the dollar-quoted SQL block.
+        if "$$" in text or "$_hive_cypher$" in text:
+            raise ValueError(
+                f"Value contains dollar-quote sequence and cannot be safely "
+                f"interpolated into AGE Cypher: {text!r}"
+            )
+        # Escape single quotes for Cypher string literals.
+        escaped = text.replace("\\", "\\\\").replace("'", "\\'")
         return f"'{escaped}'"
 
 
