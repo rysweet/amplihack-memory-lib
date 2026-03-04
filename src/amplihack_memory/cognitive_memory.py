@@ -192,11 +192,24 @@ class CognitiveMemory:
     Args:
         agent_name: Identifier for the agent (used for row isolation).
         db_path: Filesystem path for the Kuzu database directory.
+        buffer_pool_size: Kuzu buffer pool size in bytes. Default 0 lets Kuzu
+            use ~80% of system RAM, which causes mmap failures when creating
+            many concurrent databases (e.g. 100 agents). Set to 256MB
+            (268435456) for multi-agent deployments.
+        max_db_size: Maximum database size in bytes. Default 0 lets Kuzu use
+            8TB, which can exhaust virtual address space with many DBs.
+            Set to 1GB (1073741824) for multi-agent deployments.
     """
 
     WORKING_MEMORY_CAPACITY = WORKING_MEMORY_CAPACITY
 
-    def __init__(self, agent_name: str, db_path: str | Path) -> None:
+    def __init__(
+        self,
+        agent_name: str,
+        db_path: str | Path,
+        buffer_pool_size: int = 0,
+        max_db_size: int = 0,
+    ) -> None:
         if not agent_name or not agent_name.strip():
             raise ValueError("agent_name cannot be empty")
 
@@ -205,7 +218,13 @@ class CognitiveMemory:
         # Ensure the *parent* directory exists; Kuzu creates the db dir itself.
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._db = kuzu.Database(str(self.db_path))
+        db_kwargs: dict[str, int] = {}
+        if buffer_pool_size > 0:
+            db_kwargs["buffer_pool_size"] = buffer_pool_size
+        if max_db_size > 0:
+            db_kwargs["max_db_size"] = max_db_size
+
+        self._db = kuzu.Database(str(self.db_path), **db_kwargs)
         self._conn = kuzu.Connection(self._db)
         self._initialize_schema()
 
