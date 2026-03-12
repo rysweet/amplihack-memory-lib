@@ -27,9 +27,12 @@ tempfile = "3"
 
 [features]
 default = []
-kuzu = ["pyo3"]
+kuzu = ["dep:pyo3", "pyo3/auto-initialize"]
+python = ["dep:pyo3", "pyo3/extension-module"]
 
 [dependencies.pyo3]
 version = "0.22"
-features = ["auto-initialize"]
 optional = true
+
+[lib]
+crate-type = ["lib", "cdylib"]

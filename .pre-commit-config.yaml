@@ -1,0 +1,32 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --manifest-path rust/amplihack-memory/Cargo.toml --
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --manifest-path rust/amplihack-memory/Cargo.toml -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --manifest-path rust/amplihack-memory/Cargo.toml --quiet
+        language: system
+        types: [rust]
+        pass_filenames: false

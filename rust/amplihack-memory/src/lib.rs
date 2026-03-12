@@ -9,6 +9,13 @@
 //! - Graph abstraction with in-memory and federated store implementations
 //! - Pattern recognition from discoveries
 
+#[cfg(all(feature = "python", feature = "kuzu"))]
+compile_error!(
+    "Features `python` and `kuzu` are mutually exclusive. \
+     `python` uses pyo3/extension-module (Rust as Python extension), \
+     `kuzu` uses pyo3/auto-initialize (Rust calls Python)."
+);
+
 pub mod backends;
 pub mod cognitive_memory;
 pub mod connector;
@@ -20,6 +27,8 @@ pub mod graph;
 pub mod hierarchical_memory;
 pub mod memory_types;
 pub mod pattern_recognition;
+#[cfg(feature = "python")]
+pub mod python_module;
 pub mod security;
 pub mod semantic_search;
 pub mod similarity;

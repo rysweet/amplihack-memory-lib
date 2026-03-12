@@ -532,10 +532,14 @@ impl MemoryBackend for KuzuBackend {
     }
 
     fn close(&mut self) {
-        // Python GC handles cleanup
         Python::with_gil(|py| {
-            let _ = self.py_conn.bind(py);
-            let _ = self.py_db.bind(py);
+            // Explicitly close connection before dropping
+            if let Ok(conn) = self.py_conn.bind(py).getattr("close") {
+                let _ = conn.call0();
+            }
+            if let Ok(db) = self.py_db.bind(py).getattr("close") {
+                let _ = db.call0();
+            }
         });
     }
 
@@ -580,7 +584,7 @@ impl MemoryBackend for KuzuBackend {
                     py,
                     "MATCH (e:Experience) \
                      WHERE e.agent_name = $agent AND e.timestamp < $cutoff \
-                     DELETE e",
+                     DETACH DELETE e",
                     &age_params,
                 );
             }
@@ -707,7 +711,7 @@ impl MemoryBackend for KuzuBackend {
                                 .map_err(|e| MemoryError::Storage(format!("param error: {e}")))?;
                             let _ = self.execute(
                                 py,
-                                "MATCH (e:Experience {experience_id: $id}) DELETE e",
+                                "MATCH (e:Experience {experience_id: $id}) DETACH DELETE e",
                                 &del_params,
                             );
                         }
@@ -740,7 +744,7 @@ impl ExperienceBackend for KuzuBackend {
     }
 }
 
-/// Calculate total file size in a directory (non-recursive walk).
+/// Calculate total file size in a directory (recursive).
 fn walkdir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {
