@@ -18,6 +18,7 @@ pub(crate) fn sensory_to_dict(py: Python<'_>, s: &SensoryItem) -> PyResult<PyObj
     d.set_item("raw_data", &s.raw_data)?;
     d.set_item("observation_order", s.observation_order)?;
     d.set_item("expires_at", s.expires_at)?;
+    d.set_item("created_at", s.created_at.to_rfc3339())?;
     Ok(d.to_object(py))
 }
 
@@ -28,6 +29,7 @@ pub(crate) fn working_to_dict(py: Python<'_>, w: &WorkingMemorySlot) -> PyResult
     d.set_item("content", &w.content)?;
     d.set_item("relevance", w.relevance)?;
     d.set_item("task_id", &w.task_id)?;
+    d.set_item("created_at", w.created_at.to_rfc3339())?;
     Ok(d.to_object(py))
 }
 
@@ -38,6 +40,8 @@ pub(crate) fn episode_to_dict(py: Python<'_>, e: &EpisodicMemory) -> PyResult<Py
     d.set_item("source_label", &e.source_label)?;
     d.set_item("temporal_index", e.temporal_index)?;
     d.set_item("compressed", e.compressed)?;
+    d.set_item("created_at", e.created_at.to_rfc3339())?;
+    d.set_item("metadata", hashmap_to_pydict(py, &e.metadata)?)?;
     Ok(d.to_object(py))
 }
 
@@ -49,6 +53,8 @@ pub(crate) fn fact_to_dict(py: Python<'_>, f: &SemanticFact) -> PyResult<PyObjec
     d.set_item("confidence", f.confidence)?;
     d.set_item("source_id", &f.source_id)?;
     d.set_item("tags", f.tags.to_object(py))?;
+    d.set_item("created_at", f.created_at.to_rfc3339())?;
+    d.set_item("metadata", hashmap_to_pydict(py, &f.metadata)?)?;
     Ok(d.to_object(py))
 }
 
@@ -59,6 +65,7 @@ pub(crate) fn procedure_to_dict(py: Python<'_>, p: &ProceduralMemory) -> PyResul
     d.set_item("steps", p.steps.to_object(py))?;
     d.set_item("prerequisites", p.prerequisites.to_object(py))?;
     d.set_item("usage_count", p.usage_count)?;
+    d.set_item("created_at", p.created_at.to_rfc3339())?;
     Ok(d.to_object(py))
 }
 
@@ -70,6 +77,7 @@ pub(crate) fn prospective_to_dict(py: Python<'_>, p: &ProspectiveMemory) -> PyRe
     d.set_item("action_on_trigger", &p.action_on_trigger)?;
     d.set_item("status", &p.status)?;
     d.set_item("priority", p.priority)?;
+    d.set_item("created_at", p.created_at.to_rfc3339())?;
     Ok(d.to_object(py))
 }
 

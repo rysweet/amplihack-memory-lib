@@ -99,14 +99,14 @@ impl ExperienceStore {
 
     fn check_quota(&self) -> crate::Result<()> {
         if self.connector.db_path.exists() {
-            if let Ok(meta) = std::fs::metadata(&self.connector.db_path) {
-                let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
-                if size_mb > self.max_memory_mb as f64 {
-                    return Err(MemoryError::MemoryQuotaExceeded(format!(
-                        "Storage quota exceeded: {size_mb:.1}MB > {}MB",
-                        self.max_memory_mb
-                    )));
-                }
+            let meta = std::fs::metadata(&self.connector.db_path)
+                .map_err(|e| MemoryError::Storage(format!("Cannot read db metadata: {e}")))?;
+            let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
+            if size_mb > self.max_memory_mb as f64 {
+                return Err(MemoryError::MemoryQuotaExceeded(format!(
+                    "Storage quota exceeded: {size_mb:.1}MB > {}MB",
+                    self.max_memory_mb
+                )));
             }
         }
         Ok(())

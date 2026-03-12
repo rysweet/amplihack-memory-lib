@@ -91,8 +91,8 @@ impl SqliteBackend {
 
             CREATE TRIGGER IF NOT EXISTS experiences_fts_delete AFTER DELETE ON experiences
             BEGIN
-                INSERT INTO experiences_fts(experiences_fts, rowid, context, outcome)
-                VALUES('delete', old.rowid, old.context, old.outcome);
+                INSERT INTO experiences_fts(experiences_fts, rowid, experience_id, context, outcome)
+                VALUES('delete', old.rowid, old.experience_id, old.context, old.outcome);
             END;
             ",
         )

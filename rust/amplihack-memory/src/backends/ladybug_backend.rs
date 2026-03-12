@@ -114,8 +114,8 @@ impl LadybugBackend {
             serde_json::from_str(metadata_str).unwrap_or_default();
         let tags: Vec<String> = serde_json::from_str(tags_str).unwrap_or_default();
 
-        Ok(Experience {
-            experience_id: exp_id,
+        Experience::from_parts(
+            exp_id,
             experience_type,
             context,
             outcome,
@@ -123,7 +123,7 @@ impl LadybugBackend {
             timestamp,
             metadata,
             tags,
-        })
+        )
     }
 
     /// Build the standard RETURN clause used by retrieve and search queries.
@@ -134,7 +134,7 @@ impl LadybugBackend {
 
 impl MemoryBackend for LadybugBackend {
     fn initialize_schema(&mut self) -> crate::Result<()> {
-        let _ = self.exec_mut(
+        self.exec_mut(
             "CREATE NODE TABLE IF NOT EXISTS Experience(\
                 experience_id STRING, \
                 agent_name STRING, \
@@ -148,21 +148,21 @@ impl MemoryBackend for LadybugBackend {
                 compressed BOOLEAN, \
                 PRIMARY KEY(experience_id)\
             )",
-        );
+        )?;
 
-        let _ = self.exec_mut(
+        self.exec_mut(
             "CREATE REL TABLE IF NOT EXISTS SIMILAR_TO(\
                 FROM Experience TO Experience, \
                 similarity_score DOUBLE\
             )",
-        );
+        )?;
 
-        let _ = self.exec_mut(
+        self.exec_mut(
             "CREATE REL TABLE IF NOT EXISTS LEADS_TO(\
                 FROM Experience TO Experience, \
                 causal_strength DOUBLE\
             )",
-        );
+        )?;
 
         Ok(())
     }

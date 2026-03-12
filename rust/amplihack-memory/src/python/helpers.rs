@@ -15,7 +15,7 @@ pub(crate) fn mem_err(e: crate::MemoryError) -> PyErr {
 }
 
 pub(crate) fn parse_experience_type(s: &str) -> PyResult<ExperienceType> {
-    s.parse::<ExperienceType>().map_err(PyRuntimeError::new_err)
+    s.parse::<ExperienceType>().map_err(PyValueError::new_err)
 }
 
 pub(crate) fn json_to_py(py: Python<'_>, val: &serde_json::Value) -> PyResult<PyObject> {

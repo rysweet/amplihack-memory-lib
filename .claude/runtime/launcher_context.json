@@ -1,0 +1,8 @@
+{
+  "launcher": "copilot",
+  "command": "amplihack copilot ",
+  "timestamp": "2026-03-12T03:47:41.094819+00:00",
+  "environment": {
+    "AMPLIHACK_LAUNCHER": "copilot"
+  }
+}

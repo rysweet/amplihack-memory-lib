@@ -67,22 +67,14 @@ impl PatternDetector {
 
     /// Get occurrence count for a pattern type.
     pub fn get_occurrence_count(&self, pattern_type: &str) -> usize {
-        for (key, data) in &self.patterns {
-            if key.contains(pattern_type) {
-                return data.count;
-            }
-        }
-        0
+        self.patterns.get(pattern_type).map_or(0, |d| d.count)
     }
 
     /// Check if pattern has been recognized.
     pub fn is_pattern_recognized(&self, pattern_type: &str) -> bool {
-        for (key, data) in &self.patterns {
-            if key.contains(pattern_type) {
-                return data.count >= self.threshold;
-            }
-        }
-        false
+        self.patterns
+            .get(pattern_type)
+            .is_some_and(|d| d.count >= self.threshold)
     }
 
     /// Get all recognized patterns as experiences.
@@ -140,20 +132,18 @@ impl PatternDetector {
         let success_rate = validation.successes as f64 / total as f64;
         let failures = validation.failures;
 
-        for (key, data) in self.patterns.iter_mut() {
-            if key.contains(pattern_type) {
-                let base_conf = if data.base_confidence > 0.0 {
-                    data.base_confidence
-                } else {
-                    data.confidence
-                };
-                let mut multiplier = 0.7 + (0.4 * success_rate);
-                if failures > 5 {
-                    let penalty = ((failures - 5) as f64 * 0.02).min(0.2);
-                    multiplier -= penalty;
-                }
-                data.confidence = (base_conf * multiplier).clamp(0.1, 0.95);
+        if let Some(data) = self.patterns.get_mut(pattern_type) {
+            let base_conf = if data.base_confidence > 0.0 {
+                data.base_confidence
+            } else {
+                data.confidence
+            };
+            let mut multiplier = 0.7 + (0.4 * success_rate);
+            if failures > 5 {
+                let penalty = ((failures - 5) as f64 * 0.02).min(0.2);
+                multiplier -= penalty;
             }
+            data.confidence = (base_conf * multiplier).clamp(0.1, 0.95);
         }
     }
 

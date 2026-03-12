@@ -123,12 +123,22 @@ pub fn rerank_facts_by_query(
     top_k: usize,
 ) -> Vec<HashMap<String, serde_json::Value>> {
     if facts.is_empty() || query.is_empty() {
-        return facts.to_vec();
+        let all = facts.to_vec();
+        return if top_k > 0 {
+            all.into_iter().take(top_k).collect()
+        } else {
+            all
+        };
     }
 
     let query_tokens = tokenize(query);
     if query_tokens.is_empty() {
-        return facts.to_vec();
+        let all = facts.to_vec();
+        return if top_k > 0 {
+            all.into_iter().take(top_k).collect()
+        } else {
+            all
+        };
     }
 
     let query_lower = query.to_lowercase();
@@ -294,11 +304,22 @@ mod tests {
 
         let result = rerank_facts_by_query(&facts, "fact data", 3);
         assert_eq!(result.len(), 3);
-        // Verify ranking: each result should have a _rerank_score, in descending order
+        // Verify ranking by recomputing Jaccard overlap scores
+        let query_tokens = super::tokenize("fact data");
         let scores: Vec<f64> = result
             .iter()
-            .filter_map(|r| r.get("_rerank_score").and_then(|v| v.as_f64()))
+            .map(|r| {
+                let ctx = r.get("context").and_then(|v| v.as_str()).unwrap_or("");
+                let out = r.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
+                let fact_text = format!("{ctx} {out}");
+                let fact_tokens = super::tokenize(&fact_text);
+                if fact_tokens.is_empty() {
+                    return 0.0;
+                }
+                query_tokens.intersection(&fact_tokens).count() as f64 / query_tokens.len() as f64
+            })
             .collect();
+        assert!(!scores.is_empty(), "should have scores to verify");
         for w in scores.windows(2) {
             assert!(w[0] >= w[1], "results should be sorted by descending score");
         }
