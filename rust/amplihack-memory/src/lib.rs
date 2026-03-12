@@ -28,7 +28,7 @@ pub mod hierarchical_memory;
 pub mod memory_types;
 pub mod pattern_recognition;
 #[cfg(feature = "python")]
-pub mod python_module;
+pub mod python;
 pub mod security;
 pub mod semantic_search;
 pub mod similarity;
