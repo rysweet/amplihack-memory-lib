@@ -16,6 +16,12 @@ compile_error!(
      `kuzu` uses pyo3/auto-initialize (Rust calls Python)."
 );
 
+#[cfg(all(feature = "kuzu", feature = "ladybug"))]
+compile_error!(
+    "Features `kuzu` and `ladybug` are mutually exclusive. \
+     Use one graph backend at a time."
+);
+
 pub mod backends;
 pub mod cognitive_memory;
 pub mod connector;
@@ -72,6 +78,8 @@ pub use pattern_recognition::{
 
 #[cfg(feature = "kuzu")]
 pub use backends::KuzuBackend;
+#[cfg(feature = "ladybug")]
+pub use backends::LadybugBackend;
 pub use backends::{ExperienceBackend, MemoryBackend, SqliteBackend};
 pub use cognitive_memory::CognitiveMemory;
 pub use connector::{BackendType, MemoryConnector};

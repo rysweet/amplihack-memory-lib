@@ -21,6 +21,7 @@ dirs = "5"
 sha2 = "0.10"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+ladybug-graph-rs = { path = "../../ladybug-graph-rs", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -29,6 +30,7 @@ tempfile = "3"
 default = []
 kuzu = ["dep:pyo3", "pyo3/auto-initialize"]
 python = ["dep:pyo3", "pyo3/extension-module"]
+ladybug = ["dep:ladybug-graph-rs"]
 
 [dependencies.pyo3]
 version = "0.22"
