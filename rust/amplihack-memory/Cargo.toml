@@ -35,4 +35,7 @@ version = "0.22"
 optional = true
 
 [lib]
-crate-type = ["lib", "cdylib"]
+# cdylib is only needed when building the Python extension module.
+# maturin adds it automatically; keeping just "lib" avoids unnecessary
+# linker work for pure-Rust consumers.
+crate-type = ["lib"]

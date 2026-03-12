@@ -3,10 +3,13 @@
 //! Compiled only with `--features python`. Produces a `amplihack_memory_rs`
 //! native module importable from Python.
 
+// PyO3 proc-macro generates Into conversions that clippy flags as useless.
+#![allow(clippy::useless_conversion)]
+
 use std::collections::HashMap;
 use std::path::Path;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -34,32 +37,34 @@ fn mem_err(e: crate::MemoryError) -> PyErr {
 }
 
 fn parse_experience_type(s: &str) -> PyResult<ExperienceType> {
-    s.parse::<ExperienceType>()
-        .map_err(|e| PyRuntimeError::new_err(e))
+    s.parse::<ExperienceType>().map_err(PyRuntimeError::new_err)
 }
 
-fn json_to_py(py: Python<'_>, val: &serde_json::Value) -> PyObject {
+fn json_to_py(py: Python<'_>, val: &serde_json::Value) -> PyResult<PyObject> {
     match val {
-        serde_json::Value::Null => py.None(),
-        serde_json::Value::Bool(b) => b.to_object(py),
+        serde_json::Value::Null => Ok(py.None()),
+        serde_json::Value::Bool(b) => Ok(b.to_object(py)),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                i.to_object(py)
+                Ok(i.to_object(py))
             } else {
-                n.as_f64().unwrap_or(0.0).to_object(py)
+                Ok(n.as_f64().unwrap_or(0.0).to_object(py))
             }
         }
-        serde_json::Value::String(s) => s.to_object(py),
+        serde_json::Value::String(s) => Ok(s.to_object(py)),
         serde_json::Value::Array(arr) => {
-            let items: Vec<PyObject> = arr.iter().map(|v| json_to_py(py, v)).collect();
-            PyList::new_bound(py, items).to_object(py)
+            let items: Vec<PyObject> = arr
+                .iter()
+                .map(|v| json_to_py(py, v))
+                .collect::<PyResult<_>>()?;
+            Ok(PyList::new_bound(py, items).to_object(py))
         }
         serde_json::Value::Object(map) => {
             let d = PyDict::new_bound(py);
             for (k, v) in map {
-                d.set_item(k, json_to_py(py, v)).unwrap();
+                d.set_item(k, json_to_py(py, v)?)?;
             }
-            d.to_object(py)
+            Ok(d.to_object(py))
         }
     }
 }
@@ -113,7 +118,7 @@ fn hashmap_to_pydict(
 ) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
     for (k, v) in map {
-        d.set_item(k, json_to_py(py, v))?;
+        d.set_item(k, json_to_py(py, v)?)?;
     }
     Ok(d.to_object(py))
 }
@@ -132,15 +137,8 @@ fn storage_stats_to_dict(py: Python<'_>, stats: &StorageStatistics) -> PyResult<
     Ok(d.to_object(py))
 }
 
-fn parse_category(s: &str) -> MemoryCategory {
-    match s.to_lowercase().as_str() {
-        "sensory" => MemoryCategory::Sensory,
-        "working" => MemoryCategory::Working,
-        "episodic" => MemoryCategory::Episodic,
-        "procedural" => MemoryCategory::Procedural,
-        "prospective" => MemoryCategory::Prospective,
-        _ => MemoryCategory::Semantic,
-    }
+fn parse_category(s: &str) -> PyResult<MemoryCategory> {
+    s.parse::<MemoryCategory>().map_err(PyValueError::new_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +419,7 @@ impl PyCognitiveMemory {
 
     /// Get recent sensory items as list of dicts.
     #[pyo3(signature = (limit=10))]
-    fn get_recent_sensory(&self, py: Python<'_>, limit: usize) -> Vec<PyObject> {
+    fn get_recent_sensory(&self, py: Python<'_>, limit: usize) -> PyResult<Vec<PyObject>> {
         self.inner
             .get_recent_sensory(limit)
             .iter()
@@ -451,7 +449,7 @@ impl PyCognitiveMemory {
     }
 
     /// Recall working memory items for a task.
-    fn recall_working(&self, py: Python<'_>, task_id: &str) -> Vec<PyObject> {
+    fn recall_working(&self, py: Python<'_>, task_id: &str) -> PyResult<Vec<PyObject>> {
         self.inner
             .recall_working(task_id)
             .iter()
@@ -486,7 +484,7 @@ impl PyCognitiveMemory {
 
     /// Recall episodes.
     #[pyo3(signature = (limit=10))]
-    fn recall_episodes(&self, py: Python<'_>, limit: usize) -> Vec<PyObject> {
+    fn recall_episodes(&self, py: Python<'_>, limit: usize) -> PyResult<Vec<PyObject>> {
         self.inner
             .recall_episodes(limit)
             .iter()
@@ -532,7 +530,7 @@ impl PyCognitiveMemory {
         query: &str,
         limit: usize,
         min_confidence: f64,
-    ) -> Vec<PyObject> {
+    ) -> PyResult<Vec<PyObject>> {
         self.inner
             .search_facts(query, limit, min_confidence)
             .iter()
@@ -558,7 +556,12 @@ impl PyCognitiveMemory {
 
     /// Recall procedures matching a query.
     #[pyo3(signature = (query, limit=5))]
-    fn recall_procedures(&mut self, py: Python<'_>, query: &str, limit: usize) -> Vec<PyObject> {
+    fn recall_procedures(
+        &mut self,
+        py: Python<'_>,
+        query: &str,
+        limit: usize,
+    ) -> PyResult<Vec<PyObject>> {
         self.inner
             .recall_procedures_mut(query, limit)
             .iter()
@@ -583,7 +586,7 @@ impl PyCognitiveMemory {
     }
 
     /// Check which prospective memories are triggered by content.
-    fn check_triggers(&mut self, py: Python<'_>, content: &str) -> Vec<PyObject> {
+    fn check_triggers(&mut self, py: Python<'_>, content: &str) -> PyResult<Vec<PyObject>> {
         self.inner
             .check_triggers(content)
             .iter()
@@ -627,6 +630,7 @@ impl PyHierarchicalMemory {
     }
 
     /// Store a knowledge node.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (content, concept, confidence, source_id, tags=None, metadata=None, category=None))]
     fn store_knowledge(
         &mut self,
@@ -639,7 +643,7 @@ impl PyHierarchicalMemory {
         category: Option<&str>,
     ) -> PyResult<String> {
         let tag_vec = tags.unwrap_or_default();
-        let cat = category.map(|c| parse_category(c));
+        let cat = category.map(parse_category).transpose()?;
         let meta = match metadata {
             Some(d) => Some(pydict_to_hashmap(Some(d))?),
             None => None,
@@ -722,7 +726,7 @@ impl PyHierarchicalMemory {
         category: Option<&str>,
         limit: usize,
     ) -> PyResult<Vec<PyObject>> {
-        let cat = category.map(|c| parse_category(c));
+        let cat = category.map(parse_category).transpose()?;
         self.inner
             .get_all_knowledge(cat, limit)
             .iter()
@@ -735,7 +739,7 @@ impl PyHierarchicalMemory {
         let stats = self.inner.get_statistics();
         let d = PyDict::new_bound(py);
         for (k, v) in &stats {
-            d.set_item(k, json_to_py(py, v))?;
+            d.set_item(k, json_to_py(py, v)?)?;
         }
         Ok(d.to_object(py))
     }
@@ -798,70 +802,66 @@ fn py_scrub_credentials(text: &str) -> (String, bool) {
 // Type-to-dict helpers
 // ---------------------------------------------------------------------------
 
-fn sensory_to_dict(py: Python<'_>, s: &SensoryItem) -> PyObject {
+fn sensory_to_dict(py: Python<'_>, s: &SensoryItem) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
-    d.set_item("node_id", &s.node_id).unwrap();
-    d.set_item("modality", &s.modality).unwrap();
-    d.set_item("raw_data", &s.raw_data).unwrap();
-    d.set_item("observation_order", s.observation_order)
-        .unwrap();
-    d.set_item("expires_at", s.expires_at).unwrap();
-    d.to_object(py)
+    d.set_item("node_id", &s.node_id)?;
+    d.set_item("modality", &s.modality)?;
+    d.set_item("raw_data", &s.raw_data)?;
+    d.set_item("observation_order", s.observation_order)?;
+    d.set_item("expires_at", s.expires_at)?;
+    Ok(d.to_object(py))
 }
 
-fn working_to_dict(py: Python<'_>, w: &WorkingMemorySlot) -> PyObject {
+fn working_to_dict(py: Python<'_>, w: &WorkingMemorySlot) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
-    d.set_item("node_id", &w.node_id).unwrap();
-    d.set_item("slot_type", &w.slot_type).unwrap();
-    d.set_item("content", &w.content).unwrap();
-    d.set_item("relevance", w.relevance).unwrap();
-    d.set_item("task_id", &w.task_id).unwrap();
-    d.to_object(py)
+    d.set_item("node_id", &w.node_id)?;
+    d.set_item("slot_type", &w.slot_type)?;
+    d.set_item("content", &w.content)?;
+    d.set_item("relevance", w.relevance)?;
+    d.set_item("task_id", &w.task_id)?;
+    Ok(d.to_object(py))
 }
 
-fn episode_to_dict(py: Python<'_>, e: &EpisodicMemory) -> PyObject {
+fn episode_to_dict(py: Python<'_>, e: &EpisodicMemory) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
-    d.set_item("node_id", &e.node_id).unwrap();
-    d.set_item("content", &e.content).unwrap();
-    d.set_item("source_label", &e.source_label).unwrap();
-    d.set_item("temporal_index", e.temporal_index).unwrap();
-    d.set_item("compressed", e.compressed).unwrap();
-    d.to_object(py)
+    d.set_item("node_id", &e.node_id)?;
+    d.set_item("content", &e.content)?;
+    d.set_item("source_label", &e.source_label)?;
+    d.set_item("temporal_index", e.temporal_index)?;
+    d.set_item("compressed", e.compressed)?;
+    Ok(d.to_object(py))
 }
 
-fn fact_to_dict(py: Python<'_>, f: &SemanticFact) -> PyObject {
+fn fact_to_dict(py: Python<'_>, f: &SemanticFact) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
-    d.set_item("node_id", &f.node_id).unwrap();
-    d.set_item("concept", &f.concept).unwrap();
-    d.set_item("content", &f.content).unwrap();
-    d.set_item("confidence", f.confidence).unwrap();
-    d.set_item("source_id", &f.source_id).unwrap();
-    d.set_item("tags", f.tags.to_object(py)).unwrap();
-    d.to_object(py)
+    d.set_item("node_id", &f.node_id)?;
+    d.set_item("concept", &f.concept)?;
+    d.set_item("content", &f.content)?;
+    d.set_item("confidence", f.confidence)?;
+    d.set_item("source_id", &f.source_id)?;
+    d.set_item("tags", f.tags.to_object(py))?;
+    Ok(d.to_object(py))
 }
 
-fn procedure_to_dict(py: Python<'_>, p: &ProceduralMemory) -> PyObject {
+fn procedure_to_dict(py: Python<'_>, p: &ProceduralMemory) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
-    d.set_item("node_id", &p.node_id).unwrap();
-    d.set_item("name", &p.name).unwrap();
-    d.set_item("steps", p.steps.to_object(py)).unwrap();
-    d.set_item("prerequisites", p.prerequisites.to_object(py))
-        .unwrap();
-    d.set_item("usage_count", p.usage_count).unwrap();
-    d.to_object(py)
+    d.set_item("node_id", &p.node_id)?;
+    d.set_item("name", &p.name)?;
+    d.set_item("steps", p.steps.to_object(py))?;
+    d.set_item("prerequisites", p.prerequisites.to_object(py))?;
+    d.set_item("usage_count", p.usage_count)?;
+    Ok(d.to_object(py))
 }
 
-fn prospective_to_dict(py: Python<'_>, p: &ProspectiveMemory) -> PyObject {
+fn prospective_to_dict(py: Python<'_>, p: &ProspectiveMemory) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
-    d.set_item("node_id", &p.node_id).unwrap();
-    d.set_item("description", &p.description).unwrap();
-    d.set_item("trigger_condition", &p.trigger_condition)
-        .unwrap();
-    d.set_item("action_on_trigger", &p.action_on_trigger)
-        .unwrap();
-    d.set_item("status", &p.status).unwrap();
-    d.set_item("priority", p.priority).unwrap();
-    d.to_object(py)
+    d.set_item("node_id", &p.node_id)?;
+    d.set_item("description", &p.description)?;
+    d.set_item("trigger_condition", &p.trigger_condition)?;
+    d.set_item("action_on_trigger", &p.action_on_trigger)?;
+    d.set_item("status", &p.status)?;
+    d.set_item("priority", p.priority)?;
+    Ok(d.to_object(py))
 }
 
 fn knowledge_node_to_dict(py: Python<'_>, n: &KnowledgeNode) -> PyResult<PyObject> {
