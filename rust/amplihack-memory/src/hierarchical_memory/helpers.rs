@@ -142,3 +142,104 @@ pub(crate) fn rank_and_truncate(
     nodes.truncate(max_nodes);
     nodes
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{GraphEdge, GraphNode};
+
+    fn make_knode(id: &str, content: &str, confidence: f64) -> KnowledgeNode {
+        KnowledgeNode {
+            node_id: id.to_string(),
+            content: content.to_string(),
+            confidence,
+            ..KnowledgeNode::default()
+        }
+    }
+
+    #[test]
+    fn test_build_sim_map() {
+        let m = build_sim_map("content", "concept", &["t1".into()]);
+        assert_eq!(m.get("content").unwrap().as_str().unwrap(), "content");
+        assert_eq!(m.get("concept").unwrap().as_str().unwrap(), "concept");
+    }
+
+    #[test]
+    fn test_build_sim_map_empty() {
+        let m = build_sim_map("", "", &[]);
+        assert_eq!(m.get("content").unwrap().as_str().unwrap(), "");
+    }
+
+    #[test]
+    fn test_graph_node_to_knowledge_node_defaults() {
+        let gn = GraphNode::new("n1".into(), "Fact".into());
+        let kn = graph_node_to_knowledge_node(&gn);
+        assert_eq!(kn.node_id, "n1");
+        assert!((kn.confidence - 0.8).abs() < 0.01);
+        assert_eq!(kn.category, MemoryCategory::Semantic);
+    }
+
+    #[test]
+    fn test_graph_node_to_knowledge_node_full() {
+        let mut props = HashMap::new();
+        props.insert("content".into(), "Rust is fast".into());
+        props.insert("confidence".into(), "0.95".into());
+        props.insert("tags".into(), r#"["lang"]"#.into());
+        props.insert("metadata".into(), r#"{"category":"procedural"}"#.into());
+        let gn = GraphNode { node_id: "n2".into(), node_type: "F".into(), properties: props, graph_origin: String::new() };
+        let kn = graph_node_to_knowledge_node(&gn);
+        assert!((kn.confidence - 0.95).abs() < 0.01);
+        assert_eq!(kn.category, MemoryCategory::Procedural);
+    }
+
+    #[test]
+    fn test_parse_edge_metadata_valid() {
+        let mut props = HashMap::new();
+        props.insert("metadata".into(), r#"{"w":0.5}"#.into());
+        let edge = GraphEdge { edge_id: String::new(), source_id: "a".into(), target_id: "b".into(), edge_type: "L".into(), properties: props, graph_origin: String::new() };
+        let meta = parse_edge_metadata(&edge);
+        assert!((meta.get("w").unwrap().as_f64().unwrap() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_edge_metadata_missing() {
+        let edge = GraphEdge::new("a".into(), "b".into(), "L".into());
+        assert!(parse_edge_metadata(&edge).is_empty());
+    }
+
+    #[test]
+    fn test_parse_edge_metadata_invalid() {
+        let mut props = HashMap::new();
+        props.insert("metadata".into(), "not json".into());
+        let edge = GraphEdge { edge_id: String::new(), source_id: "a".into(), target_id: "b".into(), edge_type: "L".into(), properties: props, graph_origin: String::new() };
+        assert!(parse_edge_metadata(&edge).is_empty());
+    }
+
+    #[test]
+    fn test_rank_and_truncate_basic() {
+        let nodes = vec![make_knode("a", "rust programming", 0.5), make_knode("b", "rust compiler", 0.9)];
+        let result = rank_and_truncate(nodes, &["rust".into()], 1);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_rank_and_truncate_empty() {
+        let result = rank_and_truncate(vec![], &["kw".into()], 10);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_store_id_re() {
+        assert!(STORE_ID_RE.is_match("my-agent"));
+        assert!(!STORE_ID_RE.is_match(""));
+        assert!(!STORE_ID_RE.is_match("-bad"));
+    }
+
+    #[test]
+    fn test_make_id_and_now_iso() {
+        let id = make_id();
+        assert_eq!(id.len(), 36);
+        let ts = now_iso();
+        assert!(ts.starts_with("20"));
+    }
+}

@@ -20,22 +20,33 @@ const MIN_RECENCY_FACTOR: f64 = 0.7;
 /// Maximum similarity score after all adjustments.
 const MAX_SIMILARITY_SCORE: f64 = 1.0;
 
-/// Simple TF-IDF similarity calculator (word overlap approximation).
+/// Compute TF-IDF-style word similarity between two texts.
+///
+/// Delegates to [`crate::similarity::compute_word_similarity`].
+pub fn tfidf_similarity(text1: &str, text2: &str) -> f64 {
+    compute_word_similarity(text1, text2)
+}
+
+/// Simple Jaccard similarity calculator (word overlap).
 ///
 /// Delegates to [`crate::similarity::compute_word_similarity`] to avoid
 /// duplicating the Jaccard implementation.
-pub struct TfIdfSimilarity;
+pub struct JaccardSimilarity;
 
-impl TfIdfSimilarity {
+impl JaccardSimilarity {
     /// Calculate similarity between two texts using Jaccard similarity.
     pub fn calculate(text1: &str, text2: &str) -> f64 {
         compute_word_similarity(text1, text2)
     }
 }
 
+/// Deprecated alias for [`JaccardSimilarity`].
+#[deprecated(since = "0.2.0", note = "renamed to JaccardSimilarity")]
+pub type TfIdfSimilarity = JaccardSimilarity;
+
 /// Calculate relevance score for experience given query.
 pub fn calculate_relevance(experience: &Experience, query: &str) -> f64 {
-    let mut similarity = TfIdfSimilarity::calculate(&experience.context, query);
+    let mut similarity = JaccardSimilarity::calculate(&experience.context, query);
 
     // Type weighting
     match experience.experience_type {
@@ -100,6 +111,7 @@ impl SemanticSearchEngine {
     ///
     /// This implementation uses a linear scan, so it is always considered
     /// indexed. Returns `true` unconditionally.
+    #[deprecated(note = "always returns true; will be removed in a future release")]
     pub fn is_indexed(&self) -> bool {
         true
     }
@@ -147,14 +159,14 @@ mod tests {
     }
 
     #[test]
-    fn test_tfidf_identical() {
-        let sim = TfIdfSimilarity::calculate("hello world", "hello world");
+    fn test_jaccard_identical() {
+        let sim = JaccardSimilarity::calculate("hello world", "hello world");
         assert!((sim - 1.0).abs() < 0.01);
     }
 
     #[test]
-    fn test_tfidf_empty() {
-        assert_eq!(TfIdfSimilarity::calculate("", "hello"), 0.0);
+    fn test_jaccard_empty() {
+        assert_eq!(JaccardSimilarity::calculate("", "hello"), 0.0);
     }
 
     #[test]
@@ -202,7 +214,9 @@ mod tests {
         .unwrap();
         let engine = SemanticSearchEngine::new(vec![exp]);
         assert_eq!(engine.corpus_size(), 1);
-        assert!(engine.is_indexed());
+        #[allow(deprecated)]
+        let indexed = engine.is_indexed();
+        assert!(indexed);
 
         let results = engine.search("rust", 10);
         assert_eq!(results.len(), 1);
@@ -245,26 +259,26 @@ mod tests {
     // --- New parity tests ---
 
     #[test]
-    fn test_tfidf_completely_different() {
-        let sim = TfIdfSimilarity::calculate("alpha beta gamma", "delta epsilon zeta");
+    fn test_jaccard_completely_different() {
+        let sim = JaccardSimilarity::calculate("alpha beta gamma", "delta epsilon zeta");
         assert!(sim < 0.01, "disjoint word sets should have ~0 similarity");
     }
 
     #[test]
-    fn test_tfidf_partial_overlap() {
-        let sim = TfIdfSimilarity::calculate("hello world foo", "hello world bar");
+    fn test_jaccard_partial_overlap() {
+        let sim = JaccardSimilarity::calculate("hello world foo", "hello world bar");
         // Jaccard: intersection=2 (hello,world), union=4 (hello,world,foo,bar) => 0.5
         assert!((sim - 0.5).abs() < 0.01);
     }
 
     #[test]
-    fn test_tfidf_both_empty() {
-        assert_eq!(TfIdfSimilarity::calculate("", ""), 0.0);
+    fn test_jaccard_both_empty() {
+        assert_eq!(JaccardSimilarity::calculate("", ""), 0.0);
     }
 
     #[test]
-    fn test_tfidf_case_insensitivity() {
-        let sim = TfIdfSimilarity::calculate("Hello WORLD", "hello world");
+    fn test_jaccard_case_insensitivity() {
+        let sim = JaccardSimilarity::calculate("Hello WORLD", "hello world");
         assert!(
             (sim - 1.0).abs() < 0.01,
             "case should not affect similarity"
@@ -272,14 +286,14 @@ mod tests {
     }
 
     #[test]
-    fn test_tfidf_single_word_match() {
-        let sim = TfIdfSimilarity::calculate("hello", "hello");
+    fn test_jaccard_single_word_match() {
+        let sim = JaccardSimilarity::calculate("hello", "hello");
         assert!((sim - 1.0).abs() < 0.01);
     }
 
     #[test]
-    fn test_tfidf_single_word_mismatch() {
-        let sim = TfIdfSimilarity::calculate("hello", "goodbye");
+    fn test_jaccard_single_word_mismatch() {
+        let sim = JaccardSimilarity::calculate("hello", "goodbye");
         assert!(sim < 0.01);
     }
 
@@ -287,7 +301,9 @@ mod tests {
     fn test_search_engine_creation_empty() {
         let engine = SemanticSearchEngine::new(vec![]);
         assert_eq!(engine.corpus_size(), 0);
-        assert!(engine.is_indexed());
+        #[allow(deprecated)]
+        let indexed = engine.is_indexed();
+        assert!(indexed);
     }
 
     #[test]

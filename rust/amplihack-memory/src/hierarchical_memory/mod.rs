@@ -258,7 +258,11 @@ impl HierarchicalMemory {
     }
 
     /// Search for nodes matching a concept keyword.
-    pub fn search_by_concept(&self, keywords: &[String], limit: usize) -> Vec<KnowledgeNode> {
+    pub fn search_by_concept(
+        &self,
+        keywords: &[impl AsRef<str>],
+        limit: usize,
+    ) -> Vec<KnowledgeNode> {
         if keywords.is_empty() {
             return Vec::new();
         }
@@ -268,7 +272,7 @@ impl HierarchicalMemory {
         let agent_filter = self.agent_filter();
 
         for kw in keywords {
-            let kw_lower = kw.trim().to_lowercase();
+            let kw_lower = kw.as_ref().trim().to_lowercase();
             if kw_lower.len() <= 2 {
                 continue;
             }

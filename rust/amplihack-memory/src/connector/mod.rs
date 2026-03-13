@@ -32,9 +32,9 @@ pub(crate) enum BackendInner {
 ///
 /// Factory class that delegates to the selected backend implementation.
 pub struct MemoryConnector {
-    pub agent_name: String,
-    pub storage_path: PathBuf,
-    pub db_path: PathBuf,
+    agent_name: String,
+    storage_path: PathBuf,
+    db_path: PathBuf,
     pub(crate) backend: BackendInner,
 }
 
@@ -125,5 +125,15 @@ impl MemoryConnector {
             db_path,
             backend,
         })
+    }
+
+    pub fn agent_name(&self) -> &str {
+        &self.agent_name
+    }
+    pub fn storage_path(&self) -> &Path {
+        &self.storage_path
+    }
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
     }
 }

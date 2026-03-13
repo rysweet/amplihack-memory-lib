@@ -113,14 +113,14 @@ fn test_pattern_one_below_threshold() {
 #[test]
 fn test_confidence_formula_minimum() {
     // 1 occurrence: 0.5 + 0.1 = 0.6
-    let conf = calculate_pattern_confidence(1, 3);
+    let conf = calculate_pattern_confidence(1);
     assert!((conf - 0.6).abs() < 0.01);
 }
 
 #[test]
 fn test_confidence_formula_cap() {
     // 100 occurrences: 0.5 + 10.0 = capped at 0.95
-    let conf = calculate_pattern_confidence(100, 3);
+    let conf = calculate_pattern_confidence(100);
     assert!((conf - 0.95).abs() < 0.01);
 }
 

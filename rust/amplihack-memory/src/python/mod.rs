@@ -40,7 +40,7 @@ use crate::similarity::compute_word_similarity;
 #[pyfunction]
 #[pyo3(name = "extract_entities")]
 fn py_extract_entities(text: &str, concept: &str) -> String {
-    extract_entity_name(text, concept)
+    extract_entity_name(text, concept).unwrap_or_default()
 }
 
 /// Compute Jaccard word-level similarity between two strings (0.0–1.0).

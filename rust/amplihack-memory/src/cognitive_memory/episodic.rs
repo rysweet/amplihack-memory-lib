@@ -113,7 +113,7 @@ impl CognitiveMemory {
         &mut self,
         batch_size: usize,
         summarizer: Option<F>,
-    ) -> Option<String>
+    ) -> Result<Option<String>>
     where
         F: FnOnce(&[String]) -> String,
     {
@@ -140,7 +140,7 @@ impl CognitiveMemory {
         candidates.sort_by_key(|(_, _, tidx)| *tidx);
 
         if candidates.len() < batch_size {
-            return None;
+            return Ok(None);
         }
 
         let batch: Vec<(String, String, i64)> = candidates.into_iter().take(batch_size).collect();
@@ -162,19 +162,17 @@ impl CognitiveMemory {
         props.insert("original_count".to_string(), batch.len().to_string());
         props.insert("created_at".to_string(), now.to_string());
 
-        if self
-            .graph
+        self.graph
             .add_node(NT_CONSOLIDATED, props, Some(&cons_id))
-            .is_err()
-        {
-            return None;
-        }
+            .map_err(|e| MemoryError::Storage(e.to_string()))?;
 
         // Mark originals as compressed and create edges
-        for (ep_id, _, _) in &batch {
+        for (idx, (ep_id, _, _)) in batch.iter().enumerate() {
             let mut update = HashMap::new();
             update.insert("compressed".to_string(), "true".to_string());
-            let _ = self.graph.update_node(ep_id, update);
+            if !self.graph.update_node(ep_id, update) {
+                warn!("consolidate_episodes: failed to mark episode {ep_id} as compressed");
+            }
 
             // Best-effort edge
             if let Err(e) = self.graph.add_edge(
@@ -190,14 +188,28 @@ impl CognitiveMemory {
                 warn!("consolidate_episodes: failed to add CONSOLIDATES edge: {e}");
                 // Rollback: revert compressed flags on all episodes in this batch
                 for (rollback_id, _, _) in &batch {
-                    let mut rollback = HashMap::new();
-                    rollback.insert("compressed".to_string(), "false".to_string());
-                    let _ = self.graph.update_node(rollback_id, rollback);
+                    if !self.graph.update_node(rollback_id, {
+                        let mut rollback = HashMap::new();
+                        rollback.insert("compressed".to_string(), "false".to_string());
+                        rollback
+                    }) {
+                        warn!("consolidate_episodes: failed to rollback compressed flag on {rollback_id}");
+                    }
                 }
-                return None;
+                // Delete previously-created edges for this consolidated node
+                for (prev_ep_id, _, _) in &batch[..idx] {
+                    let _ = self
+                        .graph
+                        .delete_edge(&cons_id, prev_ep_id, ET_CONSOLIDATES);
+                }
+                // Delete the consolidated node itself
+                let _ = self.graph.delete_node(&cons_id);
+                return Err(MemoryError::Storage(format!(
+                    "failed to add CONSOLIDATES edge: {e}"
+                )));
             }
         }
 
-        Some(cons_id)
+        Ok(Some(cons_id))
     }
 }

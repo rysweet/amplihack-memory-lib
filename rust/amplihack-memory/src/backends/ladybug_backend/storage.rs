@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use chrono::Utc;
 use ladybug_graph_rs::Property;
 
-use super::{walkdir_size, LadybugBackend};
-use crate::backends::base::{MemoryBackend, StorageStatistics};
+use super::LadybugBackend;
+use crate::backends::base::{walkdir_size, MemoryBackend, StorageStatistics};
 use crate::errors::MemoryError;
 use crate::experience::{Experience, ExperienceType};
 
@@ -48,21 +48,7 @@ impl MemoryBackend for LadybugBackend {
     }
 
     fn store_experience(&mut self, experience: &Experience) -> crate::Result<String> {
-        if experience.context.trim().is_empty() {
-            return Err(MemoryError::InvalidExperience(
-                "context cannot be empty".into(),
-            ));
-        }
-        if experience.outcome.trim().is_empty() {
-            return Err(MemoryError::InvalidExperience(
-                "outcome cannot be empty".into(),
-            ));
-        }
-        if !(0.0..=1.0).contains(&experience.confidence) {
-            return Err(MemoryError::InvalidExperience(
-                "confidence must be between 0.0 and 1.0".into(),
-            ));
-        }
+        experience.validate()?;
 
         let metadata_json =
             serde_json::to_string(&experience.metadata).unwrap_or_else(|_| "{}".to_string());
@@ -203,7 +189,7 @@ impl MemoryBackend for LadybugBackend {
             .and_then(|p| p.as_i64())
             .unwrap_or(0) as usize;
 
-        let compression_ratio = if compressed > 0 { 3.0 } else { 1.0 };
+        let compression_ratio = 1.0;
 
         Ok(StorageStatistics {
             total_experiences: total,
@@ -229,7 +215,7 @@ impl MemoryBackend for LadybugBackend {
         // 1. Mark old experiences as compressed (>30 days)
         if auto_compress && self.enable_compression {
             let cutoff = (Utc::now() - chrono::Duration::days(30)).timestamp();
-            if let Err(e) = self.exec(
+            self.exec(
                 "MATCH (e:Experience) \
                  WHERE e.agent_name = $agent AND e.timestamp < $cutoff AND e.compressed = false \
                  SET e.compressed = true",
@@ -237,15 +223,13 @@ impl MemoryBackend for LadybugBackend {
                     ("agent", Property::from(agent.as_str())),
                     ("cutoff", Property::Int64(cutoff)),
                 ],
-            ) {
-                warn!("cleanup: failed to auto-compress old experiences: {e}");
-            }
+            )?;
         }
 
         // 2. Delete experiences older than max_age_days
         if let Some(days) = max_age_days {
             let cutoff = (Utc::now() - chrono::Duration::days(days)).timestamp();
-            if let Err(e) = self.exec(
+            self.exec(
                 "MATCH (e:Experience) \
                  WHERE e.agent_name = $agent AND e.timestamp < $cutoff \
                  DETACH DELETE e",
@@ -253,9 +237,7 @@ impl MemoryBackend for LadybugBackend {
                     ("agent", Property::from(agent.as_str())),
                     ("cutoff", Property::Int64(cutoff)),
                 ],
-            ) {
-                warn!("cleanup: failed to delete experiences older than {days} days: {e}");
-            }
+            )?;
         }
 
         // 3. Limit to max_experiences
