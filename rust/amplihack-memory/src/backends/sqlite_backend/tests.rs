@@ -229,4 +229,33 @@ mod tests {
         let results = MemoryBackend::search(&backend, "AND", None, 0.0, 10).unwrap();
         assert_eq!(results.len(), 1);
     }
+
+    #[test]
+    fn test_qa_retrieve_with_logging() {
+        let (mut backend, _tmp) = test_backend();
+        let exp = test_experience();
+        backend.store_experience(&exp).unwrap();
+        let results = backend.retrieve_experiences(Some(10), None, 0.0).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_qa_statistics_propagation() {
+        let (mut backend, _tmp) = test_backend();
+        let exp = test_experience();
+        backend.store_experience(&exp).unwrap();
+        let stats = backend.get_statistics().unwrap();
+        assert_eq!(stats.total_experiences, 1);
+        assert_eq!(stats.compressed_experiences, 0);
+    }
+
+    #[test]
+    fn test_qa_cleanup_propagation() {
+        let (mut backend, _tmp) = test_backend();
+        for _ in 0..5 {
+            backend.store_experience(&test_experience()).unwrap();
+        }
+        let result = backend.cleanup(false, None, Some(3));
+        assert!(result.is_ok());
+    }
 }

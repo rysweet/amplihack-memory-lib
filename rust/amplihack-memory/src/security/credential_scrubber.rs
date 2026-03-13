@@ -98,11 +98,33 @@ impl CredentialScrubber {
     pub fn scrub_experience(&self, experience: &Experience) -> crate::Result<(Experience, bool)> {
         let (scrubbed_context, ctx_modified) = self.scrub_text(&experience.context);
         let (scrubbed_outcome, out_modified) = self.scrub_text(&experience.outcome);
-        let was_scrubbed = ctx_modified || out_modified;
+        let mut was_scrubbed = ctx_modified || out_modified;
 
-        let mut tags = experience.tags.clone();
-        if was_scrubbed && !tags.contains(&"credential_scrubbed".to_string()) {
-            tags.push("credential_scrubbed".to_string());
+        let mut scrubbed_metadata = experience.metadata.clone();
+        for value in scrubbed_metadata.values_mut() {
+            if let Some(s) = value.as_str() {
+                let (sv, m) = self.scrub_text(s);
+                if m {
+                    *value = serde_json::Value::String(sv);
+                    was_scrubbed = true;
+                }
+            }
+        }
+
+        let mut scrubbed_tags: Vec<String> = experience
+            .tags
+            .iter()
+            .map(|t| {
+                let (st, m) = self.scrub_text(t);
+                if m {
+                    was_scrubbed = true;
+                }
+                st
+            })
+            .collect();
+
+        if was_scrubbed && !scrubbed_tags.contains(&"credential_scrubbed".to_string()) {
+            scrubbed_tags.push("credential_scrubbed".to_string());
         }
 
         let scrubbed = Experience::from_parts(
@@ -112,8 +134,8 @@ impl CredentialScrubber {
             scrubbed_outcome,
             experience.confidence,
             experience.timestamp,
-            experience.metadata.clone(),
-            tags,
+            scrubbed_metadata,
+            scrubbed_tags,
         )
         .map_err(|e| {
             MemoryError::Internal(format!("failed to reconstruct scrubbed experience: {e}"))
@@ -133,7 +155,8 @@ impl CredentialScrubber {
                     "db_url" => {
                         format!("${{1}}{REDACTION_TEXT}${{3}}")
                     }
-                    "bearer_token" => {
+                    "bearer_token" | "aws_secret" | "azure_key" | "password" | "token"
+                    | "api_key" | "secret" => {
                         format!("${{1}}{REDACTION_TEXT}")
                     }
                     _ => REDACTION_TEXT.to_string(),

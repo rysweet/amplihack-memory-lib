@@ -336,9 +336,16 @@ fn test_aggregation_top_concepts() {
         .unwrap();
 
     let result = mem.execute_aggregation("top_concepts", "", 10);
-    let items = result.get("items").unwrap().as_object().unwrap();
-    assert!(items.contains_key("alpha"));
-    assert_eq!(items.get("alpha").and_then(|v| v.as_u64()), Some(2));
+    let items = result.get("items").unwrap().as_array().unwrap();
+    let item_map: std::collections::HashMap<String, u64> = items
+        .iter()
+        .filter_map(|v| {
+            let pair = v.as_array()?;
+            Some((pair[0].as_str()?.to_string(), pair[1].as_u64()?))
+        })
+        .collect();
+    assert!(item_map.contains_key("alpha"));
+    assert_eq!(item_map.get("alpha"), Some(&2));
 }
 
 #[test]
@@ -1035,7 +1042,7 @@ fn test_aggregation_top_concepts_with_limit() {
     }
 
     let result = mem.execute_aggregation("top_concepts", "", 2);
-    let items = result.get("items").unwrap().as_object().unwrap();
+    let items = result.get("items").unwrap().as_array().unwrap();
     assert!(items.len() <= 2);
 }
 
@@ -1081,4 +1088,20 @@ fn test_classifier_case_insensitive() {
 fn test_classifier_default_returns() {
     let c = MemoryClassifier;
     assert_eq!(c.classify("plain fact", ""), MemoryCategory::Semantic);
+}
+
+#[test]
+fn test_qa_top_concepts_is_array() {
+    let mut mem = make_mem();
+    for _ in 0..5 {
+        mem.store_knowledge("Plants grow", "plants", 0.9, None, "", &[], None)
+            .unwrap();
+    }
+    for _ in 0..3 {
+        mem.store_knowledge("Animals eat", "animals", 0.8, None, "", &[], None)
+            .unwrap();
+    }
+    let result = mem.execute_aggregation("top_concepts", "", 10);
+    let items = result.get("items").unwrap();
+    assert!(items.is_array());
 }

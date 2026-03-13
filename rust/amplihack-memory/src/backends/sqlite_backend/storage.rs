@@ -11,6 +11,7 @@ use crate::errors::MemoryError;
 use crate::experience::{Experience, ExperienceType};
 
 use super::search::fts5_search;
+use tracing::warn;
 
 impl MemoryBackend for SqliteBackend {
     fn initialize_schema(&mut self) -> crate::Result<()> {
@@ -92,7 +93,15 @@ impl MemoryBackend for SqliteBackend {
             .query_map(params_refs.as_slice(), Self::row_to_experience)
             .map_err(|e| MemoryError::Storage(format!("Failed to execute query: {e}")))?;
 
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows
+            .filter_map(|r| match r {
+                Ok(exp) => Some(exp),
+                Err(e) => {
+                    warn!("retrieve: skipping row: {e}");
+                    None
+                }
+            })
+            .collect())
     }
 
     fn search(
@@ -133,7 +142,7 @@ impl MemoryBackend for SqliteBackend {
                 params![self.agent_name],
                 |row| row.get(0),
             )
-            .unwrap_or(0);
+            .map_err(|e| MemoryError::Storage(format!("count failed: {e}")))?;
 
         let mut by_type = HashMap::new();
         let mut stmt = conn
@@ -171,7 +180,7 @@ impl MemoryBackend for SqliteBackend {
                 params![self.agent_name],
                 |row| row.get(0),
             )
-            .unwrap_or(0);
+            .map_err(|e| MemoryError::Storage(format!("compressed count failed: {e}")))?;
 
         // No actual compression implemented; ratio is always 1:1
         let compression_ratio = 1.0;
@@ -239,7 +248,7 @@ impl MemoryBackend for SqliteBackend {
                     params![self.agent_name],
                     |row| row.get(0),
                 )
-                .unwrap_or(0);
+                .map_err(|e| MemoryError::Storage(format!("cleanup count failed: {e}")))?;
 
             if count > max_exp {
                 conn.execute(

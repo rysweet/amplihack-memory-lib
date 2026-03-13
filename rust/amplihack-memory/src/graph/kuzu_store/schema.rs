@@ -58,6 +58,7 @@ impl KuzuGraphStore {
                 .collect();
 
             if !new_cols.is_empty() {
+                let mut added_cols = Vec::new();
                 Python::with_gil(|py| -> crate::Result<()> {
                     for (col_name, col_type) in &new_cols {
                         let ddl = format!(
@@ -65,6 +66,8 @@ impl KuzuGraphStore {
                         );
                         if let Err(e) = self.execute_no_params(py, &ddl) {
                             warn!("ensure_node_table: failed to add column {col_name} to {table_name}: {e}");
+                        } else {
+                            added_cols.push(col_name.clone());
                         }
                     }
                     Ok(())
@@ -74,7 +77,7 @@ impl KuzuGraphStore {
                     .node_table_columns
                     .entry(table_name.to_string())
                     .or_default();
-                for (col_name, _) in new_cols {
+                for col_name in added_cols {
                     known.insert(col_name);
                 }
             }

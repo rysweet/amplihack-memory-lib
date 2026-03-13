@@ -73,10 +73,17 @@ impl QueryValidator {
         Ok(())
     }
 
+    /// Strip SQL comments.
+    fn strip_sql_comments(sql: &str) -> String {
+        static LINE_COMMENT_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"--[^\n]*").unwrap());
+        static BLOCK_COMMENT_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?s)/\*.*?\*/").unwrap());
+        let no_block = BLOCK_COMMENT_RE.replace_all(sql, " ");
+        LINE_COMMENT_RE.replace_all(&no_block, " ").to_string()
+    }
+
     /// Check if a Cypher query is non-destructive (read-only).
-    ///
-    /// Allows `MATCH ... RETURN` queries and rejects destructive operations
-    /// like `DELETE`, `SET`, `REMOVE`, `MERGE`, and non-schema `CREATE`.
     pub fn is_safe_cypher(cypher: &str) -> bool {
         let trimmed = cypher.trim();
         if !trimmed
@@ -89,20 +96,25 @@ impl QueryValidator {
         }
 
         static DESTRUCTIVE_CYPHER: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-            ["DELETE", "DETACH", "SET", "REMOVE", "MERGE", "CREATE"]
-                .iter()
-                .map(|kw| Regex::new(&format!(r"(?i)\b{kw}\b")).unwrap())
-                .collect()
+            [
+                "DELETE", "DETACH", "SET", "REMOVE", "MERGE", "CREATE", "CALL", "LOAD", "FOREACH",
+            ]
+            .iter()
+            .map(|kw| Regex::new(&format!(r"(?i)\b{kw}\b")).unwrap())
+            .collect()
         });
 
         !DESTRUCTIVE_CYPHER.iter().any(|p| p.is_match(trimmed))
     }
 
     /// Check if a SQL query is non-destructive (read-only SELECT).
-    ///
-    /// Returns `false` for DELETE, UPDATE, INSERT, DROP, and other DDL/DML.
     pub fn is_safe_query(sql: &str) -> bool {
-        let sql_trimmed = sql.trim();
+        let stripped = Self::strip_sql_comments(sql);
+        let sql_trimmed = stripped.trim();
+
+        if sql_trimmed.contains(';') {
+            return false;
+        }
 
         if !sql_trimmed
             .chars()
@@ -115,8 +127,25 @@ impl QueryValidator {
 
         static DESTRUCTIVE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
             [
-                "DELETE", "UPDATE", "INSERT", "DROP", "TRUNCATE", "ALTER", "CREATE", "REPLACE",
-                "GRANT", "REVOKE", "UNION", "ATTACH", "PRAGMA",
+                "DELETE",
+                "UPDATE",
+                "INSERT",
+                "DROP",
+                "TRUNCATE",
+                "ALTER",
+                "CREATE",
+                "REPLACE",
+                "GRANT",
+                "REVOKE",
+                "UNION",
+                "ATTACH",
+                "PRAGMA",
+                "VACUUM",
+                "REINDEX",
+                "SAVEPOINT",
+                "BEGIN",
+                "COMMIT",
+                "ROLLBACK",
             ]
             .iter()
             .map(|kw| Regex::new(&format!(r"(?i)\b{kw}\b")).unwrap())

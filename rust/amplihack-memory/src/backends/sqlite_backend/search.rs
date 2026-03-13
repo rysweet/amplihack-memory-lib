@@ -7,6 +7,7 @@ use crate::errors::MemoryError;
 use crate::experience::{Experience, ExperienceType};
 
 use super::escape_fts5_query;
+use tracing::warn;
 
 /// Execute an FTS5 search against the experiences table.
 ///
@@ -53,5 +54,13 @@ pub(crate) fn fts5_search(
         .query_map(params_refs.as_slice(), SqliteBackend::row_to_experience)
         .map_err(|e| MemoryError::Storage(format!("Failed to execute search: {e}")))?;
 
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Ok(rows
+        .filter_map(|r| match r {
+            Ok(exp) => Some(exp),
+            Err(e) => {
+                warn!("fts5_search: skipping row: {e}");
+                None
+            }
+        })
+        .collect())
 }

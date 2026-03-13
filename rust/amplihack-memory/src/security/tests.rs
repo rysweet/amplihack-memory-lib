@@ -514,9 +514,11 @@ fn test_redaction_full_replacement_no_prefix() {
 fn test_redaction_password_full_replacement() {
     let scrubber = CredentialScrubber::new();
     let (scrubbed, _) = scrubber.scrub_text(r#"password="SuperSecret123!""#);
+    assert!(scrubbed.contains("password="), "label: {scrubbed}");
+    assert!(scrubbed.contains("[REDACTED]"), "redacted: {scrubbed}");
     assert!(
-        scrubbed.starts_with("[REDACTED]"),
-        "should be fully redacted: {scrubbed}"
+        !scrubbed.contains("SuperSecret123!"),
+        "secret gone: {scrubbed}"
     );
 }
 
@@ -673,4 +675,150 @@ fn test_scrub_experience_credential_in_metadata() {
         .insert("api_key".into(), serde_json::json!("abc123def456ghi789"));
     let (scrubbed, _) = scrubber.scrub_experience(&exp).unwrap();
     assert!(scrubbed.metadata.contains_key("api_key"));
+}
+
+// ====================================================================
+// QA Audit Fix Tests
+// ====================================================================
+
+#[test]
+fn test_qa_rejects_semicolons() {
+    assert!(!QueryValidator::is_safe_query("SELECT 1; DROP TABLE t"));
+    assert!(!QueryValidator::is_safe_query("SELECT 1;"));
+}
+
+#[test]
+fn test_qa_strips_line_comments() {
+    assert!(QueryValidator::is_safe_query(
+        "SELECT 1 -- comment\nFROM t LIMIT 1"
+    ));
+}
+
+#[test]
+fn test_qa_strips_block_comments() {
+    assert!(!QueryValidator::is_safe_query(
+        "SELECT /* x */ 1; DROP TABLE t"
+    ));
+}
+
+#[test]
+fn test_qa_rejects_vacuum() {
+    assert!(!QueryValidator::is_safe_query("SELECT 1 FROM VACUUM"));
+}
+
+#[test]
+fn test_qa_rejects_savepoint() {
+    assert!(!QueryValidator::is_safe_query("SELECT 1 SAVEPOINT sp"));
+}
+
+#[test]
+fn test_qa_rejects_begin_commit_rollback() {
+    assert!(!QueryValidator::is_safe_query("SELECT 1 BEGIN"));
+    assert!(!QueryValidator::is_safe_query("SELECT 1 COMMIT"));
+    assert!(!QueryValidator::is_safe_query("SELECT 1 ROLLBACK"));
+}
+
+#[test]
+fn test_qa_cypher_rejects_call() {
+    assert!(!QueryValidator::is_safe_cypher(
+        "MATCH (e:Experience) CALL db.info()"
+    ));
+}
+
+#[test]
+fn test_qa_cypher_rejects_load() {
+    assert!(!QueryValidator::is_safe_cypher(
+        "MATCH (e:Experience) LOAD CSV FROM '/etc/passwd'"
+    ));
+}
+
+#[test]
+fn test_qa_cypher_rejects_foreach() {
+    assert!(!QueryValidator::is_safe_cypher(
+        "MATCH (e:Experience) FOREACH (x IN [1] | SET e.v = x)"
+    ));
+}
+
+#[test]
+fn test_qa_scrub_metadata() {
+    let scrubber = CredentialScrubber::new();
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "notes".to_string(),
+        serde_json::Value::String("key is sk-abcdefghijklmnopqrst12345".to_string()),
+    );
+    let exp = Experience::from_parts(
+        "m1".into(),
+        ExperienceType::Success,
+        "ctx".into(),
+        "out".into(),
+        0.8,
+        chrono::Utc::now(),
+        metadata,
+        vec![],
+    )
+    .unwrap();
+    let (s, w) = scrubber.scrub_experience(&exp).unwrap();
+    assert!(w);
+    assert!(s
+        .metadata
+        .get("notes")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .contains("[REDACTED]"));
+}
+
+#[test]
+fn test_qa_scrub_tags() {
+    let scrubber = CredentialScrubber::new();
+    let exp = Experience::from_parts(
+        "t1".into(),
+        ExperienceType::Success,
+        "ctx".into(),
+        "out".into(),
+        0.8,
+        chrono::Utc::now(),
+        std::collections::HashMap::new(),
+        vec!["sk-abcdefghijklmnopqrst12345".into()],
+    )
+    .unwrap();
+    let (s, w) = scrubber.scrub_experience(&exp).unwrap();
+    assert!(w);
+    assert!(s.tags.iter().any(|t| t.contains("[REDACTED]")));
+}
+
+#[test]
+fn test_qa_preserves_password_label() {
+    let scrubber = CredentialScrubber::new();
+    let (s, m) = scrubber.scrub_text(r#"password="mysecret""#);
+    assert!(m);
+    assert!(s.contains("password="));
+    assert!(s.contains("[REDACTED]"));
+}
+
+#[test]
+fn test_qa_preserves_api_key_label() {
+    let scrubber = CredentialScrubber::new();
+    let (s, _) = scrubber.scrub_text(r#"api_key="abcdef1234567890""#);
+    assert!(s.contains("api_key="));
+    assert!(s.contains("[REDACTED]"));
+}
+
+#[test]
+fn test_qa_preserves_secret_label() {
+    let scrubber = CredentialScrubber::new();
+    let (s, _) = scrubber.scrub_text(r#"secret="TopSecretValue123""#);
+    assert!(s.contains("secret="));
+    assert!(s.contains("[REDACTED]"));
+}
+
+#[test]
+fn test_qa_search_sanitizes_quotes() {
+    let caps = AgentCapabilities::new(ScopeLevel::SessionOnly, vec![], 50, false, 10).unwrap();
+    let mut backend = SecureMemoryBackend::new(MockBackend::new(), caps);
+    let exp = make_experience(ExperienceType::Success, "test ctx", "test out");
+    backend.add_experience(&exp).unwrap();
+    let result = backend.search("test' OR '1'='1", None, 0.0, 10);
+    assert!(result.is_ok());
 }

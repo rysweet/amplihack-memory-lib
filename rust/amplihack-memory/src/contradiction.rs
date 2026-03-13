@@ -51,7 +51,7 @@ pub fn detect_contradiction(
 
     let common: HashSet<&String> = concept_words_a
         .intersection(&concept_words_b)
-        .filter(|w| w.len() > 2)
+        .filter(|w| w.chars().count() > 2)
         .collect();
 
     if common.is_empty() {
@@ -128,6 +128,24 @@ mod tests {
             "team size",
             "team size",
         );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_qa_unicode_chars_count() {
+        let result = detect_contradiction(
+            "The café has 5 tables",
+            "The café has 8 tables",
+            "café layout",
+            "café layout",
+        );
+        assert!(result.is_some());
+        assert!(result.unwrap().contradiction);
+    }
+
+    #[test]
+    fn test_qa_short_word_excluded() {
+        let result = detect_contradiction("The ab has 5 items", "The ab has 8 items", "ab", "ab");
         assert!(result.is_none());
     }
 }
