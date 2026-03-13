@@ -6,6 +6,7 @@ use crate::memory_types::ProceduralMemory;
 use crate::{MemoryError, Result};
 
 use crate::graph::protocol::GraphStore;
+use tracing::warn;
 
 use super::converters::node_to_procedural;
 use super::types::{agent_filter, new_id, ts_now, NT_PROCEDURAL};
@@ -21,9 +22,17 @@ impl CognitiveMemory {
     ) -> Result<String> {
         let node_id = new_id("proc");
         let now = ts_now();
-        let steps_json = serde_json::to_string(steps).unwrap_or_else(|_| "[]".into());
+        let steps_json = serde_json::to_string(steps).unwrap_or_else(|e| {
+            warn!("store_procedure: failed to serialize steps: {e}");
+            "[]".into()
+        });
         let prereqs_json = prerequisites
-            .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "[]".into()))
+            .map(|p| {
+                serde_json::to_string(p).unwrap_or_else(|e| {
+                    warn!("store_procedure: failed to serialize prerequisites: {e}");
+                    "[]".into()
+                })
+            })
             .unwrap_or_else(|| "[]".into());
 
         let mut props = HashMap::new();

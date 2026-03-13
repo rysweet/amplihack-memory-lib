@@ -6,6 +6,7 @@ use crate::memory_types::SemanticFact;
 use crate::{MemoryError, Result};
 
 use crate::graph::protocol::GraphStore;
+use tracing::warn;
 
 use super::converters::node_to_fact;
 use super::types::{agent_filter, new_id, ts_now, ET_DERIVES_FROM, ET_SIMILAR_TO, NT_SEMANTIC};
@@ -34,10 +35,20 @@ impl CognitiveMemory {
         let node_id = new_id("sem");
         let now = ts_now();
         let tags_json = tags
-            .map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".into()))
+            .map(|t| {
+                serde_json::to_string(t).unwrap_or_else(|e| {
+                    warn!("store_fact: failed to serialize tags: {e}");
+                    "[]".into()
+                })
+            })
             .unwrap_or_else(|| "[]".into());
         let meta_json = metadata
-            .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "{}".into()))
+            .map(|m| {
+                serde_json::to_string(m).unwrap_or_else(|e| {
+                    warn!("store_fact: failed to serialize metadata: {e}");
+                    "{}".into()
+                })
+            })
             .unwrap_or_else(|| "{}".into());
 
         let mut props = HashMap::new();
