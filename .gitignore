@@ -32,12 +32,17 @@ htmlcov/
 venv/
 env/
 ENV/
+.python-version
 
 # IDEs
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
+
+# Rust
+*.rs.bk
 
 # MkDocs
 site/
