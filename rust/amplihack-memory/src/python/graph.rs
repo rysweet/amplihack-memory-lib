@@ -263,13 +263,9 @@ impl PyGraphStore {
     ) -> PyResult<Vec<PyObject>> {
         let dir = parse_direction(direction)?;
         let edge_types: Option<Vec<String>> = edge_type.map(|et| vec![et.to_string()]);
-        let result = self.inner.traverse(
-            node_id,
-            edge_types.as_deref(),
-            depth,
-            dir,
-            None,
-        );
+        let result = self
+            .inner
+            .traverse(node_id, edge_types.as_deref(), depth, dir, None);
         result
             .nodes
             .iter()
