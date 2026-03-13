@@ -174,7 +174,7 @@ impl CognitiveMemory {
         for (ep_id, _, _) in &batch {
             let mut update = HashMap::new();
             update.insert("compressed".to_string(), "true".to_string());
-            self.graph.update_node(ep_id, update);
+            let _ = self.graph.update_node(ep_id, update);
 
             // Best-effort edge
             if let Err(e) = self.graph.add_edge(
@@ -192,7 +192,7 @@ impl CognitiveMemory {
                 for (rollback_id, _, _) in &batch {
                     let mut rollback = HashMap::new();
                     rollback.insert("compressed".to_string(), "false".to_string());
-                    self.graph.update_node(rollback_id, rollback);
+                    let _ = self.graph.update_node(rollback_id, rollback);
                 }
                 return None;
             }

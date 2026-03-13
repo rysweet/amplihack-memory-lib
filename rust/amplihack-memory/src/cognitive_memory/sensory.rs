@@ -143,7 +143,7 @@ impl CognitiveMemory {
 
         let count = expired_ids.len();
         for id in expired_ids {
-            self.graph.delete_node(&id);
+            let _ = self.graph.delete_node(&id);
         }
         count
     }

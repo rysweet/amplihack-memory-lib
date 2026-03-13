@@ -71,7 +71,7 @@ impl HiveGraphStore {
         }
         let mut props = HashMap::new();
         props.insert("trust".into(), new_trust.to_string());
-        self.inner.update_node(agent_id, props);
+        let _ = self.inner.update_node(agent_id, props);
         Ok(())
     }
 
@@ -85,7 +85,7 @@ impl HiveGraphStore {
                 .unwrap_or(0);
             let mut props = HashMap::new();
             props.insert("fact_count".into(), (current + 1).to_string());
-            self.inner.update_node(agent_id, props);
+            let _ = self.inner.update_node(agent_id, props);
         }
     }
 

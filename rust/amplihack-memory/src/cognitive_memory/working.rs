@@ -31,7 +31,7 @@ impl CognitiveMemory {
                     .partial_cmp(&b.relevance)
                     .unwrap_or(std::cmp::Ordering::Equal)
             }) {
-                self.graph.delete_node(&lowest.node_id);
+                let _ = self.graph.delete_node(&lowest.node_id);
             }
         }
 
@@ -85,7 +85,7 @@ impl CognitiveMemory {
 
         let count = nodes.len();
         for n in nodes {
-            self.graph.delete_node(&n.node_id);
+            let _ = self.graph.delete_node(&n.node_id);
         }
         count
     }

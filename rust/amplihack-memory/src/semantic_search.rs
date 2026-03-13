@@ -1,43 +1,35 @@
 //! Semantic search and relevance scoring for experiences.
 
 use chrono::Utc;
-use std::collections::HashSet;
 
 use crate::experience::{Experience, ExperienceType};
+use crate::similarity::compute_word_similarity;
+
+/// Weight multiplier for [`ExperienceType::Pattern`] when scoring relevance.
+const PATTERN_TYPE_WEIGHT: f64 = 1.5;
+/// Weight multiplier for [`ExperienceType::Insight`] when scoring relevance.
+const INSIGHT_TYPE_WEIGHT: f64 = 1.3;
+/// Base factor for the confidence contribution to relevance.
+const CONFIDENCE_BASE: f64 = 0.5;
+/// Number of days over which recency decays.
+const RECENCY_DECAY_DAYS: f64 = 90.0;
+/// Rate at which recency decays per unit of `RECENCY_DECAY_DAYS`.
+const RECENCY_DECAY_RATE: f64 = 0.3;
+/// Minimum recency factor (floor for decay).
+const MIN_RECENCY_FACTOR: f64 = 0.7;
+/// Maximum similarity score after all adjustments.
+const MAX_SIMILARITY_SCORE: f64 = 1.0;
 
 /// Simple TF-IDF similarity calculator (word overlap approximation).
+///
+/// Delegates to [`crate::similarity::compute_word_similarity`] to avoid
+/// duplicating the Jaccard implementation.
 pub struct TfIdfSimilarity;
 
 impl TfIdfSimilarity {
     /// Calculate similarity between two texts using Jaccard similarity.
     pub fn calculate(text1: &str, text2: &str) -> f64 {
-        if text1.is_empty() || text2.is_empty() {
-            return 0.0;
-        }
-
-        let words1: HashSet<String> = text1
-            .to_lowercase()
-            .split_whitespace()
-            .map(String::from)
-            .collect();
-        let words2: HashSet<String> = text2
-            .to_lowercase()
-            .split_whitespace()
-            .map(String::from)
-            .collect();
-
-        if words1.is_empty() || words2.is_empty() {
-            return 0.0;
-        }
-
-        let intersection = words1.intersection(&words2).count();
-        let union = words1.union(&words2).count();
-
-        if union == 0 {
-            0.0
-        } else {
-            intersection as f64 / union as f64
-        }
+        compute_word_similarity(text1, text2)
     }
 }
 
@@ -47,20 +39,21 @@ pub fn calculate_relevance(experience: &Experience, query: &str) -> f64 {
 
     // Type weighting
     match experience.experience_type {
-        ExperienceType::Pattern => similarity *= 1.5,
-        ExperienceType::Insight => similarity *= 1.3,
+        ExperienceType::Pattern => similarity *= PATTERN_TYPE_WEIGHT,
+        ExperienceType::Insight => similarity *= INSIGHT_TYPE_WEIGHT,
         _ => {}
     }
 
     // Confidence boost
-    similarity *= 0.5 + experience.confidence * 0.5;
+    similarity *= CONFIDENCE_BASE + experience.confidence * CONFIDENCE_BASE;
 
-    // Recency boost (decay over 90 days)
+    // Recency boost
     let age_days = (Utc::now() - experience.timestamp).num_days().max(0);
-    let recency_factor = (1.0 - (age_days as f64 / 90.0) * 0.3).max(0.7);
+    let recency_factor =
+        (1.0 - (age_days as f64 / RECENCY_DECAY_DAYS) * RECENCY_DECAY_RATE).max(MIN_RECENCY_FACTOR);
     similarity *= recency_factor;
 
-    similarity.min(1.0)
+    similarity.min(MAX_SIMILARITY_SCORE)
 }
 
 /// Retrieve most relevant experiences for current context.

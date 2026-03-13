@@ -86,7 +86,7 @@ impl CognitiveMemory {
                 // Mark as triggered
                 let mut update = HashMap::new();
                 update.insert("status".to_string(), "triggered".to_string());
-                self.graph.update_node(&pm.node_id, update);
+                let _ = self.graph.update_node(&pm.node_id, update);
 
                 pm.status = "triggered".to_string();
                 triggered.push(pm);
@@ -100,6 +100,6 @@ impl CognitiveMemory {
     pub fn resolve_prospective(&mut self, node_id: &str) {
         let mut update = HashMap::new();
         update.insert("status".to_string(), "resolved".to_string());
-        self.graph.update_node(node_id, update);
+        let _ = self.graph.update_node(node_id, update);
     }
 }

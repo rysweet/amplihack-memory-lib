@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+/// Maximum number of characters allowed in the `context` field.
+pub const MAX_CONTEXT_LENGTH: usize = 500;
+/// Maximum number of characters allowed in the `outcome` field.
+pub const MAX_OUTCOME_LENGTH: usize = 1000;
+
 /// Types of experiences an agent can have.
 ///
 /// Each variant carries different semantic weight when computing relevance
@@ -132,35 +137,9 @@ impl Experience {
         confidence: f64,
         timestamp: DateTime<Utc>,
     ) -> crate::Result<Self> {
-        if context.trim().is_empty() {
-            return Err(crate::MemoryError::InvalidExperience(
-                "context cannot be empty".into(),
-            ));
-        }
-        if context.chars().count() > 500 {
-            return Err(crate::MemoryError::InvalidExperience(
-                "context exceeds 500 characters".into(),
-            ));
-        }
-        if outcome.trim().is_empty() {
-            return Err(crate::MemoryError::InvalidExperience(
-                "outcome cannot be empty".into(),
-            ));
-        }
-        if outcome.chars().count() > 1000 {
-            return Err(crate::MemoryError::InvalidExperience(
-                "outcome exceeds 1000 characters".into(),
-            ));
-        }
-        if !(0.0..=1.0).contains(&confidence) {
-            return Err(crate::MemoryError::InvalidExperience(
-                "confidence must be between 0.0 and 1.0".into(),
-            ));
-        }
-
         let experience_id = generate_id(&context, &outcome, &timestamp);
 
-        Ok(Self {
+        let exp = Self {
             experience_id,
             experience_type,
             context,
@@ -169,7 +148,9 @@ impl Experience {
             timestamp,
             metadata: HashMap::new(),
             tags: Vec::new(),
-        })
+        };
+        exp.validate()?;
+        Ok(exp)
     }
 
     /// Create from a full set of fields (e.g. from a database row).
@@ -191,33 +172,7 @@ impl Experience {
         metadata: HashMap<String, serde_json::Value>,
         tags: Vec<String>,
     ) -> crate::Result<Self> {
-        if context.trim().is_empty() {
-            return Err(crate::MemoryError::InvalidExperience(
-                "context cannot be empty".into(),
-            ));
-        }
-        if context.chars().count() > 500 {
-            return Err(crate::MemoryError::InvalidExperience(
-                "context exceeds 500 characters".into(),
-            ));
-        }
-        if outcome.trim().is_empty() {
-            return Err(crate::MemoryError::InvalidExperience(
-                "outcome cannot be empty".into(),
-            ));
-        }
-        if outcome.chars().count() > 1000 {
-            return Err(crate::MemoryError::InvalidExperience(
-                "outcome exceeds 1000 characters".into(),
-            ));
-        }
-        if !(0.0..=1.0).contains(&confidence) {
-            return Err(crate::MemoryError::InvalidExperience(
-                "confidence must be between 0.0 and 1.0".into(),
-            ));
-        }
-
-        Ok(Self {
+        let exp = Self {
             experience_id,
             experience_type,
             context,
@@ -226,7 +181,45 @@ impl Experience {
             timestamp,
             metadata,
             tags,
-        })
+        };
+        exp.validate()?;
+        Ok(exp)
+    }
+
+    /// Validate all fields of this experience.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::MemoryError::InvalidExperience`] if `context` is empty or
+    /// exceeds [`MAX_CONTEXT_LENGTH`] chars, `outcome` is empty or exceeds
+    /// [`MAX_OUTCOME_LENGTH`] chars, or `confidence` is outside `[0.0, 1.0]`.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.context.trim().is_empty() {
+            return Err(crate::MemoryError::InvalidExperience(
+                "context cannot be empty".into(),
+            ));
+        }
+        if self.context.chars().count() > MAX_CONTEXT_LENGTH {
+            return Err(crate::MemoryError::InvalidExperience(format!(
+                "context exceeds {MAX_CONTEXT_LENGTH} characters"
+            )));
+        }
+        if self.outcome.trim().is_empty() {
+            return Err(crate::MemoryError::InvalidExperience(
+                "outcome cannot be empty".into(),
+            ));
+        }
+        if self.outcome.chars().count() > MAX_OUTCOME_LENGTH {
+            return Err(crate::MemoryError::InvalidExperience(format!(
+                "outcome exceeds {MAX_OUTCOME_LENGTH} characters"
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.confidence) {
+            return Err(crate::MemoryError::InvalidExperience(
+                "confidence must be between 0.0 and 1.0".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Serialize this experience into a flat key-value map suitable for JSON.

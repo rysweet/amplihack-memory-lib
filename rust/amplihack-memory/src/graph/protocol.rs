@@ -41,9 +41,13 @@ pub trait GraphStore {
     ) -> Vec<GraphNode>;
 
     /// Update properties on an existing node. Returns true on success.
+    // FUTURE: migrate to Result<bool, MemoryError>
+    #[must_use]
     fn update_node(&mut self, node_id: &str, properties: HashMap<String, String>) -> bool;
 
     /// Delete a node by ID. Returns true if the node existed.
+    // FUTURE: migrate to Result<bool, MemoryError>
+    #[must_use]
     fn delete_node(&mut self, node_id: &str) -> bool;
 
     // -- edge operations --
@@ -67,6 +71,8 @@ pub trait GraphStore {
     ) -> Vec<(GraphEdge, GraphNode)>;
 
     /// Delete a specific edge. Returns true if the edge existed.
+    // FUTURE: migrate to Result<bool, MemoryError>
+    #[must_use]
     fn delete_edge(&mut self, source_id: &str, target_id: &str, edge_type: &str) -> bool;
 
     // -- traversal --

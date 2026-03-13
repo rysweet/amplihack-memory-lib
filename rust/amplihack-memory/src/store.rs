@@ -57,7 +57,7 @@ impl ExperienceStore {
 
     /// Add experience with automatic management.
     pub fn add(&mut self, experience: &Experience) -> crate::Result<String> {
-        self.validate_experience(experience)?;
+        experience.validate()?;
         self.check_quota()?;
 
         let exp_id = self.connector.store_experience(experience)?;
@@ -85,25 +85,6 @@ impl ExperienceStore {
     /// Get storage statistics.
     pub fn get_statistics(&self) -> crate::Result<StorageStatistics> {
         self.connector.get_statistics()
-    }
-
-    fn validate_experience(&self, experience: &Experience) -> crate::Result<()> {
-        if experience.context.trim().is_empty() {
-            return Err(MemoryError::InvalidExperience(
-                "context cannot be empty".into(),
-            ));
-        }
-        if experience.outcome.trim().is_empty() {
-            return Err(MemoryError::InvalidExperience(
-                "outcome cannot be empty".into(),
-            ));
-        }
-        if !(0.0..=1.0).contains(&experience.confidence) {
-            return Err(MemoryError::InvalidExperience(
-                "confidence must be between 0.0 and 1.0".into(),
-            ));
-        }
-        Ok(())
     }
 
     fn check_quota(&self) -> crate::Result<()> {
