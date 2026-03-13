@@ -71,22 +71,30 @@ impl HiveGraphStore {
         }
         let mut props = HashMap::new();
         props.insert("trust".into(), new_trust.to_string());
-        let _ = self.inner.update_node(agent_id, props);
+        if !self.inner.update_node(agent_id, props) {
+            return Err(crate::MemoryError::Internal("trust update failed".into()));
+        }
         Ok(())
     }
 
     /// Increment the fact count for an agent.
-    pub fn increment_fact_count(&mut self, agent_id: &str) {
-        if let Some(node) = self.inner.get_node(agent_id) {
-            let current: i64 = node
-                .properties
-                .get("fact_count")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            let mut props = HashMap::new();
-            props.insert("fact_count".into(), (current + 1).to_string());
-            let _ = self.inner.update_node(agent_id, props);
+    pub fn increment_fact_count(&mut self, agent_id: &str) -> crate::Result<()> {
+        let node = self.inner.get_node(agent_id).ok_or_else(|| {
+            crate::MemoryError::Internal(format!("Agent not registered in hive: {agent_id}"))
+        })?;
+        let current: i64 = node
+            .properties
+            .get("fact_count")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut props = HashMap::new();
+        props.insert("fact_count".into(), (current + 1).to_string());
+        if !self.inner.update_node(agent_id, props) {
+            return Err(crate::MemoryError::Storage(
+                "failed to update fact_count".into(),
+            ));
         }
+        Ok(())
     }
 
     /// Find agents registered as experts in a given domain.
@@ -117,6 +125,11 @@ impl HiveGraphStore {
         confirmed_agent_id: &str,
         confidence: f64,
     ) -> crate::Result<()> {
+        if !(0.0..=1.0).contains(&confidence) {
+            return Err(crate::MemoryError::InvalidInput(
+                "confidence must be between 0.0 and 1.0".into(),
+            ));
+        }
         let mut props = HashMap::new();
         props.insert(
             "confirmed_at".into(),
@@ -336,8 +349,8 @@ mod tests {
             .unwrap();
         assert_eq!(count_before, 0);
 
-        hive.increment_fact_count("agent-x");
-        hive.increment_fact_count("agent-x");
+        hive.increment_fact_count("agent-x").unwrap();
+        hive.increment_fact_count("agent-x").unwrap();
 
         let node_after = hive.inner.get_node("agent-x").unwrap();
         let count_after: i64 = node_after
@@ -398,5 +411,31 @@ mod tests {
                 .abs()
                 < 0.01
         );
+    }
+
+    #[test]
+    fn test_update_trust_nonexistent_agent_errors() {
+        let mut hive = HiveGraphStore::new(None);
+        let result = hive.update_trust("nonexistent", 0.5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_increment_fact_count_returns_result() {
+        let mut hive = HiveGraphStore::new(None);
+        hive.register_agent("a1", "math", 0.8).unwrap();
+        assert!(hive.increment_fact_count("a1").is_ok());
+        let result = hive.increment_fact_count("no-such-agent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_confirmation_rejects_invalid_confidence() {
+        let mut hive = HiveGraphStore::new(None);
+        hive.register_agent("a1", "bio", 1.0).unwrap();
+        hive.register_agent("a2", "bio", 1.0).unwrap();
+        assert!(hive.add_confirmation("a1", "a2", -0.1).is_err());
+        assert!(hive.add_confirmation("a1", "a2", 1.1).is_err());
+        assert!(hive.add_confirmation("a1", "a2", 0.5).is_ok());
     }
 }

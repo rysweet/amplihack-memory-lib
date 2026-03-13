@@ -63,7 +63,7 @@ impl HierarchicalMemory {
             }
         }
 
-        let entity_name = extract_entity_name(content, concept);
+        let entity_name = extract_entity_name(content, concept).unwrap_or_default();
 
         let mut props = HashMap::new();
         props.insert("concept".into(), concept.to_string());
@@ -135,7 +135,7 @@ impl HierarchicalMemory {
         // 2. If concept is empty or matched few nodes, search by entity name
         //    extracted from content to find related nodes.
         if candidates.len() < MAX_CANDIDATES {
-            let entity = extract_entity_name(content, concept);
+            let entity = extract_entity_name(content, concept).unwrap_or_default();
             if !entity.is_empty() {
                 let remaining = MAX_CANDIDATES - candidates.len();
                 for node in self.store.search_nodes(

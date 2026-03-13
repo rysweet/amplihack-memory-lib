@@ -6,6 +6,7 @@ use crate::memory_types::WorkingMemorySlot;
 use crate::{MemoryError, Result};
 
 use crate::graph::protocol::GraphStore;
+use tracing::warn;
 
 use super::converters::node_to_working;
 use super::types::{agent_filter, new_id, ts_now, NT_WORKING, WORKING_MEMORY_CAPACITY};
@@ -31,7 +32,9 @@ impl CognitiveMemory {
                     .partial_cmp(&b.relevance)
                     .unwrap_or(std::cmp::Ordering::Equal)
             }) {
-                let _ = self.graph.delete_node(&lowest.node_id);
+                if !self.graph.delete_node(&lowest.node_id) {
+                    warn!("store_working: failed to evict node {}", lowest.node_id);
+                }
             }
         }
 
@@ -85,7 +88,9 @@ impl CognitiveMemory {
 
         let count = nodes.len();
         for n in nodes {
-            let _ = self.graph.delete_node(&n.node_id);
+            if !self.graph.delete_node(&n.node_id) {
+                warn!("clear_working: failed to delete node {}", n.node_id);
+            }
         }
         count
     }

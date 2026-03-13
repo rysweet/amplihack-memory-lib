@@ -211,11 +211,13 @@ fn test_consolidate_episodes() {
     // Not enough for batch_size=10
     assert!(cm
         .consolidate_episodes::<fn(&[String]) -> String>(10, None)
+        .unwrap()
         .is_none());
 
     // Enough for batch_size=3
     let cons_id = cm
         .consolidate_episodes::<fn(&[String]) -> String>(3, None)
+        .unwrap()
         .unwrap();
     assert!(cons_id.starts_with("con_"));
 
@@ -237,6 +239,7 @@ fn test_consolidate_with_custom_summarizer() {
             3,
             Some(|contents: &[String]| format!("SUMMARY({})", contents.len())),
         )
+        .unwrap()
         .unwrap();
 
     // Verify the consolidated node exists
@@ -251,7 +254,8 @@ fn test_search_episodes_excludes_compressed() {
         cm.store_episode(&format!("ep-{i}"), "src", None, None)
             .unwrap();
     }
-    cm.consolidate_episodes::<fn(&[String]) -> String>(3, None);
+    cm.consolidate_episodes::<fn(&[String]) -> String>(3, None)
+        .unwrap();
 
     let uncompressed = cm.search_episodes(10);
     assert_eq!(uncompressed.len(), 2);
@@ -918,3 +922,23 @@ fn test_check_triggers_multiple_triggers() {
     assert_eq!(triggered[0].priority, 5);
     assert_eq!(triggered[1].priority, 2);
 }
+
+#[test]
+fn test_consolidate_episodes_creates_summary() {
+    let mut cm = make_cm();
+    for i in 0..5 {
+        cm.store_episode(&format!("event-{i}"), "src", None, None)
+            .unwrap();
+    }
+    let cons_id = cm
+        .consolidate_episodes::<fn(&[String]) -> String>(3, None)
+        .unwrap()
+        .unwrap();
+    assert!(cons_id.starts_with("con_"));
+    let uncompressed = cm.get_episodes(10, false);
+    assert_eq!(uncompressed.len(), 2);
+}
+
+// ====================================================================
+// QA audit: Fix 15 — consolidate_episodes creates summary
+// ====================================================================

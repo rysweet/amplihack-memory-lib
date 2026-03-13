@@ -438,7 +438,7 @@ fn parity_test_all() {
         record(&mut results, "pattern_key_with_link", json!(key2), true);
 
         // Confidence calculation
-        let conf = calculate_pattern_confidence(3, 3);
+        let conf = calculate_pattern_confidence(3);
         record(
             &mut results,
             "pattern_confidence_at_3",
@@ -446,7 +446,7 @@ fn parity_test_all() {
             true,
         );
 
-        let conf5 = calculate_pattern_confidence(5, 3);
+        let conf5 = calculate_pattern_confidence(5);
         record(
             &mut results,
             "pattern_confidence_at_5",

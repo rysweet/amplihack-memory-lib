@@ -125,9 +125,11 @@ pub use security::{
     AgentCapabilities, CredentialScrubber, QueryValidator, ScopeLevel, SecureMemoryBackend,
 };
 
-/// Semantic search engine and TF-IDF similarity scorer.
+/// Semantic search engine and relevance scorer.
+#[allow(deprecated)]
 pub use semantic_search::{
-    calculate_relevance, retrieve_relevant_experiences, SemanticSearchEngine, TfIdfSimilarity,
+    calculate_relevance, retrieve_relevant_experiences, tfidf_similarity, JaccardSimilarity,
+    SemanticSearchEngine, TfIdfSimilarity,
 };
 
 /// Pattern recognition utilities for discovering recurring experience patterns.

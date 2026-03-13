@@ -1,13 +1,13 @@
 //! MemoryBackend trait implementation for the Kuzu backend.
 
-use super::{walkdir_size, KuzuBackend};
-use crate::backends::base::{MemoryBackend, StorageStatistics};
+use super::KuzuBackend;
+use crate::backends::base::{walkdir_size, MemoryBackend, StorageStatistics};
 use crate::errors::MemoryError;
 use crate::experience::{Experience, ExperienceType};
 use crate::security::QueryValidator;
 use pyo3::prelude::*;
 use std::collections::HashMap;
-use tracing::{error, warn};
+use tracing::warn;
 
 /// Set a key-value pair on a Python dict, mapping errors to `MemoryError`.
 fn set_param<V: IntoPyObject<'_>>(
@@ -68,30 +68,24 @@ fn collect_ids(result_ref: &Bound<'_, PyAny>) -> crate::Result<Vec<String>> {
 impl MemoryBackend for KuzuBackend {
     fn initialize_schema(&mut self) -> crate::Result<()> {
         Python::with_gil(|py| {
-            if let Err(e) = self.execute_no_params(
+            self.execute_no_params(
                 py,
                 "CREATE NODE TABLE IF NOT EXISTS Experience(\
                     experience_id STRING, agent_name STRING, experience_type STRING, \
                     context STRING, outcome STRING, confidence DOUBLE, timestamp INT64, \
                     metadata STRING, tags STRING, compressed BOOLEAN, \
                     PRIMARY KEY(experience_id))",
-            ) {
-                error!("initialize_schema: failed to create Experience node table: {e}");
-            }
-            if let Err(e) = self.execute_no_params(
+            )?;
+            self.execute_no_params(
                 py,
                 "CREATE REL TABLE IF NOT EXISTS SIMILAR_TO(\
                     FROM Experience TO Experience, similarity_score DOUBLE)",
-            ) {
-                error!("initialize_schema: failed to create SIMILAR_TO rel table: {e}");
-            }
-            if let Err(e) = self.execute_no_params(
+            )?;
+            self.execute_no_params(
                 py,
                 "CREATE REL TABLE IF NOT EXISTS LEADS_TO(\
                     FROM Experience TO Experience, causal_strength DOUBLE)",
-            ) {
-                error!("initialize_schema: failed to create LEADS_TO rel table: {e}");
-            }
+            )?;
             Ok(())
         })
     }
@@ -266,7 +260,7 @@ impl MemoryBackend for KuzuBackend {
                 &params,
             )?;
             let compressed: usize = scalar_from_result(result.bind(py), 0)?;
-            let compression_ratio = if compressed > 0 { 3.0 } else { 1.0 };
+            let compression_ratio = 1.0;
 
             Ok(StorageStatistics {
                 total_experiences: total,
@@ -306,12 +300,10 @@ impl MemoryBackend for KuzuBackend {
             if auto_compress {
                 let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).timestamp();
                 set_param(&params, "cutoff", cutoff)?;
-                if let Err(e) = self.execute(py,
+                self.execute(py,
                     "MATCH (e:Experience) \
                      WHERE e.agent_name = $agent AND e.timestamp < $cutoff AND e.compressed = false \
-                     SET e.compressed = true", &params) {
-                    warn!("cleanup: failed to auto-compress old experiences: {e}");
-                }
+                     SET e.compressed = true", &params)?;
             }
 
             if let Some(days) = max_age_days {
@@ -319,15 +311,13 @@ impl MemoryBackend for KuzuBackend {
                 let age_params = pyo3::types::PyDict::new_bound(py);
                 set_param(&age_params, "agent", &self.agent_name)?;
                 set_param(&age_params, "cutoff", cutoff)?;
-                if let Err(e) = self.execute(
+                self.execute(
                     py,
                     "MATCH (e:Experience) \
                      WHERE e.agent_name = $agent AND e.timestamp < $cutoff \
                      DETACH DELETE e",
                     &age_params,
-                ) {
-                    warn!("cleanup: failed to delete experiences older than {days} days: {e}");
-                }
+                )?;
             }
 
             if let Some(max_exp) = max_experiences {

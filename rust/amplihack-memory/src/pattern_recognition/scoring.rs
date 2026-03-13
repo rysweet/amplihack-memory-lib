@@ -27,6 +27,6 @@ pub fn extract_pattern_key(discovery: &HashMap<String, serde_json::Value>) -> St
 }
 
 /// Calculate pattern confidence based on occurrences.
-pub fn calculate_pattern_confidence(occurrences: usize, _threshold: usize) -> f64 {
+pub fn calculate_pattern_confidence(occurrences: usize) -> f64 {
     (0.5 + (occurrences as f64 * 0.1)).min(0.95)
 }

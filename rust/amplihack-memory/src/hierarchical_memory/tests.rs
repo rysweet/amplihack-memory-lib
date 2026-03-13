@@ -696,6 +696,16 @@ fn test_search_by_concept_short_keyword() {
     assert!(results.is_empty());
 }
 
+#[test]
+fn test_search_by_concept_with_str_slices() {
+    // Fix 10: verify search_by_concept accepts &[&str] via AsRef<str>
+    let mut mem = make_mem();
+    mem.store_knowledge("Gravity pulls objects", "physics", 0.9, None, "", &[], None)
+        .unwrap();
+    let results = mem.search_by_concept(&["physics"], 10);
+    assert!(!results.is_empty());
+}
+
 // -- Multiple agents isolation --
 
 #[test]
@@ -1069,6 +1079,6 @@ fn test_classifier_case_insensitive() {
 
 #[test]
 fn test_classifier_default_returns() {
-    let c = MemoryClassifier::default();
+    let c = MemoryClassifier;
     assert_eq!(c.classify("plain fact", ""), MemoryCategory::Semantic);
 }

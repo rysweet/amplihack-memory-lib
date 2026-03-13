@@ -1,11 +1,14 @@
 //! High-level experience storage and retrieval with automatic management.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::backends::base::StorageStatistics;
 use crate::connector::MemoryConnector;
 use crate::errors::MemoryError;
 use crate::experience::{Experience, ExperienceType};
+
+const CLEANUP_INTERVAL: u32 = 100;
 
 /// High-level storage and retrieval of experiences with auto-management.
 ///
@@ -16,12 +19,12 @@ use crate::experience::{Experience, ExperienceType};
 /// - Full-text search
 /// - Statistics tracking
 pub struct ExperienceStore {
-    pub agent_name: String,
-    pub auto_compress: bool,
-    pub max_age_days: Option<i64>,
-    pub max_experiences: Option<usize>,
-    pub max_memory_mb: i32,
+    pub(crate) auto_compress: bool,
+    pub(crate) max_age_days: Option<i64>,
+    pub(crate) max_experiences: Option<usize>,
+    pub(crate) max_memory_mb: i32,
     connector: MemoryConnector,
+    insert_count: AtomicU32,
 }
 
 impl ExperienceStore {
@@ -46,13 +49,18 @@ impl ExperienceStore {
             MemoryConnector::new(agent_name, storage_path, max_memory_mb, auto_compress)?;
 
         Ok(Self {
-            agent_name: agent_name.to_string(),
             auto_compress,
             max_age_days,
             max_experiences,
             max_memory_mb,
             connector,
+            insert_count: AtomicU32::new(0),
         })
+    }
+
+    /// The agent name associated with this store.
+    pub fn agent_name(&self) -> &str {
+        self.connector.agent_name()
     }
 
     /// Add experience with automatic management.
@@ -62,7 +70,10 @@ impl ExperienceStore {
 
         let exp_id = self.connector.store_experience(experience)?;
 
-        if self.auto_compress || self.max_age_days.is_some() || self.max_experiences.is_some() {
+        let count = self.insert_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count % CLEANUP_INTERVAL == 0
+            && (self.auto_compress || self.max_age_days.is_some() || self.max_experiences.is_some())
+        {
             self.connector
                 .cleanup(self.auto_compress, self.max_age_days, self.max_experiences)?;
         }
@@ -88,8 +99,8 @@ impl ExperienceStore {
     }
 
     fn check_quota(&self) -> crate::Result<()> {
-        if self.connector.db_path.exists() {
-            let meta = std::fs::metadata(&self.connector.db_path)
+        if self.connector.db_path().exists() {
+            let meta = std::fs::metadata(self.connector.db_path())
                 .map_err(|e| MemoryError::Storage(format!("Cannot read db metadata: {e}")))?;
             let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
             if size_mb > self.max_memory_mb as f64 {
@@ -150,7 +161,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store =
             ExperienceStore::new("default-agent", true, None, None, 100, Some(tmp.path())).unwrap();
-        assert_eq!(store.agent_name, "default-agent");
+        assert_eq!(store.agent_name(), "default-agent");
         assert!(store.auto_compress);
         assert!(store.max_age_days.is_none());
         assert!(store.max_experiences.is_none());
@@ -169,7 +180,7 @@ mod tests {
             Some(tmp.path()),
         )
         .unwrap();
-        assert_eq!(store.agent_name, "custom-agent");
+        assert_eq!(store.agent_name(), "custom-agent");
         assert!(!store.auto_compress);
         assert_eq!(store.max_age_days, Some(30));
         assert_eq!(store.max_experiences, Some(500));
@@ -407,6 +418,16 @@ mod tests {
             .unwrap();
             store.add(&exp).unwrap();
         }
+
+        // Force cleanup since throttled insert count may not have triggered it
+        store
+            .connector
+            .cleanup(
+                store.auto_compress,
+                store.max_age_days,
+                store.max_experiences,
+            )
+            .unwrap();
 
         let stats = store.get_statistics().unwrap();
         assert!(

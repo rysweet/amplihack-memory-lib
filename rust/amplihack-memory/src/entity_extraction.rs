@@ -17,7 +17,7 @@ pub static MULTI_WORD_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Uses simple heuristics to find proper nouns (capitalized multi-word names)
 /// in the concept field first, then the content. Returns lowercase for
 /// consistent indexing.
-pub fn extract_entity_name(content: &str, concept: &str) -> String {
+pub fn extract_entity_name(content: &str, concept: &str) -> Option<String> {
     for text in [concept, content] {
         if text.is_empty() {
             continue;
@@ -31,7 +31,7 @@ pub fn extract_entity_name(content: &str, concept: &str) -> String {
 
         if !matches.is_empty() {
             let best = matches.iter().max_by_key(|m| m.chars().count()).unwrap();
-            return best.to_lowercase();
+            return Some(best.to_lowercase());
         }
 
         // Single capitalized word that isn't at start of sentence
@@ -47,7 +47,7 @@ pub fn extract_entity_name(content: &str, concept: &str) -> String {
                         if !cleaned.is_empty()
                             && cleaned.chars().next().is_some_and(|c| c.is_uppercase())
                         {
-                            return cleaned.to_lowercase();
+                            return Some(cleaned.to_lowercase());
                         }
                     }
                 }
@@ -55,7 +55,7 @@ pub fn extract_entity_name(content: &str, concept: &str) -> String {
         }
     }
 
-    String::new()
+    None
 }
 
 #[cfg(test)]
@@ -66,7 +66,7 @@ mod tests {
     fn test_multi_word_name() {
         assert_eq!(
             extract_entity_name("Met with Sarah Chen today", ""),
-            "sarah chen"
+            Some("sarah chen".to_string())
         );
     }
 
@@ -74,35 +74,38 @@ mod tests {
     fn test_concept_first() {
         assert_eq!(
             extract_entity_name("some content", "Sarah Chen"),
-            "sarah chen"
+            Some("sarah chen".to_string())
         );
     }
 
     #[test]
     fn test_empty() {
-        assert_eq!(extract_entity_name("", ""), "");
+        assert_eq!(extract_entity_name("", ""), None);
     }
 
     #[test]
     fn test_no_names() {
-        assert_eq!(extract_entity_name("all lowercase words here", ""), "");
+        assert_eq!(extract_entity_name("all lowercase words here", ""), None);
     }
 
     #[test]
     fn test_apostrophe_name() {
-        let result = extract_entity_name("Met O'Brien today", "");
+        let result = extract_entity_name("Met O'Brien today", "").unwrap();
         assert!(result.contains("o'brien") || result.contains("o\u{2019}brien"));
     }
 
     #[test]
     fn test_unicode_entity_extraction_cjk() {
         let result = extract_entity_name("hello 日本語 world", "");
-        let _ = result;
+        assert!(
+            result.is_none(),
+            "expected no entity from CJK text, got: {result:?}"
+        );
     }
 
     #[test]
     fn test_unicode_entity_extraction_emoji() {
         let result = extract_entity_name("the 🎉🎊 Party was fun", "");
-        assert_eq!(result, "party");
+        assert_eq!(result, Some("party".to_string()));
     }
 }

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::experience::{Experience, ExperienceType};
+use crate::experience::Experience;
 use crate::pattern_recognition::{
     calculate_pattern_confidence, extract_pattern_key, recognize_patterns, PatternDetector,
 };
@@ -32,8 +32,8 @@ fn test_below_threshold() {
 
 #[test]
 fn test_confidence_formula() {
-    assert!((calculate_pattern_confidence(3, 3) - 0.8).abs() < 0.01);
-    assert!((calculate_pattern_confidence(10, 3) - 0.95).abs() < 0.01);
+    assert!((calculate_pattern_confidence(3) - 0.8).abs() < 0.01);
+    assert!((calculate_pattern_confidence(10) - 0.95).abs() < 0.01);
 }
 
 #[test]

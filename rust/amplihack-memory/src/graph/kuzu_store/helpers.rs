@@ -176,7 +176,10 @@ impl KuzuGraphStore {
 
             let result = match self.execute_cypher(py, &cypher, &params) {
                 Ok(r) => r,
-                Err(_) => return Vec::new(),
+                Err(e) => {
+                    tracing::warn!("query_directed_neighbors failed: {e}");
+                    return Vec::new();
+                }
             };
             let result_ref = result.bind(py);
 

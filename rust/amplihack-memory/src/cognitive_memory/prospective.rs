@@ -6,6 +6,7 @@ use crate::memory_types::ProspectiveMemory;
 use crate::{MemoryError, Result};
 
 use crate::graph::protocol::GraphStore;
+use tracing::warn;
 
 use super::converters::node_to_prospective;
 use super::types::{agent_filter, new_id, ts_now, NT_PROSPECTIVE};
@@ -86,7 +87,12 @@ impl CognitiveMemory {
                 // Mark as triggered
                 let mut update = HashMap::new();
                 update.insert("status".to_string(), "triggered".to_string());
-                let _ = self.graph.update_node(&pm.node_id, update);
+                if !self.graph.update_node(&pm.node_id, update) {
+                    warn!(
+                        "check_triggers: failed to update prospective node {}",
+                        pm.node_id
+                    );
+                }
 
                 pm.status = "triggered".to_string();
                 triggered.push(pm);
@@ -100,6 +106,8 @@ impl CognitiveMemory {
     pub fn resolve_prospective(&mut self, node_id: &str) {
         let mut update = HashMap::new();
         update.insert("status".to_string(), "resolved".to_string());
-        let _ = self.graph.update_node(node_id, update);
+        if !self.graph.update_node(node_id, update) {
+            warn!("resolve_prospective: failed to update node {node_id}");
+        }
     }
 }

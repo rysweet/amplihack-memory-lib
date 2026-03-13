@@ -149,7 +149,7 @@ fn test_connector_search_limit() {
 fn test_connector_agent_name_trimmed() {
     let tmp = TempDir::new().unwrap();
     let connector = MemoryConnector::new("  trimmed-agent  ", Some(tmp.path()), 100, true).unwrap();
-    assert_eq!(connector.agent_name, "trimmed-agent");
+    assert_eq!(connector.agent_name(), "trimmed-agent");
 }
 
 #[test]
@@ -158,11 +158,11 @@ fn test_connector_db_path_is_set() {
     let connector = MemoryConnector::new("dbpath-agent", Some(tmp.path()), 100, true).unwrap();
     assert!(
         connector
-            .db_path
+            .db_path()
             .to_string_lossy()
             .contains("experiences.db"),
         "db_path should point to experiences.db: {:?}",
-        connector.db_path
+        connector.db_path()
     );
 }
 

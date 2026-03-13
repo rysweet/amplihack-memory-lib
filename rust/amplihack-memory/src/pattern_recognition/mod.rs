@@ -69,7 +69,7 @@ impl PatternDetector {
         }
 
         if pattern.count >= self.threshold {
-            let base_conf = calculate_pattern_confidence(pattern.count, self.threshold);
+            let base_conf = calculate_pattern_confidence(pattern.count);
             pattern.base_confidence = base_conf;
             pattern.confidence = base_conf;
         }
