@@ -36,6 +36,42 @@ impl InMemoryGraphStore {
             graph_origin: id,
         }
     }
+
+    /// Total number of nodes in the store.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Total number of edges in the store.
+    pub fn edge_count(&self) -> usize {
+        self.edges.values().map(|v| v.len()).sum()
+    }
+
+    /// Return up to `limit` nodes regardless of type.
+    pub fn all_nodes(&self, limit: usize) -> Vec<GraphNode> {
+        self.nodes.values().take(limit).cloned().collect()
+    }
+
+    /// Search all nodes for `query` in any property value, optionally filtered by type.
+    pub fn search_all_properties(
+        &self,
+        query: &str,
+        node_type: Option<&str>,
+        limit: usize,
+    ) -> Vec<GraphNode> {
+        let query_lower = query.to_lowercase();
+        self.nodes
+            .values()
+            .filter(|n| node_type.map_or(true, |t| n.node_type == t))
+            .filter(|n| {
+                n.properties
+                    .values()
+                    .any(|v| v.to_lowercase().contains(&query_lower))
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
 }
 
 impl GraphStore for InMemoryGraphStore {

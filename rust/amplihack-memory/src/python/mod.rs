@@ -8,6 +8,7 @@ mod cognitive;
 mod connectors;
 mod converters;
 mod experience;
+mod graph;
 mod helpers;
 mod hierarchical;
 mod patterns;
@@ -17,6 +18,7 @@ mod security;
 pub use cognitive::PyCognitiveMemory;
 pub use connectors::{PyExperienceStore, PyMemoryConnector};
 pub use experience::PyExperience;
+pub use graph::PyGraphStore;
 pub use hierarchical::PyHierarchicalMemory;
 pub use patterns::PyPatternDetector;
 pub use search::PySemanticSearchEngine;
@@ -96,6 +98,7 @@ pub fn amplihack_memory_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPatternDetector>()?;
     m.add_class::<PySemanticSearchEngine>()?;
     m.add_class::<PySecureMemoryBackend>()?;
+    m.add_class::<PyGraphStore>()?;
 
     // Functions
     m.add_function(wrap_pyfunction!(py_extract_entities, m)?)?;
