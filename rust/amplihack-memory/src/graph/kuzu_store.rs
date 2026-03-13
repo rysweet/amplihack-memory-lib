@@ -15,6 +15,8 @@ use super::protocol::GraphStore;
 use super::traversal::bfs_traverse;
 use super::types::{Direction, GraphEdge, GraphNode, TraversalResult};
 
+use tracing::warn;
+
 fn is_valid_identifier(name: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -179,7 +181,9 @@ impl KuzuGraphStore {
                         let ddl = format!(
                             "ALTER TABLE {table_name} ADD {col_name} {col_type} DEFAULT ''"
                         );
-                        let _ = self.execute_no_params(py, &ddl);
+                        if let Err(e) = self.execute_no_params(py, &ddl) {
+                            warn!("ensure_node_table: failed to add column {col_name} to {table_name}: {e}");
+                        }
                     }
                     Ok(())
                 })?;
@@ -553,15 +557,14 @@ impl GraphStore for KuzuGraphStore {
         let _guard = self.lock.lock().unwrap();
 
         if let Some(cached_table) = self.id_table_cache.get(node_id) {
-            let table = cached_table.clone();
-            if let Some(node) = self.get_node_from_table(node_id, &table) {
+            if let Some(node) = self.get_node_from_table(node_id, cached_table) {
                 return Some(node);
             }
         }
 
-        let cached = self.id_table_cache.get(node_id).cloned();
+        let cached = self.id_table_cache.get(node_id);
         for table in &self.known_node_tables {
-            if Some(table) == cached.as_ref() {
+            if cached == Some(table) {
                 continue;
             }
             if let Some(node) = self.get_node_from_table(node_id, table) {

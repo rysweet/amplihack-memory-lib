@@ -473,7 +473,7 @@ impl HierarchicalMemory {
 
         // If no head found, use all matching nodes
         if head_ids.is_empty() {
-            head_ids = matching.iter().map(|n| n.node_id.clone()).collect();
+            head_ids = matching.into_iter().map(|n| n.node_id).collect();
         }
 
         // Walk from each head through SUPERSEDES chain
@@ -623,9 +623,13 @@ impl HierarchicalMemory {
             "by_category" => {
                 let mut cat_counts: HashMap<String, usize> = HashMap::new();
                 for n in &filtered {
-                    let meta_str = n.properties.get("metadata").cloned().unwrap_or_default();
+                    let meta_str = n
+                        .properties
+                        .get("metadata")
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
                     let meta: HashMap<String, serde_json::Value> =
-                        serde_json::from_str(&meta_str).unwrap_or_default();
+                        serde_json::from_str(meta_str).unwrap_or_default();
                     let cat = meta
                         .get("category")
                         .and_then(|v| v.as_str())
@@ -818,15 +822,23 @@ impl HierarchicalMemory {
         let new_node = build_sim_map(content, concept, tags);
 
         for other in &candidates {
-            let other_content = other.properties.get("content").cloned().unwrap_or_default();
-            let other_concept = other.properties.get("concept").cloned().unwrap_or_default();
+            let other_content = other
+                .properties
+                .get("content")
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let other_concept = other
+                .properties
+                .get("concept")
+                .map(|s| s.as_str())
+                .unwrap_or("");
             let other_tags: Vec<String> = other
                 .properties
                 .get("tags")
                 .and_then(|t| serde_json::from_str(t).ok())
                 .unwrap_or_default();
 
-            let other_map = build_sim_map(&other_content, &other_concept, &other_tags);
+            let other_map = build_sim_map(other_content, other_concept, &other_tags);
             let score = compute_similarity(&new_node, &other_map);
 
             if score > 0.3 {
@@ -835,7 +847,7 @@ impl HierarchicalMemory {
                 // Check for contradiction between high-similarity facts
                 if score > 0.5 {
                     if let Some(contradiction) =
-                        detect_contradiction(content, &other_content, concept, &other_concept)
+                        detect_contradiction(content, other_content, concept, other_concept)
                     {
                         edge_meta.insert(
                             "contradiction".to_string(),
@@ -843,7 +855,7 @@ impl HierarchicalMemory {
                         );
                         edge_meta.insert(
                             "conflicting_values".to_string(),
-                            contradiction.conflicting_values.clone(),
+                            contradiction.conflicting_values,
                         );
                     }
                 }
@@ -854,9 +866,9 @@ impl HierarchicalMemory {
                 let meta_json = if edge_meta.len() > 1 {
                     // Has contradiction info beyond just weight
                     let meta_map: HashMap<String, serde_json::Value> = edge_meta
-                        .iter()
+                        .into_iter()
                         .filter(|(k, _)| k.as_str() != "weight")
-                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                        .map(|(k, v)| (k, serde_json::Value::String(v)))
                         .collect();
                     serde_json::to_string(&meta_map).unwrap_or_default()
                 } else {
@@ -921,10 +933,10 @@ impl HierarchicalMemory {
             let old_meta_str = candidate
                 .properties
                 .get("metadata")
-                .cloned()
-                .unwrap_or_default();
+                .map(|s| s.as_str())
+                .unwrap_or("");
             let old_meta: HashMap<String, serde_json::Value> =
-                serde_json::from_str(&old_meta_str).unwrap_or_default();
+                serde_json::from_str(old_meta_str).unwrap_or_default();
             let old_temporal_idx = old_meta
                 .get("temporal_index")
                 .and_then(|v| v.as_i64())
@@ -937,16 +949,16 @@ impl HierarchicalMemory {
             let old_content = candidate
                 .properties
                 .get("content")
-                .cloned()
-                .unwrap_or_default();
+                .map(|s| s.as_str())
+                .unwrap_or("");
             let old_concept = candidate
                 .properties
                 .get("concept")
-                .cloned()
-                .unwrap_or_default();
+                .map(|s| s.as_str())
+                .unwrap_or("");
 
             if let Some(contradiction) =
-                detect_contradiction(content, &old_content, concept, &old_concept)
+                detect_contradiction(content, old_content, concept, old_concept)
             {
                 if contradiction.contradiction {
                     let temporal_delta = format!("index {old_temporal_idx} -> {new_temporal_idx}");

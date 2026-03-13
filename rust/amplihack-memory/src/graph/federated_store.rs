@@ -100,7 +100,7 @@ impl FederatedGraphStore {
         let expert_nodes =
             self.hive
                 .search_nodes("HiveAgent", &["domain".to_string()], query, None, 10);
-        let expert_agents: Vec<String> = expert_nodes.iter().map(|n| n.node_id.clone()).collect();
+        let expert_agents: Vec<String> = expert_nodes.into_iter().map(|n| n.node_id).collect();
 
         let mut seen_hashes: HashSet<String> = HashSet::new();
         let mut annotated: Vec<AnnotatedResult> = Vec::new();
