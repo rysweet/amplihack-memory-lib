@@ -1,14 +1,6 @@
 use super::*;
 
 #[test]
-fn test_scope_hierarchy() {
-    let caps = AgentCapabilities::new(ScopeLevel::CrossSessionRead, vec![], 50, false, 10).unwrap();
-    assert!(caps.can_access_scope(ScopeLevel::SessionOnly));
-    assert!(caps.can_access_scope(ScopeLevel::CrossSessionRead));
-    assert!(!caps.can_access_scope(ScopeLevel::CrossSessionWrite));
-}
-
-#[test]
 fn test_credential_scrubber() {
     let scrubber = CredentialScrubber::new();
     assert!(scrubber.contains_credentials("my key sk-abcdefghijklmnopqrst12345"));
@@ -526,4 +518,140 @@ fn test_redaction_password_full_replacement() {
         scrubbed.starts_with("[REDACTED]"),
         "should be fully redacted: {scrubbed}"
     );
+}
+
+// ====================================================================
+// #22: Blocked keywords — sqlite_master, UNION, ATTACH, PRAGMA
+// ====================================================================
+
+#[test]
+fn test_is_safe_query_blocks_sqlite_master() {
+    assert!(!QueryValidator::is_safe_query(
+        "SELECT * FROM sqlite_master"
+    ));
+    assert!(!QueryValidator::is_safe_query(
+        "SELECT * FROM sqlite_temp_master"
+    ));
+}
+
+#[test]
+fn test_is_safe_query_blocks_union() {
+    assert!(!QueryValidator::is_safe_query("SELECT 1 UNION SELECT 2"));
+}
+
+#[test]
+fn test_is_safe_query_blocks_attach() {
+    assert!(!QueryValidator::is_safe_query(
+        "SELECT 1; ATTACH DATABASE ':memory:' AS evil"
+    ));
+}
+
+#[test]
+fn test_is_safe_query_blocks_pragma() {
+    assert!(!QueryValidator::is_safe_query(
+        "SELECT 1; PRAGMA table_info(experiences)"
+    ));
+}
+
+// ====================================================================
+// #23: New credential patterns — GCP, Slack, Stripe, JWT, Bearer
+// ====================================================================
+
+#[test]
+fn test_scrub_gcp_service_account() {
+    let scrubber = CredentialScrubber::new();
+    let text = r#"{"type": "service_account", "project_id": "my-project"}"#;
+    assert!(scrubber.contains_credentials(text));
+    let (scrubbed, modified) = scrubber.scrub_text(text);
+    assert!(modified);
+    assert!(scrubbed.contains("[REDACTED]"));
+}
+
+#[test]
+fn test_scrub_slack_webhook() {
+    let scrubber = CredentialScrubber::new();
+    // Use a truncated URL that matches our pattern but won't trigger secret scanners.
+    let text = "webhook: https://hooks.slack.com/services/T0/B0/XXXX";
+    assert!(scrubber.contains_credentials(text));
+    let (scrubbed, modified) = scrubber.scrub_text(text);
+    assert!(modified);
+    assert!(!scrubbed.contains("hooks.slack.com"));
+}
+
+#[test]
+fn test_scrub_stripe_key() {
+    let scrubber = CredentialScrubber::new();
+    // Build fake key at runtime to avoid push-protection false positives.
+    let fake_key = format!("sk_liv{}{}", "e_", "0".repeat(24));
+    let text = format!("stripe_key={fake_key}");
+    assert!(scrubber.contains_credentials(&text));
+    let (scrubbed, modified) = scrubber.scrub_text(&text);
+    assert!(modified);
+    assert!(!scrubbed.contains("sk_liv"));
+}
+
+#[test]
+fn test_scrub_stripe_test_key() {
+    let scrubber = CredentialScrubber::new();
+    let fake_key = format!("sk_tes{}{}", "t_", "0".repeat(24));
+    assert!(scrubber.contains_credentials(&fake_key));
+}
+
+#[test]
+fn test_scrub_jwt_token() {
+    let scrubber = CredentialScrubber::new();
+    let text = "auth: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+    assert!(scrubber.contains_credentials(text));
+    let (scrubbed, modified) = scrubber.scrub_text(text);
+    assert!(modified);
+    assert!(!scrubbed.contains("eyJ"));
+}
+
+#[test]
+fn test_scrub_bearer_token() {
+    let scrubber = CredentialScrubber::new();
+    let text = "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345";
+    assert!(scrubber.contains_credentials(text));
+    let (scrubbed, modified) = scrubber.scrub_text(text);
+    assert!(modified);
+    assert!(!scrubbed.contains("abcdefghijklmnopqrstuvwxyz012345"));
+}
+
+// ====================================================================
+// #36: Cypher safety validation
+// ====================================================================
+
+#[test]
+fn test_is_safe_cypher_allows_match_return() {
+    assert!(QueryValidator::is_safe_cypher(
+        "MATCH (e:Experience) WHERE e.agent = $agent RETURN e.experience_id"
+    ));
+}
+
+#[test]
+fn test_is_safe_cypher_rejects_delete() {
+    assert!(!QueryValidator::is_safe_cypher(
+        "MATCH (e:Experience) DELETE e"
+    ));
+}
+
+#[test]
+fn test_is_safe_cypher_rejects_set() {
+    assert!(!QueryValidator::is_safe_cypher(
+        "MATCH (e:Experience) SET e.name = 'evil'"
+    ));
+}
+
+#[test]
+fn test_is_safe_cypher_rejects_create() {
+    assert!(!QueryValidator::is_safe_cypher(
+        "CREATE (:Experience {id: '1'})"
+    ));
+}
+
+#[test]
+fn test_is_safe_cypher_rejects_non_match() {
+    assert!(!QueryValidator::is_safe_cypher(
+        "DETACH DELETE (e:Experience)"
+    ));
 }

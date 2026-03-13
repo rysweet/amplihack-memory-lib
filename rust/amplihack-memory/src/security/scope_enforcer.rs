@@ -17,15 +17,8 @@ pub enum ScopeLevel {
 }
 
 impl ScopeLevel {
-    fn hierarchy_index(&self) -> usize {
-        match self {
-            Self::SessionOnly => 0,
-            Self::CrossSessionRead => 1,
-            Self::CrossSessionWrite => 2,
-            Self::GlobalRead => 3,
-            Self::GlobalWrite => 4,
-        }
-    }
+    // Scope enforcement is not yet integrated at memory access points.
+    // ScopeLevel variants are defined for future capability-based access control.
 }
 
 /// Security capabilities governing what a memory-enabled agent can do.
@@ -98,10 +91,5 @@ impl AgentCapabilities {
             return false;
         }
         self.allowed_experience_types.contains(&experience_type)
-    }
-
-    /// Check if agent has sufficient scope permission.
-    pub fn can_access_scope(&self, target_scope: ScopeLevel) -> bool {
-        self.scope.hierarchy_index() >= target_scope.hierarchy_index()
     }
 }

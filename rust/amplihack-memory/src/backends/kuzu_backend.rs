@@ -12,6 +12,7 @@ use pyo3::prelude::*;
 use super::base::{ExperienceBackend, MemoryBackend, StorageStatistics};
 use crate::errors::MemoryError;
 use crate::experience::{Experience, ExperienceType};
+use crate::security::QueryValidator;
 
 use tracing::{debug, error, warn};
 
@@ -87,7 +88,8 @@ impl KuzuBackend {
         conn.call_method("execute", (cypher, params), None)
             .map(|r| r.unbind())
             .map_err(|e| {
-                MemoryError::Storage(format!("Cypher execution failed: {e}\nQuery: {cypher}"))
+                debug!("Cypher execution failed — query: {cypher}");
+                MemoryError::Storage(format!("Cypher execution failed: {e}"))
             })
     }
 
@@ -97,7 +99,8 @@ impl KuzuBackend {
         conn.call_method1("execute", (cypher,))
             .map(|r| r.unbind())
             .map_err(|e| {
-                MemoryError::Storage(format!("Cypher execution failed: {e}\nQuery: {cypher}"))
+                debug!("Cypher execution failed — query: {cypher}");
+                MemoryError::Storage(format!("Cypher execution failed: {e}"))
             })
     }
 
@@ -334,7 +337,14 @@ impl MemoryBackend for KuzuBackend {
             );
 
             if let Some(lim) = limit {
+                // Safety: `lim` is a `usize`, guaranteed to be a non-negative integer.
                 query.push_str(&format!(" LIMIT {lim}"));
+            }
+
+            if !QueryValidator::is_safe_cypher(&query) {
+                return Err(MemoryError::SecurityViolation(
+                    "constructed Cypher query failed safety check".into(),
+                ));
             }
 
             let result = self.execute(py, &query, &params)?;
@@ -399,6 +409,7 @@ impl MemoryBackend for KuzuBackend {
             }
 
             let where_clause = where_clauses.join(" AND ");
+            // Safety: `limit` is a `usize`, guaranteed to be a non-negative integer.
             let kuzu_query = format!(
                 "MATCH (e:Experience) WHERE {where_clause} \
                  RETURN e.experience_id, e.experience_type, e.context, e.outcome, \
@@ -406,6 +417,12 @@ impl MemoryBackend for KuzuBackend {
                  ORDER BY e.timestamp DESC \
                  LIMIT {limit}"
             );
+
+            if !QueryValidator::is_safe_cypher(&kuzu_query) {
+                return Err(MemoryError::SecurityViolation(
+                    "constructed Cypher query failed safety check".into(),
+                ));
+            }
 
             let result = self.execute(py, &kuzu_query, &params)?;
             let result_ref = result.bind(py);
@@ -670,6 +687,7 @@ impl MemoryBackend for KuzuBackend {
                     }
 
                     // Get most recent IDs
+                    // Safety: `max_exp` is a `usize`, guaranteed to be a non-negative integer.
                     let recent_query = format!(
                         "MATCH (e:Experience) WHERE e.agent_name = $agent \
                          RETURN e.experience_id ORDER BY e.timestamp DESC LIMIT {max_exp}"

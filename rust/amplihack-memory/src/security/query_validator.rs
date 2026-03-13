@@ -73,6 +73,31 @@ impl QueryValidator {
         Ok(())
     }
 
+    /// Check if a Cypher query is non-destructive (read-only).
+    ///
+    /// Allows `MATCH ... RETURN` queries and rejects destructive operations
+    /// like `DELETE`, `SET`, `REMOVE`, `MERGE`, and non-schema `CREATE`.
+    pub fn is_safe_cypher(cypher: &str) -> bool {
+        let trimmed = cypher.trim();
+        if !trimmed
+            .chars()
+            .take(5)
+            .collect::<String>()
+            .eq_ignore_ascii_case("match")
+        {
+            return false;
+        }
+
+        static DESTRUCTIVE_CYPHER: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+            ["DELETE", "DETACH", "SET", "REMOVE", "MERGE", "CREATE"]
+                .iter()
+                .map(|kw| Regex::new(&format!(r"(?i)\b{kw}\b")).unwrap())
+                .collect()
+        });
+
+        !DESTRUCTIVE_CYPHER.iter().any(|p| p.is_match(trimmed))
+    }
+
     /// Check if a SQL query is non-destructive (read-only SELECT).
     ///
     /// Returns `false` for DELETE, UPDATE, INSERT, DROP, and other DDL/DML.
@@ -91,12 +116,20 @@ impl QueryValidator {
         static DESTRUCTIVE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
             [
                 "DELETE", "UPDATE", "INSERT", "DROP", "TRUNCATE", "ALTER", "CREATE", "REPLACE",
-                "GRANT", "REVOKE",
+                "GRANT", "REVOKE", "UNION", "ATTACH", "PRAGMA",
             ]
             .iter()
             .map(|kw| Regex::new(&format!(r"(?i)\b{kw}\b")).unwrap())
             .collect()
         });
+
+        // Block access to sqlite_master / sqlite_temp_master metadata tables.
+        static METADATA_TABLE_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?i)\bsqlite_(?:temp_)?master\b").unwrap());
+
+        if METADATA_TABLE_RE.is_match(sql_trimmed) {
+            return false;
+        }
 
         for pattern in DESTRUCTIVE_PATTERNS.iter() {
             if pattern.is_match(sql_trimmed) {

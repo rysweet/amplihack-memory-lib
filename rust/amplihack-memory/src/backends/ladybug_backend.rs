@@ -253,6 +253,7 @@ impl MemoryBackend for LadybugBackend {
         );
 
         if let Some(lim) = limit {
+            // Safety: `lim` is a `usize`, guaranteed to be a non-negative integer.
             query.push_str(&format!(" LIMIT {lim}"));
         }
 
@@ -292,6 +293,7 @@ impl MemoryBackend for LadybugBackend {
         }
 
         let where_clause = where_clauses.join(" AND ");
+        // Safety: `limit` is a `usize`, guaranteed to be a non-negative integer.
         let cypher = format!(
             "MATCH (e:Experience) WHERE {where_clause} \
              RETURN {} \
@@ -439,6 +441,7 @@ impl MemoryBackend for LadybugBackend {
                     }
                 }
 
+                // Safety: `max_exp` is a `usize`, guaranteed to be a non-negative integer.
                 let recent_query = format!(
                     "MATCH (e:Experience) WHERE e.agent_name = $agent \
                      RETURN e.experience_id ORDER BY e.timestamp DESC LIMIT {max_exp}"

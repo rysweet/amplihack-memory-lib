@@ -73,6 +73,17 @@ impl MemoryConnector {
 
         let agent = agent_name.trim().to_string();
 
+        // Reject agent names that could cause path traversal or contain
+        // characters outside the safe set [a-zA-Z0-9_-].
+        if !agent
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(MemoryError::InvalidInput(
+                "agent_name must only contain ASCII alphanumeric characters, hyphens, and underscores".into(),
+            ));
+        }
+
         let storage = match storage_path {
             Some(p) => PathBuf::from(p),
             None => dirs::home_dir()
@@ -639,5 +650,49 @@ mod tests {
             "db_path should point to experiences.db: {:?}",
             connector.db_path
         );
+    }
+
+    // ====================================================================
+    // #21: Agent name validation — path traversal prevention
+    // ====================================================================
+
+    #[test]
+    fn test_agent_name_rejects_path_traversal() {
+        let tmp = TempDir::new().unwrap();
+        assert!(MemoryConnector::new("../etc/passwd", Some(tmp.path()), 100, true).is_err());
+    }
+
+    #[test]
+    fn test_agent_name_rejects_slash() {
+        let tmp = TempDir::new().unwrap();
+        assert!(MemoryConnector::new("agent/evil", Some(tmp.path()), 100, true).is_err());
+    }
+
+    #[test]
+    fn test_agent_name_rejects_backslash() {
+        let tmp = TempDir::new().unwrap();
+        assert!(MemoryConnector::new("agent\\evil", Some(tmp.path()), 100, true).is_err());
+    }
+
+    #[test]
+    fn test_agent_name_rejects_dots() {
+        let tmp = TempDir::new().unwrap();
+        assert!(MemoryConnector::new("agent..name", Some(tmp.path()), 100, true).is_err());
+    }
+
+    #[test]
+    fn test_agent_name_rejects_special_chars() {
+        let tmp = TempDir::new().unwrap();
+        assert!(MemoryConnector::new("agent@name", Some(tmp.path()), 100, true).is_err());
+        assert!(MemoryConnector::new("agent name", Some(tmp.path()), 100, true).is_err());
+        assert!(MemoryConnector::new("agent!name", Some(tmp.path()), 100, true).is_err());
+    }
+
+    #[test]
+    fn test_agent_name_allows_valid_names() {
+        let tmp = TempDir::new().unwrap();
+        assert!(MemoryConnector::new("valid-agent", Some(tmp.path()), 100, true).is_ok());
+        assert!(MemoryConnector::new("agent_123", Some(tmp.path()), 100, true).is_ok());
+        assert!(MemoryConnector::new("MyAgent", Some(tmp.path()), 100, true).is_ok());
     }
 }
