@@ -95,7 +95,7 @@ impl CognitiveMemory {
             let new_count = (proc.usage_count + 1).to_string();
             let mut update = HashMap::new();
             update.insert("usage_count".to_string(), new_count);
-            self.graph.update_node(&proc.node_id, update);
+            let _ = self.graph.update_node(&proc.node_id, update);
         }
 
         procs

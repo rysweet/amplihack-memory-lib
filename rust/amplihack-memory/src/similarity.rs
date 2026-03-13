@@ -8,6 +8,17 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
+/// Minimum token length (exclusive) to keep after tokenization.
+const MIN_TOKEN_LENGTH: usize = 2;
+/// Weight of word similarity in the composite score.
+const WORD_SIMILARITY_WEIGHT: f64 = 0.5;
+/// Weight of tag similarity in the composite score.
+const TAG_SIMILARITY_WEIGHT: f64 = 0.2;
+/// Weight of concept similarity in the composite score.
+const CONCEPT_SIMILARITY_WEIGHT: f64 = 0.3;
+/// Score boost for facts with temporal metadata.
+const TEMPORAL_BOOST_SCORE: f64 = 0.15;
+
 /// Common English stop words.
 static STOP_WORDS: &[&str] = &[
     "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
@@ -32,7 +43,7 @@ fn tokenize(text: &str) -> HashSet<String> {
     text.to_lowercase()
         .split_whitespace()
         .map(|w| w.trim_matches(|c: char| ".,;:!?()[]{}\"'".contains(c)))
-        .filter(|w| w.len() > 2)
+        .filter(|w| w.len() > MIN_TOKEN_LENGTH)
         .filter(|w| !STOP_WORDS_SET.contains(w))
         .map(String::from)
         .collect()
@@ -113,7 +124,9 @@ pub fn compute_similarity(
     let concept_b = node_b.get("concept").and_then(|v| v.as_str()).unwrap_or("");
     let concept_sim = compute_word_similarity(concept_a, concept_b);
 
-    0.5 * word_sim + 0.2 * tag_sim + 0.3 * concept_sim
+    WORD_SIMILARITY_WEIGHT * word_sim
+        + TAG_SIMILARITY_WEIGHT * tag_sim
+        + CONCEPT_SIMILARITY_WEIGHT * concept_sim
 }
 
 /// Rerank retrieved facts by keyword relevance to a query.
@@ -190,7 +203,7 @@ pub fn rerank_facts_by_query(
                         || meta.get("source_date").is_some()
                         || meta.get("temporal_order").is_some();
                     if has_temporal {
-                        score += 0.15;
+                        score += TEMPORAL_BOOST_SCORE;
                     }
                 }
             }

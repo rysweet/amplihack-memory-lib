@@ -15,8 +15,6 @@ use crate::experience::{Experience, ExperienceType};
 pub struct SqliteBackend {
     db_path: PathBuf,
     agent_name: String,
-    _max_memory_mb: i32,
-    _enable_compression: bool,
     conn: Mutex<Connection>,
 }
 
@@ -28,8 +26,8 @@ impl SqliteBackend {
     pub fn new(
         db_path: &Path,
         agent_name: &str,
-        max_memory_mb: i32,
-        enable_compression: bool,
+        _max_memory_mb: i32,
+        _enable_compression: bool,
     ) -> crate::Result<Self> {
         let conn = Connection::open(db_path)
             .map_err(|e| MemoryError::Storage(format!("Failed to open database: {e}")))?;
@@ -40,8 +38,6 @@ impl SqliteBackend {
         let backend = Self {
             db_path: db_path.to_path_buf(),
             agent_name: agent_name.to_string(),
-            _max_memory_mb: max_memory_mb,
-            _enable_compression: enable_compression,
             conn: Mutex::new(conn),
         };
 
@@ -158,21 +154,7 @@ impl MemoryBackend for SqliteBackend {
     }
 
     fn store_experience(&mut self, experience: &Experience) -> crate::Result<String> {
-        if experience.context.trim().is_empty() {
-            return Err(MemoryError::InvalidExperience(
-                "context cannot be empty".into(),
-            ));
-        }
-        if experience.outcome.trim().is_empty() {
-            return Err(MemoryError::InvalidExperience(
-                "outcome cannot be empty".into(),
-            ));
-        }
-        if !(0.0..=1.0).contains(&experience.confidence) {
-            return Err(MemoryError::InvalidExperience(
-                "confidence must be between 0.0 and 1.0".into(),
-            ));
-        }
+        experience.validate()?;
 
         let metadata_json =
             serde_json::to_string(&experience.metadata).unwrap_or_else(|_| "{}".into());
@@ -227,6 +209,7 @@ impl MemoryBackend for SqliteBackend {
         sql.push_str(" ORDER BY timestamp DESC");
 
         if let Some(lim) = limit {
+            // Safety: 'lim' is a 'usize', guaranteed to be a non-negative integer.
             sql.push_str(&format!(" LIMIT {lim}"));
         }
 
@@ -278,7 +261,7 @@ impl MemoryBackend for SqliteBackend {
             param_values.push(Box::new(et.as_str().to_string()));
         }
 
-        sql.push_str(&format!(" ORDER BY e.timestamp DESC LIMIT {limit}"));
+        sql.push_str(&format!(" ORDER BY e.timestamp DESC LIMIT {limit}")); // Safety: 'limit' is a 'usize'.
 
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();

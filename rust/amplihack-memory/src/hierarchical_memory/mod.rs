@@ -13,6 +13,15 @@
 //! Public API:
 //!     KnowledgeNode, KnowledgeEdge, KnowledgeSubgraph, MemoryClassifier, HierarchicalMemory
 
+/// Minimum similarity score to create a `SIMILAR_TO` edge.
+const DEFAULT_SIMILARITY_THRESHOLD: f64 = 0.3;
+/// Similarity score above which contradiction detection is triggered.
+const CONTRADICTION_SIMILARITY_THRESHOLD: f64 = 0.5;
+/// Decay factor applied to confidence when a node is superseded.
+const SUPERSEDE_CONFIDENCE_DECAY: f64 = 0.5;
+/// Minimum confidence after decay.
+const MIN_CONFIDENCE: f64 = 0.1;
+
 mod helpers;
 mod types;
 
@@ -85,7 +94,7 @@ impl HierarchicalMemory {
     /// Store a knowledge node in the graph.
     ///
     /// Auto-classifies if `category` is `None`. Computes similarity against
-    /// existing nodes and creates `SIMILAR_TO` edges for scores > 0.3.
+    /// existing nodes and creates `SIMILAR_TO` edges for scores > [`DEFAULT_SIMILARITY_THRESHOLD`].
     /// Detects contradictions and creates `SUPERSEDES` edges when found.
     ///
     /// Returns the `node_id` of the stored knowledge node.
@@ -842,11 +851,11 @@ impl HierarchicalMemory {
             let other_map = build_sim_map(other_content, other_concept, &other_tags);
             let score = compute_similarity(&new_node, &other_map);
 
-            if score > 0.3 {
+            if score > DEFAULT_SIMILARITY_THRESHOLD {
                 let mut edge_meta = HashMap::new();
 
                 // Check for contradiction between high-similarity facts
-                if score > 0.5 {
+                if score > CONTRADICTION_SIMILARITY_THRESHOLD {
                     if let Some(contradiction) =
                         detect_contradiction(content, other_content, concept, other_concept)
                     {
@@ -1004,7 +1013,8 @@ impl HierarchicalMemory {
                 let reason = edge.properties.get("reason").cloned().unwrap_or_default();
                 node.metadata
                     .insert("supersede_reason".into(), serde_json::Value::String(reason));
-                node.confidence = (node.confidence * 0.5).max(0.1);
+                node.confidence =
+                    (node.confidence * SUPERSEDE_CONFIDENCE_DECAY).max(MIN_CONFIDENCE);
             }
         }
     }
