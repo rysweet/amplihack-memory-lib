@@ -41,7 +41,7 @@ impl HiveGraphStore {
             "joined_at".into(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock before UNIX epoch")
+                .unwrap_or_default()
                 .as_secs_f64()
                 .to_string(),
         );
@@ -122,7 +122,7 @@ impl HiveGraphStore {
             "confirmed_at".into(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock before UNIX epoch")
+                .unwrap_or_default()
                 .as_secs_f64()
                 .to_string(),
         );
@@ -148,7 +148,7 @@ impl HiveGraphStore {
             "detected_at".into(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock before UNIX epoch")
+                .unwrap_or_default()
                 .as_secs_f64()
                 .to_string(),
         );
@@ -172,7 +172,7 @@ impl HiveGraphStore {
             "detected_at".into(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock before UNIX epoch")
+                .unwrap_or_default()
                 .as_secs_f64()
                 .to_string(),
         );

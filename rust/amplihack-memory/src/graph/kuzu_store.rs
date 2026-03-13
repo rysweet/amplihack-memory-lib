@@ -558,7 +558,10 @@ impl GraphStore for KuzuGraphStore {
     }
 
     fn get_node(&self, node_id: &str) -> Option<GraphNode> {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.lock.lock().unwrap_or_else(|e| {
+            warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
 
         if let Some(cached_table) = self.id_table_cache.borrow().get(node_id).cloned() {
             if let Some(node) = self.get_node_from_table(node_id, &cached_table) {
@@ -592,7 +595,10 @@ impl GraphStore for KuzuGraphStore {
             return Vec::new();
         }
 
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.lock.lock().unwrap_or_else(|e| {
+            warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
 
         Python::with_gil(|py| {
             let mut where_parts: Vec<String> = Vec::new();
@@ -644,7 +650,10 @@ impl GraphStore for KuzuGraphStore {
             }
         }
 
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.lock.lock().unwrap_or_else(|e| {
+            warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
 
         Python::with_gil(|py| {
             let mut where_parts: Vec<String> = Vec::new();
@@ -698,7 +707,10 @@ impl GraphStore for KuzuGraphStore {
         }
 
         let table = {
-            let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = self.lock.lock().unwrap_or_else(|e| {
+                warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
             self.id_table_cache.borrow().get(node_id).cloned()
         };
 
@@ -723,7 +735,10 @@ impl GraphStore for KuzuGraphStore {
             return true;
         }
 
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.lock.lock().unwrap_or_else(|e| {
+            warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
 
         Python::with_gil(|py| {
             let mut set_parts: Vec<String> = Vec::new();
@@ -748,7 +763,10 @@ impl GraphStore for KuzuGraphStore {
 
     fn delete_node(&mut self, node_id: &str) -> bool {
         let table = {
-            let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = self.lock.lock().unwrap_or_else(|e| {
+                warn!("mutex poisoned, recovering: {e}");
+                e.into_inner()
+            });
             self.id_table_cache.borrow().get(node_id).cloned()
         };
 
@@ -760,7 +778,10 @@ impl GraphStore for KuzuGraphStore {
             },
         };
 
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.lock.lock().unwrap_or_else(|e| {
+            warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
 
         let result = Python::with_gil(|py| {
             let cypher = format!("MATCH (n:{table}) WHERE n.node_id = $nid DETACH DELETE n");
@@ -810,7 +831,10 @@ impl GraphStore for KuzuGraphStore {
             Some(&col_types),
         )?;
 
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.lock.lock().unwrap_or_else(|e| {
+            warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
 
         Python::with_gil(|py| {
             let mut set_parts = vec![
@@ -878,7 +902,10 @@ impl GraphStore for KuzuGraphStore {
             None => return Vec::new(),
         };
 
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.lock.lock().unwrap_or_else(|e| {
+            warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
 
         let rel_tables = self.get_rel_tables_for(edge_type);
         let mut results = Vec::new();
@@ -929,7 +956,10 @@ impl GraphStore for KuzuGraphStore {
             None => return false,
         };
 
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.lock.lock().unwrap_or_else(|e| {
+            warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
 
         let src_type = &src_node.node_type;
         let tgt_type = &tgt_node.node_type;
@@ -973,7 +1003,10 @@ impl GraphStore for KuzuGraphStore {
     }
 
     fn close(&mut self) {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.lock.lock().unwrap_or_else(|e| {
+            warn!("mutex poisoned, recovering: {e}");
+            e.into_inner()
+        });
         self.id_table_cache.borrow_mut().clear();
         self.known_node_tables.clear();
         self.known_rel_tables.clear();

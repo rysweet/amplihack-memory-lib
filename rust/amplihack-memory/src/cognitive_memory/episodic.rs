@@ -40,7 +40,12 @@ impl CognitiveMemory {
         };
 
         let meta_json = metadata
-            .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "{}".into()))
+            .map(|m| {
+                serde_json::to_string(m).unwrap_or_else(|e| {
+                    warn!("store_episode: failed to serialize metadata: {e}");
+                    "{}".into()
+                })
+            })
             .unwrap_or_else(|| "{}".into());
 
         let mut props = HashMap::new();
