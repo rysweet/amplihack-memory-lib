@@ -11,12 +11,15 @@ use super::types::{Direction, GraphEdge, GraphNode, TraversalResult};
 
 /// In-memory graph store backed by HashMaps.
 ///
-/// Edges are indexed by source_id for O(k) neighbor lookups in the outgoing direction.
+/// Edges are indexed by source_id for O(k) outgoing lookups and by
+/// target_id (`reverse_edges`) for O(k) incoming lookups.
 pub struct InMemoryGraphStore {
     store_id: String,
     nodes: HashMap<String, GraphNode>,
     /// Edges indexed by source_id for efficient outgoing neighbor queries.
     edges: HashMap<String, Vec<GraphEdge>>,
+    /// Reverse index: target_id → edges, for O(k) incoming neighbor queries.
+    reverse_edges: HashMap<String, Vec<GraphEdge>>,
     graph_origin: String,
 }
 
@@ -29,6 +32,7 @@ impl InMemoryGraphStore {
             store_id: id.clone(),
             nodes: HashMap::new(),
             edges: HashMap::new(),
+            reverse_edges: HashMap::new(),
             graph_origin: id,
         }
     }
@@ -128,11 +132,21 @@ impl GraphStore for InMemoryGraphStore {
     }
 
     fn delete_node(&mut self, node_id: &str) -> bool {
-        // Remove all edges where this node is the source
-        self.edges.remove(node_id);
-        // Remove edges where this node is the target from other source buckets
-        for bucket in self.edges.values_mut() {
-            bucket.retain(|e| e.target_id != node_id);
+        // Remove outgoing edges and clean their reverse entries
+        if let Some(outgoing) = self.edges.remove(node_id) {
+            for edge in &outgoing {
+                if let Some(rev) = self.reverse_edges.get_mut(&edge.target_id) {
+                    rev.retain(|e| e.edge_id != edge.edge_id);
+                }
+            }
+        }
+        // Remove incoming edges (via reverse index) and clean their forward entries
+        if let Some(incoming) = self.reverse_edges.remove(node_id) {
+            for edge in &incoming {
+                if let Some(fwd) = self.edges.get_mut(&edge.source_id) {
+                    fwd.retain(|e| e.edge_id != edge.edge_id);
+                }
+            }
         }
         self.nodes.remove(node_id).is_some()
     }
@@ -166,6 +180,10 @@ impl GraphStore for InMemoryGraphStore {
 
         self.edges
             .entry(source_id.to_string())
+            .or_default()
+            .push(edge.clone());
+        self.reverse_edges
+            .entry(target_id.to_string())
             .or_default()
             .push(edge.clone());
         Ok(edge)
@@ -203,15 +221,11 @@ impl GraphStore for InMemoryGraphStore {
             }
         }
 
-        // Incoming / Both: scan all buckets for edges targeting node_id
+        // Incoming / Both: lookup reverse index by target_id — O(k)
         if direction == Direction::Incoming || direction == Direction::Both {
-            for (src, bucket) in &self.edges {
-                // For Both, skip the source bucket we already processed above
-                if direction == Direction::Both && src == node_id {
-                    continue;
-                }
+            if let Some(bucket) = self.reverse_edges.get(node_id) {
                 for edge in bucket {
-                    if edge.target_id == node_id && type_ok(edge) {
+                    if type_ok(edge) {
                         push_if_valid(edge, &edge.source_id, &mut results);
                         if results.len() >= limit {
                             return results;
@@ -225,13 +239,19 @@ impl GraphStore for InMemoryGraphStore {
     }
 
     fn delete_edge(&mut self, source_id: &str, target_id: &str, edge_type: &str) -> bool {
-        if let Some(bucket) = self.edges.get_mut(source_id) {
+        let removed = if let Some(bucket) = self.edges.get_mut(source_id) {
             let len_before = bucket.len();
             bucket.retain(|e| !(e.target_id == target_id && e.edge_type == edge_type));
             bucket.len() < len_before
         } else {
             false
+        };
+        if removed {
+            if let Some(rev) = self.reverse_edges.get_mut(target_id) {
+                rev.retain(|e| !(e.source_id == source_id && e.edge_type == edge_type));
+            }
         }
+        removed
     }
 
     fn traverse(
@@ -260,6 +280,7 @@ impl GraphStore for InMemoryGraphStore {
     fn close(&mut self) {
         self.nodes.clear();
         self.edges.clear();
+        self.reverse_edges.clear();
     }
 }
 
@@ -322,5 +343,108 @@ mod tests {
 
         let result = store.traverse("a", None, 3, Direction::Outgoing, None);
         assert!(result.nodes.len() >= 2);
+    }
+
+    #[test]
+    fn test_incoming_neighbors() {
+        let mut store = InMemoryGraphStore::new(Some("test"));
+        store.add_node("N", HashMap::new(), Some("a")).unwrap();
+        store.add_node("N", HashMap::new(), Some("b")).unwrap();
+        store.add_node("N", HashMap::new(), Some("c")).unwrap();
+        store.add_edge("a", "c", "LINK", None).unwrap();
+        store.add_edge("b", "c", "LINK", None).unwrap();
+
+        let incoming = store.query_neighbors("c", None, Direction::Incoming, 10);
+        assert_eq!(incoming.len(), 2);
+        let ids: Vec<&str> = incoming.iter().map(|(_, n)| n.node_id.as_str()).collect();
+        assert!(ids.contains(&"a"));
+        assert!(ids.contains(&"b"));
+    }
+
+    #[test]
+    fn test_both_direction_neighbors() {
+        let mut store = InMemoryGraphStore::new(Some("test"));
+        store.add_node("N", HashMap::new(), Some("a")).unwrap();
+        store.add_node("N", HashMap::new(), Some("b")).unwrap();
+        store.add_node("N", HashMap::new(), Some("c")).unwrap();
+        store.add_edge("a", "b", "LINK", None).unwrap();
+        store.add_edge("c", "b", "LINK", None).unwrap();
+
+        let both = store.query_neighbors("b", None, Direction::Both, 10);
+        assert_eq!(both.len(), 2);
+
+        store.add_node("N", HashMap::new(), Some("d")).unwrap();
+        store.add_edge("b", "d", "LINK", None).unwrap();
+        let both = store.query_neighbors("b", None, Direction::Both, 10);
+        assert_eq!(both.len(), 3);
+    }
+
+    #[test]
+    fn test_delete_edge_updates_reverse_index() {
+        let mut store = InMemoryGraphStore::new(Some("test"));
+        store.add_node("N", HashMap::new(), Some("a")).unwrap();
+        store.add_node("N", HashMap::new(), Some("b")).unwrap();
+        store.add_edge("a", "b", "LINK", None).unwrap();
+
+        assert_eq!(
+            store
+                .query_neighbors("b", None, Direction::Incoming, 10)
+                .len(),
+            1
+        );
+        assert!(store.delete_edge("a", "b", "LINK"));
+        assert_eq!(
+            store
+                .query_neighbors("b", None, Direction::Incoming, 10)
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_delete_node_updates_reverse_index() {
+        let mut store = InMemoryGraphStore::new(Some("test"));
+        store.add_node("N", HashMap::new(), Some("a")).unwrap();
+        store.add_node("N", HashMap::new(), Some("b")).unwrap();
+        store.add_node("N", HashMap::new(), Some("c")).unwrap();
+        store.add_edge("a", "b", "LINK", None).unwrap();
+        store.add_edge("c", "b", "LINK", None).unwrap();
+
+        assert!(store.delete_node("a"));
+        let incoming = store.query_neighbors("b", None, Direction::Incoming, 10);
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].1.node_id, "c");
+    }
+
+    #[test]
+    fn test_incoming_with_edge_type_filter() {
+        let mut store = InMemoryGraphStore::new(Some("test"));
+        store.add_node("N", HashMap::new(), Some("a")).unwrap();
+        store.add_node("N", HashMap::new(), Some("b")).unwrap();
+        store.add_edge("a", "b", "KNOWS", None).unwrap();
+        store.add_edge("a", "b", "LIKES", None).unwrap();
+
+        let knows = store.query_neighbors("b", Some("KNOWS"), Direction::Incoming, 10);
+        assert_eq!(knows.len(), 1);
+        assert_eq!(knows[0].0.edge_type, "KNOWS");
+
+        let all = store.query_neighbors("b", None, Direction::Incoming, 10);
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_self_loop_edge() {
+        let mut store = InMemoryGraphStore::new(Some("test"));
+        store.add_node("N", HashMap::new(), Some("a")).unwrap();
+        store.add_edge("a", "a", "SELF", None).unwrap();
+
+        let outgoing = store.query_neighbors("a", None, Direction::Outgoing, 10);
+        assert_eq!(outgoing.len(), 1);
+
+        let incoming = store.query_neighbors("a", None, Direction::Incoming, 10);
+        assert_eq!(incoming.len(), 1);
+
+        let both = store.query_neighbors("a", None, Direction::Both, 10);
+        assert_eq!(both.len(), 2);
     }
 }
