@@ -144,6 +144,22 @@ impl SqliteBackend {
     }
 }
 
+/// Escape user-supplied text for FTS5 MATCH queries.
+///
+/// Wraps each whitespace-delimited token in double quotes so that FTS5
+/// special operators (`AND`, `OR`, `NOT`, `NEAR`, `*`) are treated as
+/// literal search terms rather than query syntax.
+fn escape_fts5_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|term| {
+            let escaped = term.replace('"', "\"\"");
+            format!("\"{escaped}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl MemoryBackend for SqliteBackend {
     fn initialize_schema(&mut self) -> crate::Result<()> {
         let conn = self
@@ -243,6 +259,8 @@ impl MemoryBackend for SqliteBackend {
             .lock()
             .map_err(|e| MemoryError::Internal(format!("mutex poisoned: {e}")))?;
 
+        let escaped_query = escape_fts5_query(query);
+
         let mut sql = String::from(
             "SELECT e.* FROM experiences e \
              JOIN experiences_fts fts ON e.experience_id = fts.experience_id \
@@ -251,7 +269,7 @@ impl MemoryBackend for SqliteBackend {
              AND e.confidence >= ?3",
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
-            Box::new(query.to_string()),
+            Box::new(escaped_query),
             Box::new(self.agent_name.clone()),
             Box::new(min_confidence),
         ];
@@ -617,5 +635,59 @@ mod tests {
 
         let after = backend.retrieve_experiences(Some(100), None, 0.0).unwrap();
         assert!(after.len() <= 3, "expected at most 3, got {}", after.len());
+    }
+
+    // ====================================================================
+    // #31: FTS5 query escaping
+    // ====================================================================
+
+    #[test]
+    fn test_escape_fts5_query_basic() {
+        let escaped = escape_fts5_query("hello world");
+        assert_eq!(escaped, r#""hello" "world""#);
+    }
+
+    #[test]
+    fn test_escape_fts5_query_operators() {
+        let escaped = escape_fts5_query("AND OR NOT NEAR");
+        assert_eq!(escaped, r#""AND" "OR" "NOT" "NEAR""#);
+    }
+
+    #[test]
+    fn test_escape_fts5_query_wildcard() {
+        let escaped = escape_fts5_query("test*");
+        assert_eq!(escaped, r#""test*""#);
+    }
+
+    #[test]
+    fn test_escape_fts5_query_with_quotes() {
+        let escaped = escape_fts5_query(r#"say "hello""#);
+        assert_eq!(escaped, r#""say" """hello""""#);
+    }
+
+    #[test]
+    fn test_escape_fts5_query_empty() {
+        let escaped = escape_fts5_query("");
+        assert_eq!(escaped, "");
+    }
+
+    #[test]
+    fn test_search_with_fts5_operators() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("fts5_test.db");
+        let mut backend = SqliteBackend::new(&db_path, "fts5-agent", 100, true).unwrap();
+
+        let exp = Experience::new(
+            ExperienceType::Success,
+            "using AND operator in context".into(),
+            "outcome with NOT keyword".into(),
+            0.9,
+        )
+        .unwrap();
+        backend.store_experience(&exp).unwrap();
+
+        // Searching for "AND" should not cause FTS5 syntax error
+        let results = MemoryBackend::search(&backend, "AND", None, 0.0, 10).unwrap();
+        assert_eq!(results.len(), 1);
     }
 }

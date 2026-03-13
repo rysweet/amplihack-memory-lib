@@ -55,6 +55,26 @@ static CREDENTIAL_PATTERNS: LazyLock<Vec<(&str, Regex)>> = LazyLock::new(|| {
             "db_url",
             Regex::new(r"((?:postgres|mysql|mongodb)://[^:]+:)([^@]+)(@)").unwrap(),
         ),
+        (
+            "gcp_service_account",
+            Regex::new(r#""type"\s*:\s*"service_account""#).unwrap(),
+        ),
+        (
+            "slack_webhook",
+            Regex::new(r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+").unwrap(),
+        ),
+        (
+            "stripe_key",
+            Regex::new(r"sk_(?:live|test)_[A-Za-z0-9]{24,}").unwrap(),
+        ),
+        (
+            "jwt_token",
+            Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}").unwrap(),
+        ),
+        (
+            "bearer_token",
+            Regex::new(r"(Bearer\s+)([A-Za-z0-9._~+/=-]{20,})").unwrap(),
+        ),
     ]
 });
 
@@ -112,6 +132,9 @@ impl CredentialScrubber {
                 let replacement = match *name {
                     "db_url" => {
                         format!("${{1}}{REDACTION_TEXT}${{3}}")
+                    }
+                    "bearer_token" => {
+                        format!("${{1}}{REDACTION_TEXT}")
                     }
                     _ => REDACTION_TEXT.to_string(),
                 };
