@@ -22,9 +22,9 @@ pub struct AnnotatedResult {
 #[derive(Debug, Clone, Default)]
 pub struct FederatedQueryResult {
     pub results: Vec<AnnotatedResult>,
-    /// Number of results sourced from the local agent graph.
+    /// Number of raw results returned by the local agent graph (before deduplication).
     pub local_count: usize,
-    /// Number of results sourced from the shared hive graph.
+    /// Number of results from the shared hive graph added after deduplication against local results.
     pub hive_count: usize,
     pub expert_agents: Vec<String>,
 }

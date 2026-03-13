@@ -91,21 +91,7 @@ impl MemoryBackend for KuzuBackend {
     }
 
     fn store_experience(&mut self, experience: &Experience) -> crate::Result<String> {
-        if experience.context.trim().is_empty() {
-            return Err(MemoryError::InvalidExperience(
-                "context cannot be empty".into(),
-            ));
-        }
-        if experience.outcome.trim().is_empty() {
-            return Err(MemoryError::InvalidExperience(
-                "outcome cannot be empty".into(),
-            ));
-        }
-        if !(0.0..=1.0).contains(&experience.confidence) {
-            return Err(MemoryError::InvalidExperience(
-                "confidence must be between 0.0 and 1.0".into(),
-            ));
-        }
+        experience.validate()?;
         let metadata_json =
             serde_json::to_string(&experience.metadata).unwrap_or_else(|_| "{}".to_string());
         let tags_json =
