@@ -13,6 +13,8 @@ use super::base::{ExperienceBackend, MemoryBackend, StorageStatistics};
 use crate::errors::MemoryError;
 use crate::experience::{Experience, ExperienceType};
 
+use tracing::warn;
+
 /// LadybugDB graph database backend for memory storage.
 ///
 /// Stores experiences as nodes in a LadybugDB graph database, with relationship
@@ -378,7 +380,7 @@ impl MemoryBackend for LadybugBackend {
         // 1. Mark old experiences as compressed (>30 days)
         if auto_compress && self.enable_compression {
             let cutoff = (Utc::now() - chrono::Duration::days(30)).timestamp();
-            let _ = self.exec(
+            if let Err(e) = self.exec(
                 "MATCH (e:Experience) \
                  WHERE e.agent_name = $agent AND e.timestamp < $cutoff AND e.compressed = false \
                  SET e.compressed = true",
@@ -386,13 +388,15 @@ impl MemoryBackend for LadybugBackend {
                     ("agent", Property::from(agent.as_str())),
                     ("cutoff", Property::Int64(cutoff)),
                 ],
-            );
+            ) {
+                warn!("cleanup: failed to auto-compress old experiences: {e}");
+            }
         }
 
         // 2. Delete experiences older than max_age_days
         if let Some(days) = max_age_days {
             let cutoff = (Utc::now() - chrono::Duration::days(days)).timestamp();
-            let _ = self.exec(
+            if let Err(e) = self.exec(
                 "MATCH (e:Experience) \
                  WHERE e.agent_name = $agent AND e.timestamp < $cutoff \
                  DETACH DELETE e",
@@ -400,7 +404,9 @@ impl MemoryBackend for LadybugBackend {
                     ("agent", Property::from(agent.as_str())),
                     ("cutoff", Property::Int64(cutoff)),
                 ],
-            );
+            ) {
+                warn!("cleanup: failed to delete experiences older than {days} days: {e}");
+            }
         }
 
         // 3. Limit to max_experiences
@@ -451,10 +457,12 @@ impl MemoryBackend for LadybugBackend {
                 for row in &all_rows {
                     if let Some(id) = row.first().and_then(|p| p.as_str()) {
                         if !keep_ids.contains(id) {
-                            let _ = self.exec(
+                            if let Err(e) = self.exec(
                                 "MATCH (e:Experience {experience_id: $id}) DETACH DELETE e",
                                 &[("id", Property::from(id))],
-                            );
+                            ) {
+                                warn!("cleanup: failed to delete excess experience {id}: {e}");
+                            }
                         }
                     }
                 }

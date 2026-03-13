@@ -5,6 +5,7 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
+/// Compiled regex matching multi-word proper names (e.g. "Sarah Chen", "O'Brien").
 pub static MULTI_WORD_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\b([A-Z][a-z]*(?:['\u{2019}\-][A-Z]?[a-z]+)+(?:\s+(?:[A-Z][a-z]+(?:['\u{2019}\-][A-Z]?[a-z]+)?))*|[A-Z][a-z]+(?:\s+(?:[A-Z][a-z]+(?:['\u{2019}\-][A-Z]?[a-z]+)?))+)\b"

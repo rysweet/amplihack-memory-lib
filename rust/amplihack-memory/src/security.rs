@@ -9,13 +9,18 @@ use std::sync::LazyLock;
 use crate::errors::MemoryError;
 use crate::experience::{Experience, ExperienceType};
 
-/// Memory access scope levels.
+/// Memory access scope levels, ordered from most restrictive to least.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScopeLevel {
+    /// Access limited to the current session only.
     SessionOnly,
+    /// Read access across sessions of the same agent.
     CrossSessionRead,
+    /// Read and write access across sessions of the same agent.
     CrossSessionWrite,
+    /// Read access to any agent's memory in the system.
     GlobalRead,
+    /// Full read/write access to any agent's memory in the system.
     GlobalWrite,
 }
 
@@ -31,18 +36,32 @@ impl ScopeLevel {
     }
 }
 
-/// Security capabilities for memory access.
+/// Security capabilities governing what a memory-enabled agent can do.
+///
+/// Capabilities are checked before every store/retrieve/query operation
+/// by [`SecureMemoryBackend`].
 pub struct AgentCapabilities {
+    /// The maximum scope this agent is allowed to access.
     pub scope: ScopeLevel,
+    /// Which experience types the agent may store and retrieve.
+    /// An empty list means all types are allowed.
     pub allowed_experience_types: Vec<ExperienceType>,
+    /// Maximum estimated query cost before a query is rejected.
     pub max_query_cost: i32,
+    /// Whether the agent may access pattern-type experiences.
     pub can_access_patterns: bool,
+    /// Maximum storage quota in megabytes.
     pub memory_quota_mb: i32,
 }
 
 impl AgentCapabilities {
     /// Create agent capabilities with the given scope, allowed experience types,
     /// query cost limit, pattern access flag, and memory quota.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::InvalidInput`] if `max_query_cost` or
+    /// `memory_quota_mb` is not positive.
     pub fn new(
         scope: ScopeLevel,
         allowed_experience_types: Vec<ExperienceType>,
@@ -211,6 +230,9 @@ impl CredentialScrubber {
 }
 
 /// Validate and estimate cost of database queries.
+///
+/// Assigns cost points based on SQL patterns (JOINs, subqueries,
+/// unbounded SELECTs) and rejects queries exceeding a configured limit.
 pub struct QueryValidator;
 
 static COST_PATTERNS: LazyLock<Vec<(&str, Regex, i32)>> = LazyLock::new(|| {
@@ -234,7 +256,10 @@ static COST_PATTERNS: LazyLock<Vec<(&str, Regex, i32)>> = LazyLock::new(|| {
 static LIMIT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bLIMIT\b").unwrap());
 
 impl QueryValidator {
-    /// Estimate query cost from SQL.
+    /// Estimate the cost of a SQL query based on pattern analysis.
+    ///
+    /// Cost factors: full table scans (+10), JOINs (+5 each), subqueries (+3),
+    /// ORDER BY (+2), and missing LIMIT (+20). Base cost is 1.
     pub fn estimate_cost(sql: &str) -> i32 {
         let mut cost = 1; // Base cost
 
@@ -256,7 +281,11 @@ impl QueryValidator {
         cost
     }
 
-    /// Validate query against cost limit.
+    /// Validate that a query's estimated cost does not exceed `max_cost`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::QueryCostExceeded`] if the cost exceeds the limit.
     pub fn validate_query(sql: &str, max_cost: i32) -> crate::Result<()> {
         let cost = Self::estimate_cost(sql);
         if cost > max_cost {
@@ -268,7 +297,9 @@ impl QueryValidator {
         Ok(())
     }
 
-    /// Check if query is safe (non-destructive).
+    /// Check if a SQL query is non-destructive (read-only SELECT).
+    ///
+    /// Returns `false` for DELETE, UPDATE, INSERT, DROP, and other DDL/DML.
     pub fn is_safe_query(sql: &str) -> bool {
         let sql_trimmed = sql.trim();
 
@@ -301,9 +332,13 @@ impl QueryValidator {
     }
 }
 
-/// Wrapper around ExperienceStore with capability enforcement.
+/// Wrapper around an experience backend that enforces capability-based access control.
+///
+/// All write operations are credential-scrubbed before reaching the inner store.
 pub struct SecureMemoryBackend<S> {
+    /// The underlying experience storage backend.
     pub store: S,
+    /// Capabilities controlling what operations are permitted.
     pub capabilities: AgentCapabilities,
     scrubber: CredentialScrubber,
 }

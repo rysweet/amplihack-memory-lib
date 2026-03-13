@@ -38,4 +38,5 @@ pub enum MemoryError {
     Internal(String),
 }
 
+/// Convenience type alias for `std::result::Result<T, MemoryError>`.
 pub type Result<T> = std::result::Result<T, MemoryError>;

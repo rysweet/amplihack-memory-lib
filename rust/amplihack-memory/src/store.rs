@@ -25,6 +25,15 @@ pub struct ExperienceStore {
 }
 
 impl ExperienceStore {
+    /// Create a new experience store.
+    ///
+    /// Opens (or creates) a SQLite database at `storage_path` for the given
+    /// `agent_name`. When `storage_path` is `None`, a default location under
+    /// the user's data directory is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Storage`] if the database cannot be opened.
     pub fn new(
         agent_name: &str,
         auto_compress: bool,

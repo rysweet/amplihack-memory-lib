@@ -91,26 +91,44 @@ pub struct SemanticSearchEngine {
 }
 
 impl SemanticSearchEngine {
+    /// Create a new search engine pre-loaded with the given experiences.
+    ///
+    /// The engine is immediately ready for queries after construction.
     pub fn new(experiences: Vec<Experience>) -> Self {
         Self { experiences }
     }
 
+    /// Return the number of experiences currently in the corpus.
     pub fn corpus_size(&self) -> usize {
         self.experiences.len()
     }
 
+    /// Check whether the engine is indexed and ready for queries.
+    ///
+    /// This implementation uses a linear scan, so it is always considered
+    /// indexed. Returns `true` unconditionally.
     pub fn is_indexed(&self) -> bool {
         true
     }
 
+    /// Search the corpus for experiences most relevant to `query`.
+    ///
+    /// Returns up to `top_k` experiences sorted by descending relevance score.
+    /// Relevance is computed via [`calculate_relevance`], which combines
+    /// Jaccard word similarity, experience-type weighting, confidence, and
+    /// recency decay.
     pub fn search(&self, query: &str, top_k: usize) -> Vec<Experience> {
         retrieve_relevant_experiences(&self.experiences, query, top_k, 0.0)
     }
 
+    /// Append an experience to the corpus so it becomes searchable.
     pub fn add_experience(&mut self, experience: Experience) {
         self.experiences.push(experience);
     }
 
+    /// Remove an experience from the corpus by its id.
+    ///
+    /// If no experience with the given id exists, this is a no-op.
     pub fn remove_experience(&mut self, experience_id: &str) {
         self.experiences
             .retain(|e| e.experience_id != experience_id);

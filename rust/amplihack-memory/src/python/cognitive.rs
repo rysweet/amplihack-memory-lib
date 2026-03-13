@@ -38,7 +38,7 @@ impl PyCognitiveMemory {
         ttl_seconds: i64,
     ) -> PyResult<String> {
         self.inner
-            .record_sensory(modality, raw_data, ttl_seconds)
+            .store_sensory(modality, raw_data, ttl_seconds)
             .map_err(mem_err)
     }
 
@@ -46,7 +46,7 @@ impl PyCognitiveMemory {
     #[pyo3(signature = (limit=10))]
     fn get_recent_sensory(&self, py: Python<'_>, limit: usize) -> PyResult<Vec<PyObject>> {
         self.inner
-            .get_recent_sensory(limit)
+            .get_sensory(limit)
             .iter()
             .map(|s| sensory_to_dict(py, s))
             .collect()
@@ -69,14 +69,14 @@ impl PyCognitiveMemory {
         relevance: f64,
     ) -> PyResult<String> {
         self.inner
-            .push_working(slot_type, content, task_id, relevance)
+            .store_working(slot_type, content, task_id, relevance)
             .map_err(mem_err)
     }
 
     /// Recall working memory items for a task.
     fn recall_working(&self, py: Python<'_>, task_id: &str) -> PyResult<Vec<PyObject>> {
         self.inner
-            .recall_working(task_id)
+            .get_working(task_id)
             .iter()
             .map(|w| working_to_dict(py, w))
             .collect()
@@ -111,7 +111,7 @@ impl PyCognitiveMemory {
     #[pyo3(signature = (limit=10))]
     fn recall_episodes(&self, py: Python<'_>, limit: usize) -> PyResult<Vec<PyObject>> {
         self.inner
-            .recall_episodes(limit)
+            .search_episodes(limit)
             .iter()
             .map(|e| episode_to_dict(py, e))
             .collect()
@@ -188,7 +188,7 @@ impl PyCognitiveMemory {
         limit: usize,
     ) -> PyResult<Vec<PyObject>> {
         self.inner
-            .recall_procedures_mut(query, limit)
+            .search_procedures_mut(query, limit)
             .iter()
             .map(|p| procedure_to_dict(py, p))
             .collect()

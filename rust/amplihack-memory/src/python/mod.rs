@@ -10,11 +10,17 @@ mod converters;
 mod experience;
 mod helpers;
 mod hierarchical;
+mod patterns;
+mod search;
+mod security;
 
 pub use cognitive::PyCognitiveMemory;
 pub use connectors::{PyExperienceStore, PyMemoryConnector};
 pub use experience::PyExperience;
 pub use hierarchical::PyHierarchicalMemory;
+pub use patterns::PyPatternDetector;
+pub use search::PySemanticSearchEngine;
+pub use security::PySecureMemoryBackend;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -87,6 +93,9 @@ pub fn amplihack_memory_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyExperienceStore>()?;
     m.add_class::<PyCognitiveMemory>()?;
     m.add_class::<PyHierarchicalMemory>()?;
+    m.add_class::<PyPatternDetector>()?;
+    m.add_class::<PySemanticSearchEngine>()?;
+    m.add_class::<PySecureMemoryBackend>()?;
 
     // Functions
     m.add_function(wrap_pyfunction!(py_extract_entities, m)?)?;

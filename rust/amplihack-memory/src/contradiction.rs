@@ -9,10 +9,12 @@ use std::sync::LazyLock;
 
 static NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d+(?:\.\d+)?\b").unwrap());
 
-/// Result of contradiction detection.
+/// Result of contradiction detection between two facts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContradictionResult {
+    /// `true` if the two facts contain conflicting numerical values.
     pub contradiction: bool,
+    /// Human-readable description of the conflicting values (e.g. `"5 vs 8"`).
     pub conflicting_values: String,
 }
 

@@ -13,6 +13,8 @@ use super::base::{ExperienceBackend, MemoryBackend, StorageStatistics};
 use crate::errors::MemoryError;
 use crate::experience::{Experience, ExperienceType};
 
+use tracing::{error, warn};
+
 /// Kuzu graph database backend for memory storage.
 ///
 /// Stores experiences as nodes in a Kuzu graph database, with relationship
@@ -179,7 +181,7 @@ impl MemoryBackend for KuzuBackend {
     fn initialize_schema(&mut self) -> crate::Result<()> {
         Python::with_gil(|py| {
             // Create Experience node table
-            let _ = self.execute_no_params(
+            if let Err(e) = self.execute_no_params(
                 py,
                 "CREATE NODE TABLE IF NOT EXISTS Experience(\
                     experience_id STRING, \
@@ -194,25 +196,31 @@ impl MemoryBackend for KuzuBackend {
                     compressed BOOLEAN, \
                     PRIMARY KEY(experience_id)\
                 )",
-            );
+            ) {
+                error!("initialize_schema: failed to create Experience node table: {e}");
+            }
 
             // Create SIMILAR_TO relationship table
-            let _ = self.execute_no_params(
+            if let Err(e) = self.execute_no_params(
                 py,
                 "CREATE REL TABLE IF NOT EXISTS SIMILAR_TO(\
                     FROM Experience TO Experience, \
                     similarity_score DOUBLE\
                 )",
-            );
+            ) {
+                error!("initialize_schema: failed to create SIMILAR_TO rel table: {e}");
+            }
 
             // Create LEADS_TO relationship table
-            let _ = self.execute_no_params(
+            if let Err(e) = self.execute_no_params(
                 py,
                 "CREATE REL TABLE IF NOT EXISTS LEADS_TO(\
                     FROM Experience TO Experience, \
                     causal_strength DOUBLE\
                 )",
-            );
+            ) {
+                error!("initialize_schema: failed to create LEADS_TO rel table: {e}");
+            }
 
             Ok(())
         })
@@ -535,10 +543,14 @@ impl MemoryBackend for KuzuBackend {
         Python::with_gil(|py| {
             // Explicitly close connection before dropping
             if let Ok(conn) = self.py_conn.bind(py).getattr("close") {
-                let _ = conn.call0();
+                if let Err(e) = conn.call0() {
+                    warn!("close: failed to close kuzu connection: {e}");
+                }
             }
             if let Ok(db) = self.py_db.bind(py).getattr("close") {
-                let _ = db.call0();
+                if let Err(e) = db.call0() {
+                    warn!("close: failed to close kuzu database: {e}");
+                }
             }
         });
     }
@@ -561,13 +573,15 @@ impl MemoryBackend for KuzuBackend {
                 params
                     .set_item("cutoff", cutoff)
                     .map_err(|e| MemoryError::Storage(format!("param error: {e}")))?;
-                let _ = self.execute(
+                if let Err(e) = self.execute(
                     py,
                     "MATCH (e:Experience) \
                      WHERE e.agent_name = $agent AND e.timestamp < $cutoff AND e.compressed = false \
                      SET e.compressed = true",
                     &params,
-                );
+                ) {
+                    warn!("cleanup: failed to auto-compress old experiences: {e}");
+                }
             }
 
             // 2. Delete experiences older than max_age_days
@@ -580,13 +594,15 @@ impl MemoryBackend for KuzuBackend {
                 age_params
                     .set_item("cutoff", cutoff)
                     .map_err(|e| MemoryError::Storage(format!("param error: {e}")))?;
-                let _ = self.execute(
+                if let Err(e) = self.execute(
                     py,
                     "MATCH (e:Experience) \
                      WHERE e.agent_name = $agent AND e.timestamp < $cutoff \
                      DETACH DELETE e",
                     &age_params,
-                );
+                ) {
+                    warn!("cleanup: failed to delete experiences older than {days} days: {e}");
+                }
             }
 
             // 3. Limit to max_experiences
@@ -709,11 +725,13 @@ impl MemoryBackend for KuzuBackend {
                             del_params
                                 .set_item("id", &exp_id)
                                 .map_err(|e| MemoryError::Storage(format!("param error: {e}")))?;
-                            let _ = self.execute(
+                            if let Err(e) = self.execute(
                                 py,
                                 "MATCH (e:Experience {experience_id: $id}) DETACH DELETE e",
                                 &del_params,
-                            );
+                            ) {
+                                warn!("cleanup: failed to delete excess experience {exp_id}: {e}");
+                            }
                         }
                     }
                 }

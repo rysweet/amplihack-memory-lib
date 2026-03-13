@@ -6,16 +6,24 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 /// Types of experiences an agent can have.
+///
+/// Each variant carries different semantic weight when computing relevance
+/// scores in [`crate::semantic_search::calculate_relevance`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExperienceType {
+    /// A task or action completed successfully.
     Success,
+    /// A task or action that failed.
     Failure,
+    /// A recurring pattern detected across multiple experiences.
     Pattern,
+    /// A novel insight or learned lesson.
     Insight,
 }
 
 impl ExperienceType {
+    /// Return the lowercase string representation of this experience type.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Success => "success",
@@ -47,22 +55,59 @@ impl std::fmt::Display for ExperienceType {
 }
 
 /// Single agent experience record.
+///
+/// An experience captures a specific event in the agent's lifecycle together
+/// with its context, outcome, and a confidence score. Experiences are
+/// content-addressed: the `experience_id` is derived from the context,
+/// outcome, and timestamp.
+///
+/// # Examples
+///
+/// ```
+/// use amplihack_memory::{Experience, ExperienceType};
+///
+/// let exp = Experience::new(
+///     ExperienceType::Success,
+///     "compiled project".into(),
+///     "zero warnings".into(),
+///     0.95,
+/// )
+/// .unwrap();
+/// assert!(exp.experience_id.starts_with("exp_"));
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Experience {
+    /// Content-addressed unique identifier (e.g. `exp_20240101_120000_a1b2c3`).
     pub experience_id: String,
+    /// Category of experience.
     pub experience_type: ExperienceType,
+    /// Contextual description of what was happening (max 500 chars).
     pub context: String,
+    /// What resulted from the experience (max 1000 chars).
     pub outcome: String,
+    /// Confidence score in `[0.0, 1.0]`.
     pub confidence: f64,
+    /// When the experience occurred.
     pub timestamp: DateTime<Utc>,
+    /// Arbitrary key-value metadata.
     #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Categorical tags for filtering and similarity matching.
     #[serde(default)]
     pub tags: Vec<String>,
 }
 
 impl Experience {
     /// Create a new experience with validation.
+    ///
+    /// Generates a content-addressed `experience_id` from the context, outcome,
+    /// and current timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::MemoryError::InvalidExperience`] if `context` is empty or
+    /// exceeds 500 chars, `outcome` is empty or exceeds 1000 chars, or
+    /// `confidence` is outside `[0.0, 1.0]`.
     pub fn new(
         experience_type: ExperienceType,
         context: String,
@@ -74,6 +119,12 @@ impl Experience {
     }
 
     /// Create a new experience with an explicit timestamp.
+    ///
+    /// Same validation rules as [`new`](Self::new).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::MemoryError::InvalidExperience`] on validation failure.
     pub fn with_timestamp(
         experience_type: ExperienceType,
         context: String,
@@ -121,9 +172,14 @@ impl Experience {
         })
     }
 
-    /// Create from a full set of fields (e.g. from database row).
+    /// Create from a full set of fields (e.g. from a database row).
     ///
-    /// Applies the same validation as [`with_timestamp`](Self::with_timestamp).
+    /// Applies the same validation as [`with_timestamp`](Self::with_timestamp)
+    /// but accepts a caller-supplied `experience_id` instead of generating one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::MemoryError::InvalidExperience`] on validation failure.
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         experience_id: String,
@@ -173,7 +229,7 @@ impl Experience {
         })
     }
 
-    /// Convert to a serializable map.
+    /// Serialize this experience into a flat key-value map suitable for JSON.
     pub fn to_map(&self) -> HashMap<String, serde_json::Value> {
         let mut map = HashMap::new();
         map.insert(
@@ -208,7 +264,12 @@ impl Experience {
         map
     }
 
-    /// Create from a map (deserialization).
+    /// Deserialize from a key-value map (e.g. JSON round-trip).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::MemoryError::InvalidExperience`] if required fields are
+    /// missing, unparseable, or fail validation.
     pub fn from_map(data: &HashMap<String, serde_json::Value>) -> crate::Result<Self> {
         let experience_id = data
             .get("experience_id")

@@ -8,6 +8,35 @@
 //! - SQLite backend with FTS5 full-text search
 //! - Graph abstraction with in-memory and federated store implementations
 //! - Pattern recognition from discoveries
+//!
+//! # Quick start
+//!
+//! ```no_run
+//! use amplihack_memory::{Experience, ExperienceType, ExperienceStore};
+//! use std::path::Path;
+//!
+//! // Create a store backed by SQLite
+//! let mut store = ExperienceStore::new(
+//!     "my-agent",
+//!     true,         // auto-compress old experiences
+//!     Some(30),     // retain at most 30 days
+//!     Some(1000),   // retain at most 1000 experiences
+//!     100,          // 100 MB quota
+//!     Some(Path::new("/tmp/agent-memory")),
+//! ).expect("failed to open store");
+//!
+//! // Record a new experience
+//! let exp = Experience::new(
+//!     ExperienceType::Success,
+//!     "compiled the project".into(),
+//!     "zero warnings produced".into(),
+//!     0.95,
+//! ).unwrap();
+//! store.add(&exp).unwrap();
+//!
+//! // Search later
+//! let results = store.search("compile", None, 0.0, 10).unwrap();
+//! ```
 
 #[cfg(all(feature = "python", feature = "kuzu"))]
 compile_error!(

@@ -198,7 +198,7 @@ fn parity_test_all() {
             &mut results,
             "contradiction_detected",
             json!({
-                "has_contradiction": r1.as_ref().map_or(false, |c| c.contradiction),
+                "has_contradiction": r1.as_ref().is_some_and(|c| c.contradiction),
                 "conflicting_values": r1.as_ref().map_or(String::new(), |c| c.conflicting_values.clone()),
             }),
             true,
@@ -214,7 +214,7 @@ fn parity_test_all() {
             &mut results,
             "contradiction_same_numbers",
             json!({
-                "has_contradiction": r2.as_ref().map_or(false, |c| c.contradiction),
+                "has_contradiction": r2.as_ref().is_some_and(|c| c.contradiction),
             }),
             true,
         );
@@ -224,7 +224,7 @@ fn parity_test_all() {
             &mut results,
             "contradiction_different_concepts",
             json!({
-                "has_contradiction": r3.as_ref().map_or(false, |c| c.contradiction),
+                "has_contradiction": r3.as_ref().is_some_and(|c| c.contradiction),
             }),
             true,
         );
@@ -239,7 +239,7 @@ fn parity_test_all() {
             &mut results,
             "contradiction_no_numbers",
             json!({
-                "has_contradiction": r4.as_ref().map_or(false, |c| c.contradiction),
+                "has_contradiction": r4.as_ref().is_some_and(|c| c.contradiction),
             }),
             true,
         );
@@ -351,7 +351,7 @@ fn parity_test_all() {
         );
 
         let wm_id = cm
-            .push_working("goal", "Complete the deployment pipeline", "task-001", 0.95)
+            .store_working("goal", "Complete the deployment pipeline", "task-001", 0.95)
             .unwrap();
         record(
             &mut results,
@@ -363,7 +363,7 @@ fn parity_test_all() {
             true,
         );
 
-        let wm_slots = cm.recall_working("task-001");
+        let wm_slots = cm.get_working("task-001");
         record(
             &mut results,
             "cognitive_get_working",
