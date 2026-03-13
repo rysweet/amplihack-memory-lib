@@ -214,9 +214,6 @@ impl CredentialScrubber {
         for (name, pattern) in &self.patterns {
             if pattern.is_match(&scrubbed) {
                 let replacement = match *name {
-                    "password" | "token" | "api_key" | "secret" | "aws_secret" | "azure_key" => {
-                        format!("${{1}}{REDACTION_TEXT}")
-                    }
                     "db_url" => {
                         format!("${{1}}{REDACTION_TEXT}${{3}}")
                     }
