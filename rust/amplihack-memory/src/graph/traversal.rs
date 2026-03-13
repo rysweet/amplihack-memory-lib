@@ -93,3 +93,162 @@ where
         crossed_boundaries: origins.len() > 1,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_node(id: &str, origin: &str) -> GraphNode {
+        GraphNode {
+            node_id: id.into(),
+            node_type: "Test".into(),
+            properties: HashMap::new(),
+            graph_origin: origin.into(),
+        }
+    }
+
+    fn make_node_with_props(id: &str, origin: &str, props: HashMap<String, String>) -> GraphNode {
+        GraphNode {
+            node_id: id.into(),
+            node_type: "Test".into(),
+            properties: props,
+            graph_origin: origin.into(),
+        }
+    }
+
+    fn make_edge(src: &str, tgt: &str, etype: &str) -> GraphEdge {
+        GraphEdge {
+            edge_id: format!("{src}->{tgt}"),
+            source_id: src.into(),
+            target_id: tgt.into(),
+            edge_type: etype.into(),
+            properties: HashMap::new(),
+            graph_origin: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_bfs_empty_graph_no_neighbors() {
+        let start = make_node("a", "local");
+        let result = bfs_traverse(start, None, 3, None, 100, |_id, _et, _depth| vec![]);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.edges.len(), 0);
+    }
+
+    #[test]
+    fn test_bfs_single_node_zero_hops() {
+        let start = make_node("a", "local");
+        let result = bfs_traverse(start, None, 0, None, 100, |_id, _et, _depth| {
+            vec![(make_edge("a", "b", "LINK"), make_node("b", "local"))]
+        });
+        assert_eq!(result.nodes.len(), 1);
+    }
+
+    #[test]
+    fn test_bfs_linear_chain() {
+        let start = make_node("a", "local");
+        let result = bfs_traverse(start, None, 3, None, 100, |id, _et, _depth| match id {
+            "a" => vec![(make_edge("a", "b", "LINK"), make_node("b", "local"))],
+            "b" => vec![(make_edge("b", "c", "LINK"), make_node("c", "local"))],
+            _ => vec![],
+        });
+        assert_eq!(result.nodes.len(), 3);
+        assert_eq!(result.edges.len(), 2);
+    }
+
+    #[test]
+    fn test_bfs_cyclic_graph() {
+        let start = make_node("a", "local");
+        let result = bfs_traverse(start, None, 10, None, 100, |id, _et, _depth| match id {
+            "a" => vec![(make_edge("a", "b", "LINK"), make_node("b", "local"))],
+            "b" => vec![(make_edge("b", "c", "LINK"), make_node("c", "local"))],
+            "c" => vec![(make_edge("c", "a", "LINK"), make_node("a", "local"))],
+            _ => vec![],
+        });
+        assert_eq!(result.nodes.len(), 3);
+    }
+
+    #[test]
+    fn test_bfs_node_filter() {
+        let start = make_node("a", "local");
+        let mut filter = HashMap::new();
+        filter.insert("role".into(), "keep".into());
+
+        let result = bfs_traverse(
+            start,
+            None,
+            3,
+            Some(&filter),
+            100,
+            |id, _et, _depth| match id {
+                "a" => {
+                    let mut p1 = HashMap::new();
+                    p1.insert("role".into(), "keep".into());
+                    let mut p2 = HashMap::new();
+                    p2.insert("role".into(), "skip".into());
+                    vec![
+                        (
+                            make_edge("a", "b", "LINK"),
+                            make_node_with_props("b", "local", p1),
+                        ),
+                        (
+                            make_edge("a", "c", "LINK"),
+                            make_node_with_props("c", "local", p2),
+                        ),
+                    ]
+                }
+                _ => vec![],
+            },
+        );
+        assert!(result.nodes.iter().any(|n| n.node_id == "b"));
+        assert!(!result.nodes.iter().any(|n| n.node_id == "c"));
+    }
+
+    #[test]
+    fn test_bfs_max_depth() {
+        let start = make_node("a", "local");
+        let result = bfs_traverse(start, None, 1, None, 100, |id, _et, _depth| match id {
+            "a" => vec![(make_edge("a", "b", "LINK"), make_node("b", "local"))],
+            "b" => vec![(make_edge("b", "c", "LINK"), make_node("c", "local"))],
+            _ => vec![],
+        });
+        let ids: Vec<&str> = result.nodes.iter().map(|n| n.node_id.as_str()).collect();
+        assert!(ids.contains(&"a"));
+        assert!(ids.contains(&"b"));
+        assert!(!ids.contains(&"c"));
+    }
+
+    #[test]
+    fn test_bfs_max_results_caps_paths() {
+        let start = make_node("a", "local");
+        let result = bfs_traverse(start, None, 3, None, 1, |id, _et, _depth| match id {
+            "a" => vec![
+                (make_edge("a", "b", "LINK"), make_node("b", "local")),
+                (make_edge("a", "c", "LINK"), make_node("c", "local")),
+            ],
+            _ => vec![],
+        });
+        assert_eq!(result.paths.len(), 1);
+    }
+
+    #[test]
+    fn test_bfs_crossed_boundaries() {
+        let start = make_node("a", "local");
+        let result = bfs_traverse(start, None, 2, None, 100, |id, _et, _depth| match id {
+            "a" => vec![(make_edge("a", "b", "LINK"), make_node("b", "remote"))],
+            _ => vec![],
+        });
+        assert!(result.crossed_boundaries);
+    }
+
+    #[test]
+    fn test_bfs_edge_type_filter() {
+        let start = make_node("a", "local");
+        let etypes = vec!["KNOWS".to_string()];
+        let result = bfs_traverse(start, Some(&etypes), 2, None, 100, |_id, et, _depth| {
+            assert_eq!(et, Some("KNOWS"));
+            vec![(make_edge("a", "b", "KNOWS"), make_node("b", "local"))]
+        });
+        assert!(result.nodes.len() >= 2);
+    }
+}

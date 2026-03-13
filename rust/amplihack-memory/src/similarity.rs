@@ -529,4 +529,37 @@ mod tests {
             "Only tag overlap should give ~0.2, got {sim}"
         );
     }
+
+    #[test]
+    fn test_word_similarity_unicode_reversed() {
+        let sim = compute_word_similarity("hello 世界 test", "世界 hello test");
+        assert!(
+            (sim - 1.0).abs() < 0.01,
+            "Same Unicode tokens in different order should give ~1.0, got {sim}"
+        );
+    }
+
+    #[test]
+    fn test_word_similarity_unicode_partial() {
+        let sim = compute_word_similarity("hello 世界", "世界 goodbye");
+        assert!(sim > 0.0, "Partial overlap should give > 0, got {sim}");
+        assert!(sim < 1.0, "Partial overlap should give < 1, got {sim}");
+    }
+
+    #[test]
+    fn test_word_similarity_emoji() {
+        let sim = compute_word_similarity("🦀 🐍 🔥", "🦀 🐍 🔥");
+        assert!(sim >= 0.0, "Emoji tokens should not panic, got {sim}");
+    }
+
+    #[test]
+    fn test_tag_similarity_unicode() {
+        let tags_a: Vec<String> = vec!["数据".into(), "rust".into(), "テスト".into()];
+        let tags_b: Vec<String> = vec!["rust".into(), "テスト".into(), "python".into()];
+        let sim = compute_tag_similarity(&tags_a, &tags_b);
+        assert!(
+            sim > 0.0 && sim < 1.0,
+            "Partial Unicode tag overlap should give 0 < sim < 1, got {sim}"
+        );
+    }
 }

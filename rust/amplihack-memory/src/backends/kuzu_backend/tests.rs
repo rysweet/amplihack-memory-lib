@@ -140,6 +140,14 @@ fn test_cleanup() {
     .unwrap();
     backend.store_experience(&exp).unwrap();
 
-    // Should not error
+    // Verify data exists before cleanup
+    let before = backend.retrieve_experiences(Some(10), None, 0.0).unwrap();
+    assert_eq!(before.len(), 1);
+
+    // Should not error (no-op cleanup)
     backend.cleanup(false, None, None).unwrap();
+
+    // Data survives no-op cleanup
+    let after = backend.retrieve_experiences(Some(10), None, 0.0).unwrap();
+    assert_eq!(after.len(), 1);
 }

@@ -40,3 +40,56 @@ pub enum MemoryError {
 
 /// Convenience type alias for `std::result::Result<T, MemoryError>`.
 pub type Result<T> = std::result::Result<T, MemoryError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_display_experience_not_found() {
+        let e = MemoryError::ExperienceNotFound("abc123".into());
+        assert_eq!(e.to_string(), "experience not found: abc123");
+    }
+
+    #[test]
+    fn test_display_invalid_experience() {
+        let e = MemoryError::InvalidExperience("bad data".into());
+        assert_eq!(e.to_string(), "invalid experience: bad data");
+    }
+
+    #[test]
+    fn test_display_memory_quota_exceeded() {
+        let e = MemoryError::MemoryQuotaExceeded("over limit".into());
+        assert_eq!(e.to_string(), "memory quota exceeded: over limit");
+    }
+
+    #[test]
+    fn test_display_security_violation() {
+        let e = MemoryError::SecurityViolation("unauthorized".into());
+        assert_eq!(e.to_string(), "security violation: unauthorized");
+    }
+
+    #[test]
+    fn test_display_query_cost_exceeded() {
+        let e = MemoryError::QueryCostExceeded("too expensive".into());
+        assert_eq!(e.to_string(), "query cost exceeded: too expensive");
+    }
+
+    #[test]
+    fn test_display_storage() {
+        let e = MemoryError::Storage("disk full".into());
+        assert_eq!(e.to_string(), "storage error: disk full");
+    }
+
+    #[test]
+    fn test_display_invalid_input() {
+        let e = MemoryError::InvalidInput("missing field".into());
+        assert_eq!(e.to_string(), "invalid input: missing field");
+    }
+
+    #[test]
+    fn test_display_internal() {
+        let e = MemoryError::Internal("something broke".into());
+        assert_eq!(e.to_string(), "something broke");
+    }
+}

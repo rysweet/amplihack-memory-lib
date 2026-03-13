@@ -529,4 +529,28 @@ mod tests {
         let stats = store.get_statistics().unwrap();
         assert_eq!(stats.total_experiences, 2);
     }
+
+    #[test]
+    fn test_store_quota_enforcement() {
+        let tmp = TempDir::new().unwrap();
+        let mut store =
+            ExperienceStore::new("quota-agent", false, None, None, 1, Some(tmp.path())).unwrap();
+
+        // First experience succeeds (db file is tiny)
+        let exp1 =
+            Experience::new(ExperienceType::Success, "ctx1".into(), "out1".into(), 0.8).unwrap();
+        store.add(&exp1).unwrap();
+
+        // Set quota to 0 so next add triggers MemoryQuotaExceeded
+        store.max_memory_mb = 0;
+
+        let exp2 =
+            Experience::new(ExperienceType::Success, "ctx2".into(), "out2".into(), 0.8).unwrap();
+        let result = store.add(&exp2);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MemoryError::MemoryQuotaExceeded(_) => {}
+            other => panic!("expected MemoryQuotaExceeded, got {other:?}"),
+        }
+    }
 }

@@ -3,7 +3,7 @@ use super::*;
 use crate::graph::types::Direction;
 
 fn make_cm() -> CognitiveMemory {
-    CognitiveMemory::new("test-agent").unwrap()
+    CognitiveMemory::new(&format!("test-agent-{}", uuid::Uuid::new_v4())).unwrap()
 }
 
 // -- construction -------------------------------------------------------
@@ -79,7 +79,7 @@ fn test_prune_expired_sensory() {
     // Use 0 TTL so it expires immediately
     cm.store_sensory("text", "ephemeral", 0).unwrap();
     // Give it a moment
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    std::thread::sleep(std::time::Duration::from_millis(1100));
 
     // This item has a long TTL and should survive
     cm.store_sensory("text", "persistent", 9999).unwrap();

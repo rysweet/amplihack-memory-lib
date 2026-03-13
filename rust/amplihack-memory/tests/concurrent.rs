@@ -448,3 +448,56 @@ fn test_concurrent_semantic_search_engine() {
         e.corpus_size()
     );
 }
+
+// ---------------------------------------------------------------------------
+// 9. Concurrent SqliteBackend access
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_concurrent_sqlite_backend() {
+    use amplihack_memory::{ExperienceBackend, SqliteBackend};
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("concurrent_test.db");
+    let backend = SqliteBackend::new(&db_path, "concurrent-agent", 100, true).unwrap();
+    let backend = Arc::new(Mutex::new(backend));
+
+    let threads = 4;
+    let ops = 25;
+    let barrier = Arc::new(Barrier::new(threads));
+    let handles: Vec<_> = (0..threads)
+        .map(|tid| {
+            let backend = Arc::clone(&backend);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for i in 0..ops {
+                    let exp = Experience::new(
+                        ExperienceType::Success,
+                        format!("thread {tid} context {i}"),
+                        format!("thread {tid} outcome {i}"),
+                        0.8,
+                    )
+                    .unwrap();
+                    let mut b = backend.lock().unwrap();
+                    b.add(&exp).unwrap();
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let b = backend.lock().unwrap();
+    let stats = b.get_statistics().unwrap();
+    assert_eq!(
+        stats.total_experiences as usize,
+        threads * ops,
+        "expected {} total experiences, got {}",
+        threads * ops,
+        stats.total_experiences
+    );
+}

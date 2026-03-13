@@ -581,4 +581,75 @@ mod tests {
             "Different inputs should produce different IDs"
         );
     }
+
+    #[test]
+    fn test_from_map_missing_context() {
+        let mut map = HashMap::new();
+        map.insert("experience_id".into(), serde_json::json!("id1"));
+        map.insert("experience_type".into(), serde_json::json!("success"));
+        map.insert("outcome".into(), serde_json::json!("out"));
+        map.insert("confidence".into(), serde_json::json!(0.5));
+        map.insert(
+            "timestamp".into(),
+            serde_json::json!(Utc::now().to_rfc3339()),
+        );
+        let result = Experience::from_map(&map);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("context"));
+    }
+
+    #[test]
+    fn test_from_map_wrong_confidence_type() {
+        let mut map = HashMap::new();
+        map.insert("experience_id".into(), serde_json::json!("id1"));
+        map.insert("experience_type".into(), serde_json::json!("success"));
+        map.insert("context".into(), serde_json::json!("ctx"));
+        map.insert("outcome".into(), serde_json::json!("out"));
+        map.insert("confidence".into(), serde_json::json!("not_a_number"));
+        map.insert(
+            "timestamp".into(),
+            serde_json::json!(Utc::now().to_rfc3339()),
+        );
+        let result = Experience::from_map(&map);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("confidence"));
+    }
+
+    #[test]
+    fn test_from_map_invalid_timestamp() {
+        let mut map = HashMap::new();
+        map.insert("experience_id".into(), serde_json::json!("id1"));
+        map.insert("experience_type".into(), serde_json::json!("success"));
+        map.insert("context".into(), serde_json::json!("ctx"));
+        map.insert("outcome".into(), serde_json::json!("out"));
+        map.insert("confidence".into(), serde_json::json!(0.5));
+        map.insert("timestamp".into(), serde_json::json!("not-a-timestamp"));
+        let result = Experience::from_map(&map);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timestamp"));
+    }
+
+    #[test]
+    fn test_from_map_unknown_experience_type() {
+        let mut map = HashMap::new();
+        map.insert("experience_id".into(), serde_json::json!("id1"));
+        map.insert("experience_type".into(), serde_json::json!("unknown_type"));
+        map.insert("context".into(), serde_json::json!("ctx"));
+        map.insert("outcome".into(), serde_json::json!("out"));
+        map.insert("confidence".into(), serde_json::json!(0.5));
+        map.insert(
+            "timestamp".into(),
+            serde_json::json!(Utc::now().to_rfc3339()),
+        );
+        let result = Experience::from_map(&map);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("experience_type"));
+    }
+
+    #[test]
+    fn test_from_map_empty_map() {
+        let map = HashMap::new();
+        let result = Experience::from_map(&map);
+        assert!(result.is_err());
+    }
 }
