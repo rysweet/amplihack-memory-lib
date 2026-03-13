@@ -93,4 +93,16 @@ mod tests {
         let result = extract_entity_name("Met O'Brien today", "");
         assert!(result.contains("o'brien") || result.contains("o\u{2019}brien"));
     }
+
+    #[test]
+    fn test_unicode_entity_extraction_cjk() {
+        let result = extract_entity_name("hello 日本語 world", "");
+        let _ = result;
+    }
+
+    #[test]
+    fn test_unicode_entity_extraction_emoji() {
+        let result = extract_entity_name("the 🎉🎊 Party was fun", "");
+        assert_eq!(result, "party");
+    }
 }

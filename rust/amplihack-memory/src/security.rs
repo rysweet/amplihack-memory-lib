@@ -131,13 +131,17 @@ static CREDENTIAL_PATTERNS: LazyLock<Vec<(&str, Regex)>> = LazyLock::new(|| {
             "github_token",
             Regex::new(r"gh[pousr]_[A-Za-z0-9]{36,}").unwrap(),
         ),
+        // Design choice: unlike Python which matches any 32-char hex string,
+        // the Rust regex requires a context label (azure, subscription, account)
+        // before the hex value. This avoids false positives on arbitrary hex
+        // strings like UUIDs, checksums, and commit hashes.
         (
             "azure_key",
             Regex::new(r#"(?i)((?:azure|subscription|account)[_\-\s]*(?:key|token|secret)["\s:=]*)([0-9a-fA-F]{32,})"#).unwrap(),
         ),
         (
             "password",
-            Regex::new(r#"(?i)(password["\'\s]*[=:]\s*"?)([^\s"\']{8,})"#).unwrap(),
+            Regex::new(r#"(?i)(password["\'\s]*[=:]\s*"?)([^\s"\']+)"#).unwrap(),
         ),
         (
             "token",
@@ -895,5 +899,50 @@ mod tests {
         assert!(QueryValidator::is_safe_query(
             "SELECT id, name FROM users WHERE active = 1 LIMIT 100"
         ));
+    }
+
+    #[test]
+    fn test_scrub_short_password() {
+        let scrubber = CredentialScrubber::new();
+        let (scrubbed, modified) = scrubber.scrub_text(r#"password="abc""#);
+        assert!(modified, "short password should be scrubbed");
+        assert!(
+            !scrubbed.contains("abc"),
+            "password value should be removed"
+        );
+        assert!(scrubbed.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_scrub_single_char_password() {
+        let scrubber = CredentialScrubber::new();
+        let (scrubbed, modified) = scrubber.scrub_text("password=x");
+        assert!(modified, "single-char password should be scrubbed");
+        assert!(!scrubbed.contains("=x"));
+    }
+
+    #[test]
+    fn test_redaction_full_replacement_no_prefix() {
+        let scrubber = CredentialScrubber::new();
+        let (scrubbed, _) = scrubber.scrub_text("key is AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(
+            scrubbed, "key is [REDACTED]",
+            "AWS key should be fully replaced"
+        );
+        let (scrubbed, _) = scrubber.scrub_text("found sk-abcdefghijklmnopqrst12345");
+        assert_eq!(
+            scrubbed, "found [REDACTED]",
+            "OpenAI key should be fully replaced"
+        );
+    }
+
+    #[test]
+    fn test_redaction_password_full_replacement() {
+        let scrubber = CredentialScrubber::new();
+        let (scrubbed, _) = scrubber.scrub_text(r#"password="SuperSecret123!""#);
+        assert!(
+            scrubbed.starts_with("[REDACTED]"),
+            "should be fully redacted: {scrubbed}"
+        );
     }
 }
