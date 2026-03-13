@@ -22,6 +22,21 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/amplihack-memory/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/amplihack-memory/Cargo.lock', 'rust/amplihack-memory/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Check formatting
         working-directory: rust/amplihack-memory
         run: cargo fmt --check
@@ -46,9 +61,55 @@ jobs:
         working-directory: rust/amplihack-memory
         run: cargo test --features ladybug
 
+      # kuzu feature requires pyo3 (needs Python) and may need a running Kuzu DB
+      # instance for integration tests — allow failure until CI has Kuzu provisioned.
+      - name: Run tests (kuzu feature)
+        working-directory: rust/amplihack-memory
+        continue-on-error: true
+        run: cargo test --features kuzu
+
+      - name: Run tests (python feature)
+        working-directory: rust/amplihack-memory
+        run: cargo test --features python
+
       - name: Build docs
         working-directory: rust/amplihack-memory
         run: cargo doc --no-deps
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Security audit
+        working-directory: rust/amplihack-memory
+        run: cargo audit
+
+  msrv:
+    name: MSRV (1.80) Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install cmake
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - uses: dtolnay/rust-toolchain@1.80
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/amplihack-memory/target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('rust/amplihack-memory/Cargo.lock', 'rust/amplihack-memory/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-msrv-
+
+      - name: Run tests (MSRV)
+        working-directory: rust/amplihack-memory
+        run: cargo test
 
   python-tests:
     name: Python Tests
