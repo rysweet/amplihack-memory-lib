@@ -24,7 +24,7 @@ impl ScopeLevel {
 /// Security capabilities governing what a memory-enabled agent can do.
 ///
 /// Capabilities are checked before every store/retrieve/query operation
-/// by `SecureMemoryBackend`.
+/// by [`crate::security::SecureMemoryBackend`].
 pub struct AgentCapabilities {
     /// The maximum scope this agent is allowed to access.
     pub scope: ScopeLevel,

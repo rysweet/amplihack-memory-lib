@@ -11,6 +11,7 @@ use crate::memory_types::{
 
 use super::helpers::hashmap_to_pydict;
 
+/// Convert a [`SensoryItem`] to a Python dictionary.
 pub(crate) fn sensory_to_dict(py: Python<'_>, s: &SensoryItem) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
     d.set_item("node_id", &s.node_id)?;
@@ -22,6 +23,7 @@ pub(crate) fn sensory_to_dict(py: Python<'_>, s: &SensoryItem) -> PyResult<PyObj
     Ok(d.to_object(py))
 }
 
+/// Convert a [`WorkingMemorySlot`] to a Python dictionary.
 pub(crate) fn working_to_dict(py: Python<'_>, w: &WorkingMemorySlot) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
     d.set_item("node_id", &w.node_id)?;
@@ -33,6 +35,7 @@ pub(crate) fn working_to_dict(py: Python<'_>, w: &WorkingMemorySlot) -> PyResult
     Ok(d.to_object(py))
 }
 
+/// Convert an [`EpisodicMemory`] to a Python dictionary.
 pub(crate) fn episode_to_dict(py: Python<'_>, e: &EpisodicMemory) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
     d.set_item("node_id", &e.node_id)?;
@@ -45,6 +48,7 @@ pub(crate) fn episode_to_dict(py: Python<'_>, e: &EpisodicMemory) -> PyResult<Py
     Ok(d.to_object(py))
 }
 
+/// Convert a [`SemanticFact`] to a Python dictionary.
 pub(crate) fn fact_to_dict(py: Python<'_>, f: &SemanticFact) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
     d.set_item("node_id", &f.node_id)?;
@@ -58,6 +62,7 @@ pub(crate) fn fact_to_dict(py: Python<'_>, f: &SemanticFact) -> PyResult<PyObjec
     Ok(d.to_object(py))
 }
 
+/// Convert a [`ProceduralMemory`] to a Python dictionary.
 pub(crate) fn procedure_to_dict(py: Python<'_>, p: &ProceduralMemory) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
     d.set_item("node_id", &p.node_id)?;
@@ -69,6 +74,7 @@ pub(crate) fn procedure_to_dict(py: Python<'_>, p: &ProceduralMemory) -> PyResul
     Ok(d.to_object(py))
 }
 
+/// Convert a [`ProspectiveMemory`] to a Python dictionary.
 pub(crate) fn prospective_to_dict(py: Python<'_>, p: &ProspectiveMemory) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
     d.set_item("node_id", &p.node_id)?;
@@ -81,6 +87,7 @@ pub(crate) fn prospective_to_dict(py: Python<'_>, p: &ProspectiveMemory) -> PyRe
     Ok(d.to_object(py))
 }
 
+/// Convert a [`KnowledgeNode`] to a Python dictionary.
 pub(crate) fn knowledge_node_to_dict(py: Python<'_>, n: &KnowledgeNode) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
     d.set_item("node_id", &n.node_id)?;
@@ -95,6 +102,7 @@ pub(crate) fn knowledge_node_to_dict(py: Python<'_>, n: &KnowledgeNode) -> PyRes
     Ok(d.to_object(py))
 }
 
+/// Convert a [`KnowledgeEdge`] to a Python dictionary.
 pub(crate) fn knowledge_edge_to_dict(py: Python<'_>, e: &KnowledgeEdge) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
     d.set_item("source_id", &e.source_id)?;

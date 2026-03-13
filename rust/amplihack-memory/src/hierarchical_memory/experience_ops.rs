@@ -20,7 +20,7 @@ impl HierarchicalMemory {
     /// Store a knowledge node in the graph.
     ///
     /// Auto-classifies if `category` is `None`. Computes similarity against
-    /// existing nodes and creates `SIMILAR_TO` edges for scores > `DEFAULT_SIMILARITY_THRESHOLD`.
+    /// existing nodes and creates `SIMILAR_TO` edges for scores above the default similarity threshold.
     /// Detects contradictions and creates `SUPERSEDES` edges when found.
     ///
     /// Returns the `node_id` of the stored knowledge node.
