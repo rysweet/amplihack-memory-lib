@@ -28,6 +28,11 @@ impl HiveGraphStore {
         domain: &str,
         trust: f64,
     ) -> crate::Result<GraphNode> {
+        if !(0.0..=1.0).contains(&trust) {
+            return Err(crate::MemoryError::InvalidInput(
+                "trust must be between 0.0 and 1.0".into(),
+            ));
+        }
         let mut props = HashMap::new();
         props.insert("domain".into(), domain.to_string());
         props.insert("trust".into(), trust.to_string());
@@ -54,6 +59,11 @@ impl HiveGraphStore {
 
     /// Update the trust score for a registered agent.
     pub fn update_trust(&mut self, agent_id: &str, new_trust: f64) -> crate::Result<()> {
+        if !(0.0..=1.0).contains(&new_trust) {
+            return Err(crate::MemoryError::InvalidInput(
+                "trust must be between 0.0 and 1.0".into(),
+            ));
+        }
         if self.inner.get_node(agent_id).is_none() {
             return Err(crate::MemoryError::Internal(format!(
                 "Agent not registered in hive: {agent_id}"

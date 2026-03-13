@@ -124,7 +124,7 @@ static CREDENTIAL_PATTERNS: LazyLock<Vec<(&str, Regex)>> = LazyLock::new(|| {
         ("aws_key", Regex::new(r"AKIA[0-9A-Z]{16}").unwrap()),
         (
             "aws_secret",
-            Regex::new(r#"aws_secret_access_key["\'\s:=]+([A-Za-z0-9/+=]{40})"#).unwrap(),
+            Regex::new(r#"(aws_secret_access_key["\'\s:=]+)([A-Za-z0-9/+=]{40})"#).unwrap(),
         ),
         ("openai_key", Regex::new(r"sk-[A-Za-z0-9]{20,}").unwrap()),
         (
@@ -133,23 +133,23 @@ static CREDENTIAL_PATTERNS: LazyLock<Vec<(&str, Regex)>> = LazyLock::new(|| {
         ),
         (
             "azure_key",
-            Regex::new(r#"(?i)(?:azure|subscription|account)[_\-\s]*(?:key|token|secret)["\s:=]*([0-9a-fA-F]{32,})"#).unwrap(),
+            Regex::new(r#"(?i)((?:azure|subscription|account)[_\-\s]*(?:key|token|secret)["\s:=]*)([0-9a-fA-F]{32,})"#).unwrap(),
         ),
         (
             "password",
-            Regex::new(r#"(?i)password["\'\s:=]+([^\s"\']+)"#).unwrap(),
+            Regex::new(r#"(?i)(password["\'\s]*[=:]\s*"?)([^\s"\']{8,})"#).unwrap(),
         ),
         (
             "token",
-            Regex::new(r#"(?i)token["\'\s:=]+([A-Za-z0-9\-._~+/]+=*)"#).unwrap(),
+            Regex::new(r#"(?i)(token["\'\s]*[=:]\s*"?)([A-Za-z0-9\-._~+/]{8,}=*)"#).unwrap(),
         ),
         (
             "api_key",
-            Regex::new(r#"(?i)api[_\-]?key["\'\s:=]+([A-Za-z0-9\-._~+/]+=*)"#).unwrap(),
+            Regex::new(r#"(?i)(api[_\-]?key["\'\s]*[=:]\s*"?)([A-Za-z0-9\-._~+/]{8,}=*)"#).unwrap(),
         ),
         (
             "secret",
-            Regex::new(r#"(?i)secret["\'\s:=]+([A-Za-z0-9\-._~+/]+=*)"#).unwrap(),
+            Regex::new(r#"(?i)(secret["\'\s]*[=:]\s*"?)([A-Za-z0-9\-._~+/]{8,}=*)"#).unwrap(),
         ),
         (
             "ssh_key",
@@ -157,7 +157,7 @@ static CREDENTIAL_PATTERNS: LazyLock<Vec<(&str, Regex)>> = LazyLock::new(|| {
         ),
         (
             "db_url",
-            Regex::new(r"(?:postgres|mysql|mongodb)://[^:]+:([^@]+)@").unwrap(),
+            Regex::new(r"((?:postgres|mysql|mongodb)://[^:]+:)([^@]+)(@)").unwrap(),
         ),
     ]
 });
@@ -211,9 +211,20 @@ impl CredentialScrubber {
         let mut scrubbed = text.to_string();
         let mut modified = false;
 
-        for (_, pattern) in &self.patterns {
+        for (name, pattern) in &self.patterns {
             if pattern.is_match(&scrubbed) {
-                scrubbed = pattern.replace_all(&scrubbed, REDACTION_TEXT).to_string();
+                let replacement = match *name {
+                    "password" | "token" | "api_key" | "secret" | "aws_secret" | "azure_key" => {
+                        format!("${{1}}{REDACTION_TEXT}")
+                    }
+                    "db_url" => {
+                        format!("${{1}}{REDACTION_TEXT}${{3}}")
+                    }
+                    _ => REDACTION_TEXT.to_string(),
+                };
+                scrubbed = pattern
+                    .replace_all(&scrubbed, replacement.as_str())
+                    .to_string();
                 modified = true;
             }
         }
@@ -760,11 +771,11 @@ mod tests {
     #[test]
     fn test_scrub_multiple_credentials_in_one_text() {
         let scrubber = CredentialScrubber::new();
-        let text = r#"key=sk-abcdefghijklmnopqrst12345 and password="hunter2""#;
+        let text = r#"key=sk-abcdefghijklmnopqrst12345 and password="hunter2secret""#;
         let (scrubbed, modified) = scrubber.scrub_text(text);
         assert!(modified);
         assert!(!scrubbed.contains("sk-"));
-        assert!(!scrubbed.contains("hunter2"));
+        assert!(!scrubbed.contains("hunter2secret"));
     }
 
     #[test]

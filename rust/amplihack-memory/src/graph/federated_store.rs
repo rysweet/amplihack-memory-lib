@@ -38,7 +38,7 @@ fn content_hash(node: &GraphNode) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
     let hash = hasher.finalize();
-    hex::encode(&hash[..8])
+    crate::utils::hex_encode(&hash[..8])
 }
 
 fn deduplicate_nodes(nodes: Vec<GraphNode>) -> Vec<GraphNode> {
@@ -61,12 +61,6 @@ fn deduplicate_nodes(nodes: Vec<GraphNode>) -> Vec<GraphNode> {
         unique.push(node);
     }
     unique
-}
-
-mod hex {
-    pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
 }
 
 /// Composes a local agent graph + hive graph behind the GraphStore trait.
@@ -318,13 +312,6 @@ fn safe_search(
     limit: usize,
 ) -> Vec<GraphNode> {
     store.search_nodes(node_type, text_fields, query, None, limit)
-}
-
-#[allow(dead_code)]
-fn matches_filter(node: &GraphNode, node_filter: &HashMap<String, String>) -> bool {
-    node_filter
-        .iter()
-        .all(|(k, v)| node.properties.get(k) == Some(v))
 }
 
 #[cfg(test)]

@@ -137,7 +137,7 @@ impl Experience {
                 "context cannot be empty".into(),
             ));
         }
-        if context.len() > 500 {
+        if context.chars().count() > 500 {
             return Err(crate::MemoryError::InvalidExperience(
                 "context exceeds 500 characters".into(),
             ));
@@ -147,7 +147,7 @@ impl Experience {
                 "outcome cannot be empty".into(),
             ));
         }
-        if outcome.len() > 1000 {
+        if outcome.chars().count() > 1000 {
             return Err(crate::MemoryError::InvalidExperience(
                 "outcome exceeds 1000 characters".into(),
             ));
@@ -196,7 +196,7 @@ impl Experience {
                 "context cannot be empty".into(),
             ));
         }
-        if context.len() > 500 {
+        if context.chars().count() > 500 {
             return Err(crate::MemoryError::InvalidExperience(
                 "context exceeds 500 characters".into(),
             ));
@@ -206,7 +206,7 @@ impl Experience {
                 "outcome cannot be empty".into(),
             ));
         }
-        if outcome.len() > 1000 {
+        if outcome.chars().count() > 1000 {
             return Err(crate::MemoryError::InvalidExperience(
                 "outcome exceeds 1000 characters".into(),
             ));
@@ -360,15 +360,8 @@ fn generate_id(context: &str, outcome: &str, timestamp: &DateTime<Utc>) -> Strin
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     let hash = hasher.finalize();
-    let hash_str = &hex::encode(hash)[..6];
+    let hash_str = &crate::utils::hex_encode(hash)[..6];
     format!("exp_{date_str}_{time_str}_{hash_str}")
-}
-
-// We need the hex crate inline since we're not adding it as a dependency
-mod hex {
-    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
-    }
 }
 
 #[cfg(test)]

@@ -68,6 +68,7 @@ pub mod security;
 pub mod semantic_search;
 pub mod similarity;
 pub mod store;
+pub(crate) mod utils;
 
 // Re-exports for convenience
 pub use errors::{MemoryError, Result};

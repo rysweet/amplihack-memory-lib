@@ -123,7 +123,7 @@ pub(crate) fn node_to_prospective(props: &HashMap<String, String>) -> Prospectiv
         trigger_condition: prop_str(props, "trigger_condition"),
         action_on_trigger: prop_str(props, "action_on_trigger"),
         status: prop_str(props, "status"),
-        priority: prop_i64(props, "priority") as i32,
+        priority: prop_i64(props, "priority").clamp(i32::MIN as i64, i32::MAX as i64) as i32,
         created_at: prop_datetime(props, "created_at"),
     }
 }

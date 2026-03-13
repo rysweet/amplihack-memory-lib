@@ -4,6 +4,7 @@
 //! Manages dynamic schema (node and rel tables created on demand), parameterized
 //! Cypher queries, and BFS traversal.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -53,7 +54,7 @@ pub struct KuzuGraphStore {
     known_node_tables: HashSet<String>,
     node_table_columns: HashMap<String, HashSet<String>>,
     known_rel_tables: HashSet<(String, String, String)>,
-    id_table_cache: HashMap<String, String>,
+    id_table_cache: RefCell<HashMap<String, String>>,
 }
 
 impl KuzuGraphStore {
@@ -107,7 +108,7 @@ impl KuzuGraphStore {
             known_node_tables: HashSet::new(),
             node_table_columns: HashMap::new(),
             known_rel_tables: HashSet::new(),
-            id_table_cache: HashMap::new(),
+            id_table_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -419,6 +420,8 @@ impl KuzuGraphStore {
                 return Vec::new();
             }
 
+            // SAFETY: `limit` is `usize`, so it cannot contain Cypher injection.
+            // Kuzu does not support parameterized LIMIT, so interpolation is required.
             let cypher = if direction == "outgoing" {
                 format!(
                     "MATCH (a:{node_table})-[r:{rel_name}]->(b:{neighbor_table}) \
@@ -543,6 +546,7 @@ impl GraphStore for KuzuGraphStore {
         })?;
 
         self.id_table_cache
+            .borrow_mut()
             .insert(nid.clone(), node_type.to_string());
 
         Ok(GraphNode {
@@ -554,20 +558,23 @@ impl GraphStore for KuzuGraphStore {
     }
 
     fn get_node(&self, node_id: &str) -> Option<GraphNode> {
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
 
-        if let Some(cached_table) = self.id_table_cache.get(node_id) {
-            if let Some(node) = self.get_node_from_table(node_id, cached_table) {
+        if let Some(cached_table) = self.id_table_cache.borrow().get(node_id).cloned() {
+            if let Some(node) = self.get_node_from_table(node_id, &cached_table) {
                 return Some(node);
             }
         }
 
-        let cached = self.id_table_cache.get(node_id);
+        let cached = self.id_table_cache.borrow().get(node_id).cloned();
         for table in &self.known_node_tables {
-            if cached == Some(table) {
+            if cached.as_ref() == Some(table) {
                 continue;
             }
             if let Some(node) = self.get_node_from_table(node_id, table) {
+                self.id_table_cache
+                    .borrow_mut()
+                    .insert(node_id.to_string(), table.clone());
                 return Some(node);
             }
         }
@@ -585,7 +592,7 @@ impl GraphStore for KuzuGraphStore {
             return Vec::new();
         }
 
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
 
         Python::with_gil(|py| {
             let mut where_parts: Vec<String> = Vec::new();
@@ -609,6 +616,7 @@ impl GraphStore for KuzuGraphStore {
             } else {
                 format!(" WHERE {}", where_parts.join(" AND "))
             };
+            // `limit: usize` is type-safe; no injection risk from interpolation.
             let cypher = format!("MATCH (n:{node_type}){where_clause} RETURN n LIMIT {limit}");
 
             let result = match self.execute_cypher(py, &cypher, &params) {
@@ -636,7 +644,7 @@ impl GraphStore for KuzuGraphStore {
             }
         }
 
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
 
         Python::with_gil(|py| {
             let mut where_parts: Vec<String> = Vec::new();
@@ -671,6 +679,7 @@ impl GraphStore for KuzuGraphStore {
             } else {
                 format!(" WHERE {}", where_parts.join(" AND "))
             };
+            // `limit: usize` is type-safe; no injection risk from interpolation.
             let cypher = format!("MATCH (n:{node_type}){where_clause} RETURN n LIMIT {limit}");
 
             let result = match self.execute_cypher(py, &cypher, &params) {
@@ -689,8 +698,8 @@ impl GraphStore for KuzuGraphStore {
         }
 
         let table = {
-            let _guard = self.lock.lock().unwrap();
-            self.id_table_cache.get(node_id).cloned()
+            let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.id_table_cache.borrow().get(node_id).cloned()
         };
 
         let table = match table {
@@ -714,7 +723,7 @@ impl GraphStore for KuzuGraphStore {
             return true;
         }
 
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
 
         Python::with_gil(|py| {
             let mut set_parts: Vec<String> = Vec::new();
@@ -739,8 +748,8 @@ impl GraphStore for KuzuGraphStore {
 
     fn delete_node(&mut self, node_id: &str) -> bool {
         let table = {
-            let _guard = self.lock.lock().unwrap();
-            self.id_table_cache.get(node_id).cloned()
+            let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.id_table_cache.borrow().get(node_id).cloned()
         };
 
         let table = match table {
@@ -751,7 +760,7 @@ impl GraphStore for KuzuGraphStore {
             },
         };
 
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
 
         let result = Python::with_gil(|py| {
             let cypher = format!("MATCH (n:{table}) WHERE n.node_id = $nid DETACH DELETE n");
@@ -763,7 +772,7 @@ impl GraphStore for KuzuGraphStore {
         });
 
         if result {
-            self.id_table_cache.remove(node_id);
+            self.id_table_cache.borrow_mut().remove(node_id);
         }
         result
     }
@@ -801,7 +810,7 @@ impl GraphStore for KuzuGraphStore {
             Some(&col_types),
         )?;
 
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
 
         Python::with_gil(|py| {
             let mut set_parts = vec![
@@ -869,7 +878,7 @@ impl GraphStore for KuzuGraphStore {
             None => return Vec::new(),
         };
 
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
 
         let rel_tables = self.get_rel_tables_for(edge_type);
         let mut results = Vec::new();
@@ -920,7 +929,7 @@ impl GraphStore for KuzuGraphStore {
             None => return false,
         };
 
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
 
         let src_type = &src_node.node_type;
         let tgt_type = &tgt_node.node_type;
@@ -964,8 +973,8 @@ impl GraphStore for KuzuGraphStore {
     }
 
     fn close(&mut self) {
-        let _guard = self.lock.lock().unwrap();
-        self.id_table_cache.clear();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.id_table_cache.borrow_mut().clear();
         self.known_node_tables.clear();
         self.known_rel_tables.clear();
         self.node_table_columns.clear();
@@ -1006,17 +1015,16 @@ impl KuzuGraphStore {
 mod tests {
     use super::*;
 
-    fn make_store() -> KuzuGraphStore {
+    fn make_store() -> (KuzuGraphStore, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("test_kuzu_db");
         let store = KuzuGraphStore::new(&db_path, Some("test"), None).unwrap();
-        std::mem::forget(tmp);
-        store
+        (store, tmp)
     }
 
     #[test]
     fn test_add_and_get_node() {
-        let mut store = make_store();
+        let (mut store, _tmp) = make_store();
         let mut props = HashMap::new();
         props.insert("name".into(), "Alice".into());
         let node = store.add_node("Person", props, Some("p1")).unwrap();
@@ -1030,14 +1038,14 @@ mod tests {
 
     #[test]
     fn test_add_node_auto_id() {
-        let mut store = make_store();
+        let (mut store, _tmp) = make_store();
         let node = store.add_node("Agent", HashMap::new(), None).unwrap();
         assert!(!node.node_id.is_empty());
     }
 
     #[test]
     fn test_query_nodes() {
-        let mut store = make_store();
+        let (mut store, _tmp) = make_store();
         let mut props1 = HashMap::new();
         props1.insert("role".into(), "developer".into());
         store.add_node("Person", props1, Some("q1")).unwrap();
@@ -1058,7 +1066,7 @@ mod tests {
 
     #[test]
     fn test_search_nodes() {
-        let mut store = make_store();
+        let (mut store, _tmp) = make_store();
         let mut props = HashMap::new();
         props.insert("content".into(), "Rust programming language".into());
         store.add_node("Fact", props, Some("f1")).unwrap();
@@ -1078,7 +1086,7 @@ mod tests {
 
     #[test]
     fn test_update_node() {
-        let mut store = make_store();
+        let (mut store, _tmp) = make_store();
         let mut props = HashMap::new();
         props.insert("name".into(), "Bob".into());
         store.add_node("Person", props, Some("u1")).unwrap();
@@ -1093,7 +1101,7 @@ mod tests {
 
     #[test]
     fn test_delete_node() {
-        let mut store = make_store();
+        let (mut store, _tmp) = make_store();
         store
             .add_node("Person", HashMap::new(), Some("d1"))
             .unwrap();
@@ -1104,7 +1112,7 @@ mod tests {
 
     #[test]
     fn test_add_edge_and_neighbors() {
-        let mut store = make_store();
+        let (mut store, _tmp) = make_store();
         store.add_node("Person", HashMap::new(), Some("a")).unwrap();
         store.add_node("Person", HashMap::new(), Some("b")).unwrap();
         let edge = store.add_edge("a", "b", "KNOWS", None).unwrap();
@@ -1123,7 +1131,7 @@ mod tests {
 
     #[test]
     fn test_delete_edge() {
-        let mut store = make_store();
+        let (mut store, _tmp) = make_store();
         store
             .add_node("Person", HashMap::new(), Some("e1"))
             .unwrap();
@@ -1140,7 +1148,7 @@ mod tests {
 
     #[test]
     fn test_traverse() {
-        let mut store = make_store();
+        let (mut store, _tmp) = make_store();
         store.add_node("N", HashMap::new(), Some("a")).unwrap();
         store.add_node("N", HashMap::new(), Some("b")).unwrap();
         store.add_node("N", HashMap::new(), Some("c")).unwrap();
@@ -1154,7 +1162,7 @@ mod tests {
 
     #[test]
     fn test_edge_with_properties() {
-        let mut store = make_store();
+        let (mut store, _tmp) = make_store();
         store
             .add_node("Person", HashMap::new(), Some("ep1"))
             .unwrap();
@@ -1172,7 +1180,7 @@ mod tests {
 
     #[test]
     fn test_close() {
-        let mut store = make_store();
+        let (mut store, _tmp) = make_store();
         store
             .add_node("Person", HashMap::new(), Some("cl1"))
             .unwrap();
@@ -1181,14 +1189,14 @@ mod tests {
 
     #[test]
     fn test_invalid_identifier() {
-        let mut store = make_store();
+        let (mut store, _tmp) = make_store();
         let result = store.add_node("invalid-type", HashMap::new(), Some("x"));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_query_nonexistent_type() {
-        let store = make_store();
+        let (store, _tmp) = make_store();
         let results = store.query_nodes("NonExistent", None, 50);
         assert!(results.is_empty());
     }

@@ -26,7 +26,7 @@ pub(crate) fn new_id(prefix: &str) -> String {
 pub(crate) fn ts_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
+        .unwrap_or_default()
         .as_secs() as i64
 }
 
