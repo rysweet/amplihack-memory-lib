@@ -10,14 +10,17 @@ use crate::backends::base::StorageStatistics;
 use crate::experience::ExperienceType;
 use crate::memory_types::MemoryCategory;
 
+/// Convert a [`crate::MemoryError`] into a Python `RuntimeError`.
 pub(crate) fn mem_err(e: crate::MemoryError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+/// Parse a string into an [`ExperienceType`], raising `ValueError` on failure.
 pub(crate) fn parse_experience_type(s: &str) -> PyResult<ExperienceType> {
     s.parse::<ExperienceType>().map_err(PyValueError::new_err)
 }
 
+/// Convert a `serde_json::Value` to a Python object recursively.
 pub(crate) fn json_to_py(py: Python<'_>, val: &serde_json::Value) -> PyResult<PyObject> {
     match val {
         serde_json::Value::Null => Ok(py.None()),
@@ -47,6 +50,7 @@ pub(crate) fn json_to_py(py: Python<'_>, val: &serde_json::Value) -> PyResult<Py
     }
 }
 
+/// Convert a Python object to a `serde_json::Value` recursively.
 pub(crate) fn py_to_json(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<serde_json::Value> {
     if obj.is_none() {
         Ok(serde_json::Value::Null)
@@ -74,6 +78,7 @@ pub(crate) fn py_to_json(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<serde_json::V
     }
 }
 
+/// Convert an optional Python dict to a Rust `HashMap<String, serde_json::Value>`.
 pub(crate) fn pydict_to_hashmap(
     dict: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<HashMap<String, serde_json::Value>> {
@@ -90,6 +95,7 @@ pub(crate) fn pydict_to_hashmap(
     }
 }
 
+/// Convert a Rust `HashMap<String, serde_json::Value>` to a Python dict.
 pub(crate) fn hashmap_to_pydict(
     py: Python<'_>,
     map: &HashMap<String, serde_json::Value>,
@@ -101,6 +107,7 @@ pub(crate) fn hashmap_to_pydict(
     Ok(d.to_object(py))
 }
 
+/// Convert a [`StorageStatistics`] struct to a Python dictionary.
 pub(crate) fn storage_stats_to_dict(
     py: Python<'_>,
     stats: &StorageStatistics,
@@ -118,6 +125,7 @@ pub(crate) fn storage_stats_to_dict(
     Ok(d.to_object(py))
 }
 
+/// Parse a string into a [`MemoryCategory`], raising `ValueError` on failure.
 pub(crate) fn parse_category(s: &str) -> PyResult<MemoryCategory> {
     s.parse::<MemoryCategory>().map_err(PyValueError::new_err)
 }

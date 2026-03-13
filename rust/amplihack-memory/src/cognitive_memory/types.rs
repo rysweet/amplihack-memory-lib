@@ -46,16 +46,27 @@ pub(crate) fn agent_filter(agent_id: &str) -> HashMap<String, String> {
 // Node-type labels (matching the Python schema table names)
 // ---------------------------------------------------------------------------
 
+/// Node-type label for sensory memory nodes.
 pub(crate) const NT_SENSORY: &str = "SensoryMemory";
+/// Node-type label for working memory nodes.
 pub(crate) const NT_WORKING: &str = "WorkingMemory";
+/// Node-type label for episodic memory nodes.
 pub(crate) const NT_EPISODIC: &str = "EpisodicMemory";
+/// Node-type label for semantic memory nodes.
 pub(crate) const NT_SEMANTIC: &str = "SemanticMemory";
+/// Node-type label for procedural memory nodes.
 pub(crate) const NT_PROCEDURAL: &str = "ProceduralMemory";
+/// Node-type label for prospective memory nodes.
 pub(crate) const NT_PROSPECTIVE: &str = "ProspectiveMemory";
+/// Node-type label for consolidated episode nodes.
 pub(crate) const NT_CONSOLIDATED: &str = "ConsolidatedEpisode";
 
 // Edge-type labels
+/// Edge-type label for sensory-to-working attention transitions.
 pub(crate) const ET_ATTENDED_TO: &str = "ATTENDED_TO";
+/// Edge-type label for episode consolidation relationships.
 pub(crate) const ET_CONSOLIDATES: &str = "CONSOLIDATES";
+/// Edge-type label for similarity links between nodes.
 pub(crate) const ET_SIMILAR_TO: &str = "SIMILAR_TO";
+/// Edge-type label indicating one node derives from another.
 pub(crate) const ET_DERIVES_FROM: &str = "DERIVES_FROM";
