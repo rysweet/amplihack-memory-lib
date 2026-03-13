@@ -13,7 +13,7 @@ use super::base::{ExperienceBackend, MemoryBackend, StorageStatistics};
 use crate::errors::MemoryError;
 use crate::experience::{Experience, ExperienceType};
 
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 /// Kuzu graph database backend for memory storage.
 ///

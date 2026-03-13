@@ -25,6 +25,7 @@ use crate::entity_extraction::{extract_entity_name, MULTI_WORD_NAME_RE};
 use crate::graph::{Direction, GraphStore, InMemoryGraphStore};
 use crate::memory_types::MemoryCategory;
 use crate::similarity::compute_similarity;
+use tracing::warn;
 
 use helpers::{
     build_sim_map, graph_node_to_knowledge_node, make_id, now_iso, parse_edge_metadata,
@@ -881,10 +882,13 @@ impl HierarchicalMemory {
                     props.insert("metadata".to_string(), meta_json);
                 }
 
-                let _ = self
+                match self
                     .store
-                    .add_edge(node_id, &other.node_id, "SIMILAR_TO", Some(props));
-                self.similarity_edge_count += 1;
+                    .add_edge(node_id, &other.node_id, "SIMILAR_TO", Some(props))
+                {
+                    Ok(_) => self.similarity_edge_count += 1,
+                    Err(e) => warn!("detect_similarity: failed to add SIMILAR_TO edge: {e}"),
+                }
             }
         }
     }
@@ -972,10 +976,13 @@ impl HierarchicalMemory {
             let mut props = HashMap::new();
             props.insert("reason".to_string(), reason);
             props.insert("temporal_delta".to_string(), delta);
-            let _ = self
+            match self
                 .store
-                .add_edge(new_node_id, &old_id, "SUPERSEDES", Some(props));
-            self.supersedes_edge_count += 1;
+                .add_edge(new_node_id, &old_id, "SUPERSEDES", Some(props))
+            {
+                Ok(_) => self.supersedes_edge_count += 1,
+                Err(e) => warn!("detect_supersedes: failed to add SUPERSEDES edge: {e}"),
+            }
         }
     }
 

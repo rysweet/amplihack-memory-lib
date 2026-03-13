@@ -360,7 +360,7 @@ fn generate_id(context: &str, outcome: &str, timestamp: &DateTime<Utc>) -> Strin
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     let hash = hasher.finalize();
-    let hash_str = &crate::utils::hex_encode(hash)[..6];
+    let hash_str = &crate::utils::hex_encode(hash)[..16];
     format!("exp_{date_str}_{time_str}_{hash_str}")
 }
 
@@ -535,5 +535,57 @@ mod tests {
             vec![],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_experience_id_hash_length() {
+        let exp = Experience::new(
+            ExperienceType::Success,
+            "test context".into(),
+            "test outcome".into(),
+            0.9,
+        )
+        .unwrap();
+        // ID format: exp_YYYYMMDD_HHMMSS_<hash>
+        let parts: Vec<&str> = exp.experience_id.split('_').collect();
+        assert_eq!(
+            parts.len(),
+            4,
+            "ID should have 4 underscore-separated parts"
+        );
+        let hash_part = parts[3];
+        assert_eq!(
+            hash_part.len(),
+            16,
+            "Hash suffix should be 16 hex chars, got {}: {}",
+            hash_part.len(),
+            hash_part
+        );
+        assert!(
+            hash_part.chars().all(|c| c.is_ascii_hexdigit()),
+            "Hash suffix should be hex"
+        );
+    }
+
+    #[test]
+    fn test_experience_id_uniqueness() {
+        let exp1 = Experience::new(
+            ExperienceType::Success,
+            "context alpha".into(),
+            "outcome one".into(),
+            0.8,
+        )
+        .unwrap();
+        let exp2 = Experience::new(
+            ExperienceType::Success,
+            "context beta".into(),
+            "outcome two".into(),
+            0.8,
+        )
+        .unwrap();
+        assert_ne!(
+            exp1.experience_id, exp2.experience_id,
+            "Different inputs should produce different IDs"
+        );
     }
 }

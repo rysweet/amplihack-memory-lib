@@ -30,7 +30,7 @@ pub fn extract_entity_name(content: &str, concept: &str) -> String {
             .collect();
 
         if !matches.is_empty() {
-            let best = matches.iter().max_by_key(|m| m.len()).unwrap();
+            let best = matches.iter().max_by_key(|m| m.chars().count()).unwrap();
             return best.to_lowercase();
         }
 
@@ -40,7 +40,7 @@ pub fn extract_entity_name(content: &str, concept: &str) -> String {
             if i > 0 {
                 let first_char = word.chars().next();
                 if let Some(c) = first_char {
-                    if c.is_uppercase() && word.len() > 2 {
+                    if c.is_uppercase() && word.chars().count() > 2 {
                         let cleaned: String = word
                             .trim_matches(|c: char| ".,;:!?()[]{}\"'".contains(c))
                             .to_string();

@@ -13,7 +13,7 @@ use super::base::{ExperienceBackend, MemoryBackend, StorageStatistics};
 use crate::errors::MemoryError;
 use crate::experience::{Experience, ExperienceType};
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// LadybugDB graph database backend for memory storage.
 ///
@@ -49,14 +49,16 @@ impl LadybugBackend {
     /// Execute a parameterised Cypher query and return rows.
     fn exec(&self, cypher: &str, params: &[(&str, Property)]) -> crate::Result<Vec<Vec<Property>>> {
         self.graph.execute(cypher, params).map_err(|e| {
-            MemoryError::Storage(format!("Cypher execution failed: {e}\nQuery: {cypher}"))
+            debug!("Cypher execution failed — query: {cypher}");
+            MemoryError::Storage(format!("Cypher execution failed: {e}"))
         })
     }
 
     /// Execute a Cypher statement with no expected results.
     fn exec_mut(&self, cypher: &str) -> crate::Result<()> {
         self.graph.execute_cypher(cypher).map_err(|e| {
-            MemoryError::Storage(format!("Cypher execution failed: {e}\nQuery: {cypher}"))
+            debug!("Cypher execution failed — query: {cypher}");
+            MemoryError::Storage(format!("Cypher execution failed: {e}"))
         })
     }
 

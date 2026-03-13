@@ -183,6 +183,13 @@ impl CognitiveMemory {
                 }),
             ) {
                 warn!("consolidate_episodes: failed to add CONSOLIDATES edge: {e}");
+                // Rollback: revert compressed flags on all episodes in this batch
+                for (rollback_id, _, _) in &batch {
+                    let mut rollback = HashMap::new();
+                    rollback.insert("compressed".to_string(), "false".to_string());
+                    self.graph.update_node(rollback_id, rollback);
+                }
+                return None;
             }
         }
 

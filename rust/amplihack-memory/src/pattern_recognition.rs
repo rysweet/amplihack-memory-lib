@@ -223,8 +223,10 @@ pub fn recognize_patterns(
             .filter_map(|p| {
                 if let Some(start) = p.context.find("Pattern '") {
                     let start = start + "Pattern '".len();
-                    if let Some(end) = p.context[start..].find('\'') {
-                        return Some(p.context[start..start + end].to_string());
+                    if let Some(rest) = p.context.get(start..) {
+                        if let Some(end) = rest.find('\'') {
+                            return Some(p.context[start..start + end].to_string());
+                        }
                     }
                 }
                 if p.context.to_lowercase().contains("known_pattern") {
@@ -237,9 +239,11 @@ pub fn recognize_patterns(
         new_patterns.retain(|p| {
             if let Some(start) = p.context.find("Pattern '") {
                 let start = start + "Pattern '".len();
-                if let Some(end) = p.context[start..].find('\'') {
-                    let key = &p.context[start..start + end];
-                    return !known_keys.contains(key);
+                if let Some(rest) = p.context.get(start..) {
+                    if let Some(end) = rest.find('\'') {
+                        let key = &p.context[start..start + end];
+                        return !known_keys.contains(key);
+                    }
                 }
             }
             true
@@ -662,5 +666,41 @@ mod tests {
         assert_eq!(patterns.len(), 1);
         // The pattern's context/outcome are generated from first example, so it works
         assert!(patterns[0].context.contains("capped"));
+    }
+
+    #[test]
+    fn test_recognize_patterns_safe_slicing_out_of_bounds() {
+        let short_exp = Experience {
+            experience_id: "exp_test".into(),
+            experience_type: ExperienceType::Success,
+            context: "Pat".into(),
+            outcome: "ok".into(),
+            confidence: 0.8,
+            timestamp: chrono::Utc::now(),
+            metadata: HashMap::new(),
+            tags: vec![],
+        };
+
+        let discoveries = vec![make_discovery("alpha")];
+        // Should not panic even with short context strings
+        let _result = recognize_patterns(&discoveries, Some(&[short_exp]), 1);
+    }
+
+    #[test]
+    fn test_recognize_patterns_safe_slicing_utf8() {
+        let utf8_exp = Experience {
+            experience_id: "exp_test_utf8".into(),
+            experience_type: ExperienceType::Success,
+            context: "Pattern '日本語テスト' found".into(),
+            outcome: "ok".into(),
+            confidence: 0.8,
+            timestamp: chrono::Utc::now(),
+            metadata: HashMap::new(),
+            tags: vec![],
+        };
+
+        let discoveries = vec![make_discovery("alpha")];
+        // Should handle multi-byte chars without panicking
+        let _result = recognize_patterns(&discoveries, Some(&[utf8_exp]), 1);
     }
 }
