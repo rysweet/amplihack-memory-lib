@@ -186,7 +186,12 @@ mod tests {
         props.insert("confidence".into(), "0.95".into());
         props.insert("tags".into(), r#"["lang"]"#.into());
         props.insert("metadata".into(), r#"{"category":"procedural"}"#.into());
-        let gn = GraphNode { node_id: "n2".into(), node_type: "F".into(), properties: props, graph_origin: String::new() };
+        let gn = GraphNode {
+            node_id: "n2".into(),
+            node_type: "F".into(),
+            properties: props,
+            graph_origin: String::new(),
+        };
         let kn = graph_node_to_knowledge_node(&gn);
         assert!((kn.confidence - 0.95).abs() < 0.01);
         assert_eq!(kn.category, MemoryCategory::Procedural);
@@ -196,7 +201,14 @@ mod tests {
     fn test_parse_edge_metadata_valid() {
         let mut props = HashMap::new();
         props.insert("metadata".into(), r#"{"w":0.5}"#.into());
-        let edge = GraphEdge { edge_id: String::new(), source_id: "a".into(), target_id: "b".into(), edge_type: "L".into(), properties: props, graph_origin: String::new() };
+        let edge = GraphEdge {
+            edge_id: String::new(),
+            source_id: "a".into(),
+            target_id: "b".into(),
+            edge_type: "L".into(),
+            properties: props,
+            graph_origin: String::new(),
+        };
         let meta = parse_edge_metadata(&edge);
         assert!((meta.get("w").unwrap().as_f64().unwrap() - 0.5).abs() < 0.01);
     }
@@ -211,13 +223,23 @@ mod tests {
     fn test_parse_edge_metadata_invalid() {
         let mut props = HashMap::new();
         props.insert("metadata".into(), "not json".into());
-        let edge = GraphEdge { edge_id: String::new(), source_id: "a".into(), target_id: "b".into(), edge_type: "L".into(), properties: props, graph_origin: String::new() };
+        let edge = GraphEdge {
+            edge_id: String::new(),
+            source_id: "a".into(),
+            target_id: "b".into(),
+            edge_type: "L".into(),
+            properties: props,
+            graph_origin: String::new(),
+        };
         assert!(parse_edge_metadata(&edge).is_empty());
     }
 
     #[test]
     fn test_rank_and_truncate_basic() {
-        let nodes = vec![make_knode("a", "rust programming", 0.5), make_knode("b", "rust compiler", 0.9)];
+        let nodes = vec![
+            make_knode("a", "rust programming", 0.5),
+            make_knode("b", "rust compiler", 0.9),
+        ];
         let result = rank_and_truncate(nodes, &["rust".into()], 1);
         assert_eq!(result.len(), 1);
     }

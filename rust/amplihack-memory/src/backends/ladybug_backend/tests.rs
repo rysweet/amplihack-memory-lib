@@ -20,7 +20,9 @@ fn make_experience(
 
 #[test]
 fn test_create_backend() {
-    let (_backend, _tmp) = make_backend();
+    let (backend, _tmp) = make_backend();
+    let stats = MemoryBackend::get_statistics(&backend).unwrap();
+    assert_eq!(stats.total_experiences, 0);
 }
 
 #[test]

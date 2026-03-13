@@ -495,4 +495,44 @@ mod tests {
             "should return exactly limit results after dedup"
         );
     }
+
+    #[test]
+    fn test_federated_query_overlapping_node_ids() {
+        let mut local = InMemoryGraphStore::new(Some("local"));
+        let mut hive = InMemoryGraphStore::new(Some("hive"));
+
+        // Same node ID "shared" in both stores with different content
+        let mut local_props = HashMap::new();
+        local_props.insert("content".into(), "local shared data".into());
+        local.add_node("Fact", local_props, Some("shared")).unwrap();
+
+        let mut hive_props = HashMap::new();
+        hive_props.insert("content".into(), "hive shared data".into());
+        hive.add_node("Fact", hive_props, Some("shared")).unwrap();
+
+        // Unique nodes in each
+        let mut lp = HashMap::new();
+        lp.insert("content".into(), "local unique data".into());
+        local.add_node("Fact", lp, Some("local-only")).unwrap();
+
+        let mut hp = HashMap::new();
+        hp.insert("content".into(), "hive unique data".into());
+        hive.add_node("Fact", hp, Some("hive-only")).unwrap();
+
+        let fed = FederatedGraphStore::new(Box::new(local), Box::new(hive));
+        let result = fed.federated_query("data", "Fact", None, 10);
+
+        let ids: Vec<&str> = result
+            .results
+            .iter()
+            .map(|r| r.node.node_id.as_str())
+            .collect();
+        assert!(ids.contains(&"local-only"), "local-only node should appear");
+        assert!(ids.contains(&"hive-only"), "hive-only node should appear");
+        let shared_count = ids.iter().filter(|&&id| id == "shared").count();
+        assert!(
+            shared_count >= 1,
+            "at least one 'shared' node should appear"
+        );
+    }
 }

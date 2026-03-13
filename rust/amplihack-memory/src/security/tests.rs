@@ -655,3 +655,22 @@ fn test_is_safe_cypher_rejects_non_match() {
         "DETACH DELETE (e:Experience)"
     ));
 }
+
+#[test]
+fn test_scrub_experience_credential_in_tags() {
+    let scrubber = CredentialScrubber::new();
+    let mut exp = make_experience(ExperienceType::Success, "clean context", "clean outcome");
+    exp.tags = vec!["password=SuperSecret123".into(), "safe-tag".into()];
+    let (scrubbed, _) = scrubber.scrub_experience(&exp).unwrap();
+    assert!(scrubbed.tags.contains(&"safe-tag".to_string()));
+}
+
+#[test]
+fn test_scrub_experience_credential_in_metadata() {
+    let scrubber = CredentialScrubber::new();
+    let mut exp = make_experience(ExperienceType::Success, "clean context", "clean outcome");
+    exp.metadata
+        .insert("api_key".into(), serde_json::json!("abc123def456ghi789"));
+    let (scrubbed, _) = scrubber.scrub_experience(&exp).unwrap();
+    assert!(scrubbed.metadata.contains_key("api_key"));
+}
