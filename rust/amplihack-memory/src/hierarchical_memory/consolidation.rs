@@ -116,9 +116,9 @@ impl HierarchicalMemory {
                 sorted.sort_by(|a, b| b.1.cmp(&a.1));
                 sorted.truncate(limit);
 
-                let items: HashMap<String, usize> = sorted.into_iter().collect();
-                result.insert("items".into(), serde_json::json!(items));
-                result.insert("count".into(), serde_json::json!(items.len()));
+                let count = sorted.len();
+                result.insert("items".into(), serde_json::json!(sorted));
+                result.insert("count".into(), serde_json::json!(count));
             }
             "by_category" => {
                 let mut cat_counts: HashMap<String, usize> = HashMap::new();

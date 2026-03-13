@@ -11,6 +11,20 @@ use crate::store::ExperienceStore;
 use super::experience::PyExperience;
 use super::helpers::{mem_err, parse_experience_type, storage_stats_to_dict};
 
+fn validate_db_path(db_path: &str) -> PyResult<()> {
+    if db_path.contains("..") {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "db_path must not contain '..' path traversal",
+        ));
+    }
+    if std::path::Path::new(db_path).is_absolute() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "db_path must be a relative path, not absolute",
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // PyMemoryConnector
 // ---------------------------------------------------------------------------
@@ -31,6 +45,9 @@ impl PyMemoryConnector {
     #[new]
     #[pyo3(signature = (agent_name, db_path=None))]
     fn new(agent_name: &str, db_path: Option<&str>) -> PyResult<Self> {
+        if let Some(p) = db_path {
+            validate_db_path(p)?;
+        }
         let path = db_path.map(Path::new);
         let conn = MemoryConnector::new(agent_name, path, 100, false).map_err(mem_err)?;
         Ok(Self { inner: conn })
@@ -106,6 +123,9 @@ impl PyExperienceStore {
     #[new]
     #[pyo3(signature = (agent_name, db_path=None))]
     fn new(agent_name: &str, db_path: Option<&str>) -> PyResult<Self> {
+        if let Some(p) = db_path {
+            validate_db_path(p)?;
+        }
         let path = db_path.map(Path::new);
         let store =
             ExperienceStore::new(agent_name, false, None, None, 100, path).map_err(mem_err)?;

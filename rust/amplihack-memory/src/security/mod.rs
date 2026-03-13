@@ -70,8 +70,9 @@ impl<S: crate::backends::ExperienceBackend> SecureMemoryBackend<S> {
             }
         }
 
+        let sanitized = query.replace('\'', "''").replace('"', "\"\"");
         self.store
-            .search(query, experience_type, min_confidence, limit)
+            .search(&sanitized, experience_type, min_confidence, limit)
     }
 
     /// Validate custom SQL query.

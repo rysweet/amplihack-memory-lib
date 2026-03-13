@@ -4,6 +4,7 @@ use ladybug_graph_rs::Property;
 
 use super::LadybugBackend;
 use crate::experience::{Experience, ExperienceType};
+use crate::security::QueryValidator;
 
 /// Execute a text search against experiences in the Ladybug graph.
 ///
@@ -44,6 +45,12 @@ pub(crate) fn search_experiences(
          LIMIT {limit}",
         LadybugBackend::RETURN_COLS
     );
+
+    if !QueryValidator::is_safe_cypher(&cypher) {
+        return Err(crate::errors::MemoryError::SecurityViolation(
+            "constructed Cypher query failed safety check".into(),
+        ));
+    }
 
     let rows = backend.exec(&cypher, &params)?;
     rows.iter()

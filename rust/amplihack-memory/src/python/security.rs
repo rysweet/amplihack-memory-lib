@@ -13,6 +13,20 @@ use crate::security::{AgentCapabilities, ScopeLevel, SecureMemoryBackend};
 use super::experience::PyExperience;
 use super::helpers::{mem_err, parse_experience_type, storage_stats_to_dict};
 
+fn validate_db_path(db_path: &str) -> PyResult<()> {
+    if db_path.contains("..") {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "db_path must not contain '..' path traversal",
+        ));
+    }
+    if std::path::Path::new(db_path).is_absolute() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "db_path must be a relative path, not absolute",
+        ));
+    }
+    Ok(())
+}
+
 /// Parse a scope level string into a ScopeLevel enum.
 fn parse_scope(s: &str) -> PyResult<ScopeLevel> {
     match s {
@@ -67,6 +81,7 @@ impl PySecureMemoryBackend {
         memory_quota_mb: i32,
     ) -> PyResult<Self> {
         let scope_level = parse_scope(scope)?;
+        validate_db_path(db_path)?;
         let types: Vec<ExperienceType> = allowed_types
             .unwrap_or_default()
             .iter()
