@@ -76,6 +76,9 @@ impl FederatedGraphStore {
     }
 
     /// High-level federated query across local + hive stores.
+    ///
+    /// Over-fetches 2× from each backend to compensate for dedup losses,
+    /// then trims to the requested `limit`.
     pub fn federated_query(
         &self,
         query: &str,
@@ -87,9 +90,21 @@ impl FederatedGraphStore {
             .map(|tf| tf.to_vec())
             .unwrap_or_else(|| vec!["content".to_string()]);
 
-        let local_results =
-            safe_search(self.local.as_ref(), node_type, &search_fields, query, limit);
-        let hive_results = safe_search(self.hive.as_ref(), node_type, &search_fields, query, limit);
+        let overfetch = limit.saturating_mul(2).max(limit);
+        let local_results = safe_search(
+            self.local.as_ref(),
+            node_type,
+            &search_fields,
+            query,
+            overfetch,
+        );
+        let hive_results = safe_search(
+            self.hive.as_ref(),
+            node_type,
+            &search_fields,
+            query,
+            overfetch,
+        );
 
         let expert_nodes =
             self.hive
@@ -447,5 +462,35 @@ mod tests {
 
         let non_matching = fed.federated_query("golang", "Fact", None, 10);
         assert!(non_matching.results.is_empty());
+    }
+
+    #[test]
+    fn test_federated_query_returns_limit_after_dedup() {
+        let mut local = InMemoryGraphStore::new(Some("local"));
+        let mut hive = InMemoryGraphStore::new(Some("hive"));
+        for i in 0..5 {
+            let mut props = HashMap::new();
+            props.insert("content".into(), format!("fact {i}"));
+            local
+                .add_node("Fact", props.clone(), Some(&format!("l{i}")))
+                .unwrap();
+            if i < 3 {
+                hive.add_node("Fact", props, Some(&format!("h{i}")))
+                    .unwrap();
+            }
+        }
+        for i in 5..7 {
+            let mut props = HashMap::new();
+            props.insert("content".into(), format!("fact {i}"));
+            hive.add_node("Fact", props, Some(&format!("h{i}")))
+                .unwrap();
+        }
+        let fed = FederatedGraphStore::new(Box::new(local), Box::new(hive));
+        let result = fed.federated_query("fact", "Fact", None, 5);
+        assert_eq!(
+            result.results.len(),
+            5,
+            "should return exactly limit results after dedup"
+        );
     }
 }
