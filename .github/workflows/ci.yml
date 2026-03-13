@@ -83,6 +83,13 @@ jobs:
         working-directory: rust/amplihack-memory
         run: cargo audit
 
+      - name: Install cargo-deny
+        run: cargo install cargo-deny
+
+      - name: Supply chain check
+        working-directory: rust/amplihack-memory
+        run: cargo deny check
+
   msrv:
     name: MSRV (1.80) Verification
     runs-on: ubuntu-latest
