@@ -1,7 +1,6 @@
 """Memory connector factory for database lifecycle management."""
 
 from pathlib import Path
-from typing import List
 
 from .backends.base import MemoryBackend
 from .backends.kuzu_backend import KuzuBackend
@@ -110,7 +109,7 @@ class MemoryConnector:
         limit: int | None = None,
         experience_type: ExperienceType | None = None,
         min_confidence: float = 0.0,
-    ) -> List[Experience]:
+    ) -> list[Experience]:
         """Retrieve experiences for this agent.
 
         Args:
@@ -133,7 +132,7 @@ class MemoryConnector:
         experience_type: ExperienceType | None = None,
         min_confidence: float = 0.0,
         limit: int = 10,
-    ) -> List[Experience]:
+    ) -> list[Experience]:
         """Search experiences by text query.
 
         Args:

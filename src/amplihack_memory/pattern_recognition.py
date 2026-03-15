@@ -13,15 +13,17 @@ class PatternDetector:
     when threshold is reached.
     """
 
-    def __init__(self, threshold: int = 3, min_confidence: float = 0.5):
+    def __init__(self, threshold: int = 3, min_confidence: float = 0.5, max_examples: int = 5):
         """Initialize pattern detector.
 
         Args:
             threshold: Minimum occurrences to recognize pattern
             min_confidence: Minimum confidence for active patterns
+            max_examples: Maximum number of examples stored per pattern
         """
         self.threshold = threshold
         self.min_confidence = min_confidence
+        self.max_examples = max_examples
         self._patterns = {}  # pattern_key -> {count, examples, first_seen, confidence}
         self._validations = {}  # pattern_key -> {successes, failures}
 
@@ -45,8 +47,8 @@ class PatternDetector:
         pattern = self._patterns[key]
         pattern["count"] += 1
 
-        # Store up to 5 examples
-        if len(pattern["examples"]) < 5:
+        # Store up to max_examples examples
+        if len(pattern["examples"]) < self.max_examples:
             pattern["examples"].append(discovery)
 
         # Update confidence if threshold reached
@@ -116,7 +118,7 @@ class PatternDetector:
                 timestamp=data["first_seen"],
                 metadata={
                     "occurrences": data["count"],
-                    "examples": data["examples"][:5],
+                    "examples": data["examples"],
                     "first_seen": data["first_seen"].isoformat(),
                 },
             )

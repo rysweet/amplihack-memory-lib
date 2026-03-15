@@ -167,7 +167,20 @@ class ExperienceStore:
         if not db_path.exists():
             return
 
-        size_mb = db_path.stat().st_size / (1024 * 1024)
+        # Use recursive sum for directories (e.g. Kuzu stores a directory tree).
+        # For file-based backends (SQLite, Kuzu single-file), also include
+        # sidecar files with the same prefix (e.g. .wal files).
+        if db_path.is_dir():
+            total_bytes = sum(f.stat().st_size for f in db_path.rglob("*") if f.is_file())
+        else:
+            # Sum the main file and any sidecar files (WAL, journal, etc.)
+            total_bytes = sum(
+                p.stat().st_size
+                for p in db_path.parent.glob(f"{db_path.name}*")
+                if p.is_file()
+            )
+
+        size_mb = total_bytes / (1024 * 1024)
         if size_mb > self.max_memory_mb:
             raise MemoryQuotaExceededError(
                 f"Storage quota exceeded: {size_mb:.1f}MB > {self.max_memory_mb}MB"

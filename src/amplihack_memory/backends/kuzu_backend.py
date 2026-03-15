@@ -3,7 +3,6 @@
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List
 
 import kuzu
 
@@ -150,7 +149,7 @@ class KuzuBackend(MemoryBackend):
         limit: int | None = None,
         experience_type: ExperienceType | None = None,
         min_confidence: float = 0.0,
-    ) -> List[Experience]:
+    ) -> list[Experience]:
         """Retrieve experiences from Kuzu.
 
         Args:
@@ -208,7 +207,7 @@ class KuzuBackend(MemoryBackend):
         experience_type: ExperienceType | None = None,
         min_confidence: float = 0.0,
         limit: int = 10,
-    ) -> List[Experience]:
+    ) -> list[Experience]:
         """Search experiences using Kuzu's text search.
 
         Args:
@@ -308,12 +307,17 @@ class KuzuBackend(MemoryBackend):
             exp_type = ExperienceType(row[0])
             by_type[exp_type] = row[1]
 
-        # Storage size (approximate from database directory)
+        # Storage size: sum main file and sidecar files (WAL, etc.)
         storage_size_kb = 0
         if self.db_path.exists():
-            for file in self.db_path.rglob("*"):
-                if file.is_file():
-                    storage_size_kb += file.stat().st_size / 1024
+            if self.db_path.is_dir():
+                for file in self.db_path.rglob("*"):
+                    if file.is_file():
+                        storage_size_kb += file.stat().st_size / 1024
+            else:
+                for path in self.db_path.parent.glob(f"{self.db_path.name}*"):
+                    if path.is_file():
+                        storage_size_kb += path.stat().st_size / 1024
 
         # Compressed count
         result = self.conn.execute(
@@ -326,17 +330,11 @@ class KuzuBackend(MemoryBackend):
         )
         compressed = result.get_next()[0] if result.has_next() else 0
 
-        # Compression ratio
-        compression_ratio = 1.0
-        if compressed > 0:
-            compression_ratio = 3.0
-
         return {
             "total_experiences": total,
             "by_type": by_type,
             "storage_size_kb": storage_size_kb,
             "compressed_experiences": compressed,
-            "compression_ratio": compression_ratio,
         }
 
     def close(self):

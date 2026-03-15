@@ -5,7 +5,6 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List
 
 from ..exceptions import InvalidExperienceError
 from ..experience import Experience, ExperienceType
@@ -173,7 +172,7 @@ class SQLiteBackend(MemoryBackend):
         limit: int | None = None,
         experience_type: ExperienceType | None = None,
         min_confidence: float = 0.0,
-    ) -> List[Experience]:
+    ) -> list[Experience]:
         """Retrieve experiences from SQLite.
 
         Args:
@@ -226,7 +225,7 @@ class SQLiteBackend(MemoryBackend):
         experience_type: ExperienceType | None = None,
         min_confidence: float = 0.0,
         limit: int = 10,
-    ) -> List[Experience]:
+    ) -> list[Experience]:
         """Search experiences using FTS5.
 
         Args:
@@ -312,7 +311,8 @@ class SQLiteBackend(MemoryBackend):
             exp_type = ExperienceType(row["experience_type"])
             by_type[exp_type] = row["count"]
 
-        # Storage size
+        # Report the stable database size for statistics. Quota enforcement uses
+        # a separate path that includes transient sidecars like WAL files.
         storage_size_kb = self.db_path.stat().st_size / 1024 if self.db_path.exists() else 0
 
         # Compressed count
@@ -322,17 +322,11 @@ class SQLiteBackend(MemoryBackend):
         )
         compressed = cursor.fetchone()[0]
 
-        # Calculate compression ratio
-        compression_ratio = 1.0
-        if compressed > 0:
-            compression_ratio = 3.0
-
         return {
             "total_experiences": total,
             "by_type": by_type,
             "storage_size_kb": storage_size_kb,
             "compressed_experiences": compressed,
-            "compression_ratio": compression_ratio,
         }
 
     def close(self):
@@ -449,7 +443,12 @@ class SQLiteBackend(MemoryBackend):
             conn.execute("INSERT INTO experiences_fts(experiences_fts) VALUES('rebuild')")
             conn.commit()
 
-            # Now vacuum
+            # Now vacuum and truncate WAL sidecars so reported storage matches
+            # the post-cleanup on-disk footprint.
+            previous_isolation_level = conn.isolation_level
             conn.isolation_level = None
-            conn.execute("VACUUM")
-            conn.isolation_level = ""
+            try:
+                conn.execute("VACUUM")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                conn.isolation_level = previous_isolation_level

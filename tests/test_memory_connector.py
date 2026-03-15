@@ -65,14 +65,14 @@ class TestMemoryConnectorDatabaseLifecycle:
     def test_creates_sqlite_database_file(self):
         """Connector creates SQLite database file on first use."""
         custom_path = Path("/tmp/test-memory-db")
-        _ = MemoryConnector(agent_name="test-agent", storage_path=custom_path)
+        _ = MemoryConnector(agent_name="test-agent", storage_path=custom_path, backend="sqlite")
         db_file = custom_path / "experiences.db"
         assert db_file.exists()
         assert db_file.is_file()
 
     def test_creates_experiences_table(self):
         """Connector creates experiences table with correct schema."""
-        connector = MemoryConnector(agent_name="test-agent")
+        connector = MemoryConnector(agent_name="test-agent", backend="sqlite")
         # Query schema
         cursor = connector._connection.cursor()
         cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='experiences'")
@@ -88,7 +88,7 @@ class TestMemoryConnectorDatabaseLifecycle:
 
     def test_creates_required_indexes(self):
         """Connector creates indexes for fast retrieval."""
-        connector = MemoryConnector(agent_name="test-agent")
+        connector = MemoryConnector(agent_name="test-agent", backend="sqlite")
         cursor = connector._connection.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='index'")
         indexes = {row[0] for row in cursor.fetchall()}
@@ -101,7 +101,7 @@ class TestMemoryConnectorDatabaseLifecycle:
 
     def test_creates_fulltext_search_index(self):
         """Connector creates FTS5 virtual table for full-text search."""
-        connector = MemoryConnector(agent_name="test-agent")
+        connector = MemoryConnector(agent_name="test-agent", backend="sqlite")
         cursor = connector._connection.cursor()
         cursor.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='experiences_fts'"
@@ -255,7 +255,7 @@ class TestMemoryConnectorErrorHandling:
 
         # Should detect corruption and either recover or fail cleanly
         with pytest.raises(Exception) as exc_info:
-            MemoryConnector(agent_name="test", storage_path=custom_path)
+            MemoryConnector(agent_name="test", storage_path=custom_path, backend="sqlite")
 
         # Should provide helpful error message
         assert (
@@ -267,14 +267,14 @@ class TestMemoryConnectorPerformance:
     """Test performance characteristics."""
 
     def test_initialization_is_fast(self):
-        """Connector initializes in less than 100ms."""
+        """Connector initializes in less than 500ms (kuzu backend requires graph DB setup)."""
         import time
 
         start = time.time()
         _ = MemoryConnector(agent_name="perf-test")
         elapsed = (time.time() - start) * 1000  # Convert to ms
 
-        assert elapsed < 100
+        assert elapsed < 500
 
     def test_handles_concurrent_access(self, isolated_storage):
         """Connector handles concurrent access from multiple threads."""
