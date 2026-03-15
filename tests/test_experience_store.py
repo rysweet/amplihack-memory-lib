@@ -468,8 +468,8 @@ class TestExperienceStoreStatistics:
         stats = store.get_statistics()
         assert stats["storage_size_kb"] > 0
 
-    def test_returns_compression_ratio(self, isolated_storage):
-        """ExperienceStore returns compression ratio when compression enabled."""
+    def test_returns_compressed_experiences_count(self, isolated_storage):
+        """ExperienceStore tracks compressed experiences count."""
         store = ExperienceStore(
             agent_name="test-agent", auto_compress=True, storage_path=isolated_storage
         )
@@ -489,8 +489,11 @@ class TestExperienceStoreStatistics:
         store._cleanup()
 
         stats = store.get_statistics()
-        # Compression ratio should be > 1.0 (e.g., 3:1 = 3.0)
-        assert stats.get("compression_ratio", 1.0) > 1.0
+        # compression_ratio is no longer fabricated; verify compressed count tracked
+        assert "compressed_experiences" in stats
+        assert stats["compressed_experiences"] >= 0
+        # Fabricated compression_ratio field must not be present
+        assert "compression_ratio" not in stats
 
 
 class TestExperienceStoreCleanup:

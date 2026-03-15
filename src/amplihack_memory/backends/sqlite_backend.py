@@ -5,7 +5,6 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List
 
 from ..exceptions import InvalidExperienceError
 from ..experience import Experience, ExperienceType
@@ -173,7 +172,7 @@ class SQLiteBackend(MemoryBackend):
         limit: int | None = None,
         experience_type: ExperienceType | None = None,
         min_confidence: float = 0.0,
-    ) -> List[Experience]:
+    ) -> list[Experience]:
         """Retrieve experiences from SQLite.
 
         Args:
@@ -226,7 +225,7 @@ class SQLiteBackend(MemoryBackend):
         experience_type: ExperienceType | None = None,
         min_confidence: float = 0.0,
         limit: int = 10,
-    ) -> List[Experience]:
+    ) -> list[Experience]:
         """Search experiences using FTS5.
 
         Args:
@@ -312,8 +311,12 @@ class SQLiteBackend(MemoryBackend):
             exp_type = ExperienceType(row["experience_type"])
             by_type[exp_type] = row["count"]
 
-        # Storage size
-        storage_size_kb = self.db_path.stat().st_size / 1024 if self.db_path.exists() else 0
+        # Storage size: sum main file and sidecar files (WAL, journal, etc.)
+        storage_size_kb = 0
+        if self.db_path.exists():
+            for path in self.db_path.parent.glob(f"{self.db_path.name}*"):
+                if path.is_file():
+                    storage_size_kb += path.stat().st_size / 1024
 
         # Compressed count
         cursor = conn.execute(
@@ -322,17 +325,11 @@ class SQLiteBackend(MemoryBackend):
         )
         compressed = cursor.fetchone()[0]
 
-        # Calculate compression ratio
-        compression_ratio = 1.0
-        if compressed > 0:
-            compression_ratio = 3.0
-
         return {
             "total_experiences": total,
             "by_type": by_type,
             "storage_size_kb": storage_size_kb,
             "compressed_experiences": compressed,
-            "compression_ratio": compression_ratio,
         }
 
     def close(self):

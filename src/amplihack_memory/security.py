@@ -13,6 +13,11 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
+_DESTRUCTIVE_KW_RE = re.compile(
+    r"\b(?:DELETE|UPDATE|INSERT|DROP|TRUNCATE|ALTER|CREATE|REPLACE|GRANT|REVOKE)\b",
+    re.IGNORECASE,
+)
+
 from .exceptions import MemoryError
 from .experience import Experience, ExperienceType
 
@@ -159,7 +164,7 @@ class CredentialScrubber:
         "aws_secret": re.compile(r'aws_secret_access_key["\'\s:=]+([A-Za-z0-9/+=]{40})'),
         "openai_key": re.compile(r"sk-[A-Za-z0-9]{20,}"),  # OpenAI keys are variable length
         "github_token": re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"),
-        "azure_key": re.compile(r"[0-9a-f]{32}"),  # Generic 32-char hex
+        "azure_key": re.compile(r"AccountKey=[A-Za-z0-9+/]{86}=="),  # Azure Storage account key (Base64, 512-bit)
         "password": re.compile(r'password["\'\s:=]+([^\s"\']+)', re.IGNORECASE),
         "token": re.compile(r'token["\'\s:=]+([A-Za-z0-9\-._~+/]+=*)', re.IGNORECASE),
         "api_key": re.compile(r'api[_\-]?key["\'\s:=]+([A-Za-z0-9\-._~+/]+=*)', re.IGNORECASE),
@@ -320,23 +325,11 @@ class QueryValidator:
         if not sql_upper.startswith("SELECT"):
             return False
 
-        # Must not contain destructive keywords
-        destructive_keywords = [
-            "DELETE",
-            "UPDATE",
-            "INSERT",
-            "DROP",
-            "TRUNCATE",
-            "ALTER",
-            "CREATE",
-            "REPLACE",
-            "GRANT",
-            "REVOKE",
-        ]
-
-        for keyword in destructive_keywords:
-            if keyword in sql_upper:
-                return False
+        # Must not contain destructive keywords (word-boundary match to avoid
+        # false positives from column/table names like updated_at, created_at,
+        # insertions, etc.)
+        if _DESTRUCTIVE_KW_RE.search(sql):
+            return False
 
         return True
 
