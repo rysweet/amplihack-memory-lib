@@ -35,7 +35,7 @@ class ExperienceStore:
         max_experiences: int | None = None,
         max_memory_mb: int = 100,
         storage_path: Path | None = None,
-        backend: str = "kuzu",
+        backend: str = "sqlite",
     ):
         """Initialize experience store.
 
@@ -46,7 +46,7 @@ class ExperienceStore:
             max_experiences: Maximum number of experiences (None = no limit)
             max_memory_mb: Maximum storage size in MB
             storage_path: Storage directory (optional)
-            backend: Backend type ('kuzu' or 'sqlite', default: 'kuzu')
+            backend: Backend type ('kuzu' or 'sqlite', default: 'sqlite')
         """
         self.agent_name = agent_name
         self.auto_compress = auto_compress

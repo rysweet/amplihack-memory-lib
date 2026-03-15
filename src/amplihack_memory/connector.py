@@ -29,7 +29,7 @@ class MemoryConnector:
         storage_path: Path | None = None,
         max_memory_mb: int = 100,
         enable_compression: bool = True,
-        backend: str = "kuzu",
+        backend: str = "sqlite",
     ):
         """Initialize memory connector.
 
@@ -38,7 +38,7 @@ class MemoryConnector:
             storage_path: Storage directory (defaults to ~/.amplihack/memory/<agent>)
             max_memory_mb: Maximum storage size in MB
             enable_compression: Enable automatic compression
-            backend: Backend type ('kuzu' or 'sqlite', default: 'kuzu')
+            backend: Backend type ('kuzu' or 'sqlite', default: 'sqlite')
 
         Raises:
             ValueError: If agent_name is invalid or backend is unknown
