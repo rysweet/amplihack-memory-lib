@@ -311,12 +311,9 @@ class SQLiteBackend(MemoryBackend):
             exp_type = ExperienceType(row["experience_type"])
             by_type[exp_type] = row["count"]
 
-        # Storage size: sum main file and sidecar files (WAL, journal, etc.)
-        storage_size_kb = 0
-        if self.db_path.exists():
-            for path in self.db_path.parent.glob(f"{self.db_path.name}*"):
-                if path.is_file():
-                    storage_size_kb += path.stat().st_size / 1024
+        # Report the stable database size for statistics. Quota enforcement uses
+        # a separate path that includes transient sidecars like WAL files.
+        storage_size_kb = self.db_path.stat().st_size / 1024 if self.db_path.exists() else 0
 
         # Compressed count
         cursor = conn.execute(
@@ -446,7 +443,12 @@ class SQLiteBackend(MemoryBackend):
             conn.execute("INSERT INTO experiences_fts(experiences_fts) VALUES('rebuild')")
             conn.commit()
 
-            # Now vacuum
+            # Now vacuum and truncate WAL sidecars so reported storage matches
+            # the post-cleanup on-disk footprint.
+            previous_isolation_level = conn.isolation_level
             conn.isolation_level = None
-            conn.execute("VACUUM")
-            conn.isolation_level = ""
+            try:
+                conn.execute("VACUUM")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                conn.isolation_level = previous_isolation_level
