@@ -37,6 +37,35 @@ from .memory_types import (
 
 WORKING_MEMORY_CAPACITY = 20
 
+# Graph edge creation
+SIMILARITY_THRESHOLD = 0.6  # Min Jaccard score to create a SIMILAR_TO edge
+SIMILARITY_CANDIDATE_LIMIT = 50  # Max existing facts scanned per store_fact call
+
+# Search / traversal
+MAX_SEARCH_KEYWORDS = 6  # Keyword cap for keyword-search queries
+GRAPH_FETCH_MULTIPLIER = 5  # Vector-search oversampling factor
+
+# Tokenizer
+MIN_TOKEN_LENGTH = 3  # Drop tokens shorter than this
+_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "the", "and", "for", "that", "this", "with", "are", "was", "were",
+        "has", "have", "had", "not", "but", "from", "they", "its", "been",
+        "into", "than", "then", "them", "can", "will", "may", "our", "also",
+    }
+)
+_NEGATION_WORDS: frozenset[str] = frozenset(
+    {
+        "not", "no", "never", "isn't", "aren't", "wasn't",
+        "doesn't", "don't", "cannot", "can't",
+    }
+)
+
+# Prospective-memory status labels
+PROSPECTIVE_STATUS_PENDING = "pending"
+PROSPECTIVE_STATUS_TRIGGERED = "triggered"
+PROSPECTIVE_STATUS_RESOLVED = "resolved"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -51,6 +80,72 @@ def _new_id(prefix: str = "mem") -> str:
 def _ts_now() -> int:
     """Current Unix timestamp as integer."""
     return int(time.time())
+
+
+def _tokenize(text: str) -> set[str]:
+    """Tokenize *text* into a set of lowercase content words.
+
+    Strips punctuation, lowercases, removes stopwords, and drops tokens
+    shorter than ``MIN_TOKEN_LENGTH``.
+
+    Args:
+        text: Input string.
+
+    Returns:
+        Set of normalised tokens.
+    """
+    punctuation = ".,!?;:\"'()[]{}-_/"
+    words: set[str] = set()
+    for raw in text.lower().split():
+        token = raw.strip(punctuation)
+        if len(token) >= MIN_TOKEN_LENGTH and token not in _STOPWORDS:
+            words.add(token)
+    return words
+
+
+def _compute_similarity(tokens_a: set[str], tokens_b: set[str]) -> float:
+    """Compute Jaccard similarity between two token sets.
+
+    Args:
+        tokens_a: First token set.
+        tokens_b: Second token set.
+
+    Returns:
+        Float in ``[0.0, 1.0]``.
+    """
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = len(tokens_a & tokens_b)
+    union = len(tokens_a | tokens_b)
+    return intersection / union if union > 0 else 0.0
+
+
+def _detect_contradiction(content_a: str, content_b: str) -> bool:
+    """Detect a potential contradiction between two content strings.
+
+    Uses a negation-heuristic: the texts share meaningful word overlap
+    but one contains negation words that the other does not.
+
+    Args:
+        content_a: First content string.
+        content_b: Second content string.
+
+    Returns:
+        ``True`` if a likely contradiction is detected, ``False`` otherwise.
+    """
+    words_a = set(content_a.lower().split())
+    words_b = set(content_b.lower().split())
+
+    # Require at least 2 shared non-negation words
+    content_words_a = words_a - _NEGATION_WORDS
+    content_words_b = words_b - _NEGATION_WORDS
+    if len(content_words_a & content_words_b) < 2:
+        return False
+
+    # Contradiction if one side has negation words and the other does not
+    neg_a = bool(words_a & _NEGATION_WORDS)
+    neg_b = bool(words_b & _NEGATION_WORDS)
+    return neg_a != neg_b
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +326,9 @@ class CognitiveMemory:
         # Monotonic counters (loaded from DB at startup)
         self._sensory_order = self._load_max_order("SensoryMemory", "observation_order")
         self._temporal_index = self._load_max_order("EpisodicMemory", "temporal_index")
+
+        # Track whether we've already warned about vector search failure
+        self._vector_search_warned = False
 
     # ------------------------------------------------------------------
     # Schema
@@ -770,6 +868,203 @@ class CognitiveMemory:
     # SEMANTIC MEMORY
     # ==================================================================
 
+    # ------------------------------------------------------------------
+    # Graph edge helpers
+    # ------------------------------------------------------------------
+
+    def _create_similarity_edges(self, new_id: str) -> int:
+        """Create SIMILAR_TO edges between a new fact and sufficiently similar facts.
+
+        Scans up to ``SIMILARITY_CANDIDATE_LIMIT`` existing SemanticMemory
+        nodes for the same agent and creates a directed SIMILAR_TO edge for
+        any pair whose Jaccard similarity meets ``SIMILARITY_THRESHOLD``.
+
+        Args:
+            new_id: node_id of the newly created SemanticMemory node.
+
+        Returns:
+            Number of SIMILAR_TO edges created.
+        """
+        result = self._conn.execute(
+            """
+            MATCH (s:SemanticMemory)
+            WHERE s.node_id = $nid AND s.agent_id = $aid
+            RETURN s.concept, s.content
+            """,
+            {"nid": new_id, "aid": self.agent_name},
+        )
+        if not result.has_next():
+            return 0
+
+        row = result.get_next()
+        new_tokens = _tokenize(f"{row[0]} {row[1]}")
+        if not new_tokens:
+            return 0
+
+        candidates = self._conn.execute(
+            """
+            MATCH (s:SemanticMemory)
+            WHERE s.agent_id = $aid AND s.node_id <> $nid
+            RETURN s.node_id, s.concept, s.content
+            LIMIT $lim
+            """,
+            {"aid": self.agent_name, "nid": new_id, "lim": SIMILARITY_CANDIDATE_LIMIT},
+        )
+
+        edges_created = 0
+        while candidates.has_next():
+            crow = candidates.get_next()
+            cand_id, concept, content = crow[0], crow[1], crow[2]
+            cand_tokens = _tokenize(f"{concept} {content}")
+            score = _compute_similarity(new_tokens, cand_tokens)
+            if score >= SIMILARITY_THRESHOLD:
+                try:
+                    self._conn.execute(
+                        """
+                        MATCH (a:SemanticMemory), (b:SemanticMemory)
+                        WHERE a.node_id = $aid AND b.node_id = $bid
+                        CREATE (a)-[:SIMILAR_TO {similarity_score: $score}]->(b)
+                        """,
+                        {"aid": new_id, "bid": cand_id, "score": score},
+                    )
+                    edges_created += 1
+                except Exception as exc:
+                    logger.debug("SIMILAR_TO edge creation failed (best-effort): %s", exc)
+
+        return edges_created
+
+    def _create_derives_from_edge(self, semantic_id: str, episode_id: str) -> None:
+        """Create a DERIVES_FROM edge from a SemanticMemory to an EpisodicMemory.
+
+        Args:
+            semantic_id: node_id of the SemanticMemory (source).
+            episode_id: node_id of the EpisodicMemory (target).
+        """
+        try:
+            self._conn.execute(
+                """
+                MATCH (s:SemanticMemory), (e:EpisodicMemory)
+                WHERE s.node_id = $sid AND e.node_id = $eid
+                CREATE (s)-[:DERIVES_FROM {derived_at: $ts}]->(e)
+                """,
+                {"sid": semantic_id, "eid": episode_id, "ts": _ts_now()},
+            )
+        except Exception as exc:
+            logger.debug("DERIVES_FROM edge creation failed (best-effort): %s", exc)
+
+    # ------------------------------------------------------------------
+    # Graph traversal search helper
+    # ------------------------------------------------------------------
+
+    def _expand_with_graph(
+        self,
+        seeds: list[SemanticFact],
+        query: str,
+        limit: int,
+        min_confidence: float,
+    ) -> list[SemanticFact]:
+        """Expand seed facts by following 1-hop SIMILAR_TO edges and re-rank.
+
+        Algorithm:
+        1. Score each seed using its rank position and keyword overlap.
+        2. For each seed, query its 1-hop SIMILAR_TO neighbours.
+        3. Score neighbours by edge similarity * confidence + keyword overlap.
+        4. Merge, de-duplicate, sort by score, and return top ``limit`` facts.
+
+        Args:
+            seeds: Initial seed facts from keyword/vector search.
+            query: Original query string (for keyword-overlap scoring).
+            limit: Maximum facts to return.
+            min_confidence: Minimum confidence threshold for neighbours.
+
+        Returns:
+            Ranked list of up to ``limit`` SemanticFact instances.
+        """
+        if not seeds:
+            return seeds
+
+        query_tokens = _tokenize(query)
+        scored: dict[str, tuple[float, SemanticFact]] = {}
+
+        # Score seed facts
+        n_seeds = len(seeds)
+        for rank, fact in enumerate(seeds):
+            base_score = (n_seeds - rank) / n_seeds  # 1.0 → 1/n_seeds
+            kw_score = (
+                _compute_similarity(query_tokens, _tokenize(f"{fact.concept} {fact.content}"))
+                if query_tokens
+                else 0.5
+            )
+            final_score = (base_score * 0.6 + kw_score * 0.4) * fact.confidence
+            scored[fact.node_id] = (final_score, fact)
+
+        # 1-hop expansion via SIMILAR_TO edges
+        for seed in seeds:
+            try:
+                nbr_result = self._conn.execute(
+                    """
+                    MATCH (s:SemanticMemory)-[r:SIMILAR_TO]->(n:SemanticMemory)
+                    WHERE s.node_id = $sid AND n.agent_id = $aid
+                      AND n.confidence >= $minc
+                    RETURN n.node_id, n.concept, n.content, n.confidence,
+                           n.source_id, n.tags, n.metadata, n.created_at,
+                           r.similarity_score
+                    """,
+                    {
+                        "sid": seed.node_id,
+                        "aid": self.agent_name,
+                        "minc": min_confidence,
+                    },
+                )
+            except Exception as exc:
+                logger.debug("Graph traversal failed for seed %s: %s", seed.node_id, exc)
+                continue
+
+            while nbr_result.has_next():
+                row = nbr_result.get_next()
+                nid = row[0]
+                if nid in scored:
+                    continue  # already scored as a seed
+
+                confidence = float(row[3])
+                edge_sim = float(row[8]) if row[8] is not None else 0.5
+                kw_score = (
+                    _compute_similarity(query_tokens, _tokenize(f"{row[1]} {row[2]}"))
+                    if query_tokens
+                    else 0.3
+                )
+                nbr_score = (edge_sim * 0.5 + kw_score * 0.5) * confidence
+
+                tags: list[str] = []
+                if row[5]:
+                    try:
+                        tags = json.loads(row[5])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                meta: dict = {}
+                if row[6]:
+                    try:
+                        meta = json.loads(row[6])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                scored[nid] = (
+                    nbr_score,
+                    SemanticFact(
+                        node_id=nid,
+                        concept=row[1],
+                        content=row[2],
+                        confidence=confidence,
+                        source_id=row[4] or "",
+                        tags=tags,
+                        metadata=meta,
+                        created_at=datetime.fromtimestamp(row[7]),
+                    ),
+                )
+
+        sorted_facts = sorted(scored.values(), key=lambda x: x[0], reverse=True)
+        return [fact for _, fact in sorted_facts[:limit]]
+
     def store_fact(
         self,
         concept: str,
@@ -778,13 +1073,21 @@ class CognitiveMemory:
         source_id: str = "",
         tags: list[str] | None = None,
         temporal_metadata: dict | None = None,
+        source_episode_id: str | None = None,
     ) -> str:
-        """Store a semantic fact.
+        """Store a semantic fact and automatically create graph edges.
 
         When sentence-transformers is installed, automatically generates
         and stores an embedding vector alongside the fact for semantic
         search.  Falls back to keyword search when embeddings are
         unavailable.
+
+        After storing the node, this method:
+
+        - Creates ``SIMILAR_TO`` edges to any sufficiently similar existing
+          facts (Jaccard similarity ≥ ``SIMILARITY_THRESHOLD``).
+        - Creates a ``DERIVES_FROM`` edge to ``source_episode_id`` when
+          provided.
 
         Args:
             concept: The concept or topic.
@@ -793,6 +1096,9 @@ class CognitiveMemory:
             source_id: Origin reference.
             tags: Categorisation tags.
             temporal_metadata: Optional structured metadata.
+            source_episode_id: node_id of an EpisodicMemory that this fact
+                was derived from.  When supplied, a ``DERIVES_FROM`` edge is
+                created.
 
         Returns:
             node_id of the stored fact.
@@ -834,6 +1140,12 @@ class CognitiveMemory:
                 "ts": now,
             },
         )
+
+        # Create graph edges (best-effort; failures do not abort the store)
+        self._create_similarity_edges(node_id)
+        if source_episode_id:
+            self._create_derives_from_edge(node_id, source_episode_id)
+
         return node_id
 
     def search_facts(
@@ -842,11 +1154,19 @@ class CognitiveMemory:
         limit: int = 10,
         min_confidence: float = 0.0,
     ) -> list[SemanticFact]:
-        """Search semantic facts using vector similarity or keyword matching.
+        """Search semantic facts with graph traversal.
 
-        Automatically uses vector search (cosine similarity via HNSW index)
-        when sentence-transformers is installed and embeddings exist.
-        Falls back to keyword matching (CONTAINS) otherwise.
+        Retrieves initial seed facts via vector similarity (when
+        sentence-transformers is installed) or keyword matching, then expands
+        the result set by following 1-hop ``SIMILAR_TO`` edges and re-ranks
+        the merged candidates.
+
+        Algorithm:
+        1. **Keyword seed**: collect matching facts via vector or keyword search.
+        2. **1-hop expansion**: follow ``SIMILAR_TO`` edges from each seed to
+           discover related facts not caught by the initial query.
+        3. **Ranking**: score every candidate by rank position, keyword overlap,
+           edge similarity, and confidence; return the top ``limit`` results.
 
         Args:
             query: Search string.
@@ -856,15 +1176,21 @@ class CognitiveMemory:
         Returns:
             List of matching SemanticFact, best matches first.
         """
-        # Try vector search first
+        # Step 1: collect seed facts
         gen = get_shared_generator()
         if gen.available and getattr(self, "_has_vector_index", False):
-            results = self._search_facts_vector(query, limit=limit, min_confidence=min_confidence)
-            if results:
-                return results
-            # Fall through to keyword search if vector returned nothing
+            seeds = self._search_facts_vector(query, limit=limit, min_confidence=min_confidence)
+            if not seeds:
+                seeds = self._search_facts_keyword(
+                    query, limit=limit, min_confidence=min_confidence
+                )
+        else:
+            seeds = self._search_facts_keyword(query, limit=limit, min_confidence=min_confidence)
 
-        return self._search_facts_keyword(query, limit=limit, min_confidence=min_confidence)
+        # Step 2 & 3: 1-hop graph expansion + ranking
+        return self._expand_with_graph(
+            seeds, query=query, limit=limit, min_confidence=min_confidence
+        )
 
     def _search_facts_vector(
         self,
@@ -889,7 +1215,7 @@ class CognitiveMemory:
 
         try:
             # Fetch more candidates than needed, then filter by agent_id and confidence
-            fetch_limit = limit * 5
+            fetch_limit = limit * GRAPH_FETCH_MULTIPLIER
             result = self._conn.execute(
                 """
                 CALL QUERY_VECTOR_INDEX(
@@ -903,7 +1229,15 @@ class CognitiveMemory:
                 {"query_emb": query_embedding, "fetch_limit": fetch_limit},
             )
         except Exception as exc:
-            logger.debug("Vector search failed, falling back to keyword: %s", exc)
+            if not self._vector_search_warned:
+                logger.warning(
+                    "Vector search unavailable, falling back to keyword search: %s. "
+                    "This may indicate a missing or misconfigured vector index.",
+                    exc,
+                )
+                self._vector_search_warned = True
+            else:
+                logger.debug("Vector search failed, falling back to keyword: %s", exc)
             return []
 
         facts: list[SemanticFact] = []
@@ -969,13 +1303,22 @@ class CognitiveMemory:
         if not keywords:
             return self.get_all_facts(limit=limit)
 
+        if len(keywords) > MAX_SEARCH_KEYWORDS:
+            logger.debug(
+                "Keyword search truncated from %d to %d keywords for query: %r",
+                len(keywords),
+                MAX_SEARCH_KEYWORDS,
+                query,
+            )
+            keywords = keywords[:MAX_SEARCH_KEYWORDS]
+
         conditions = []
         params: dict = {
             "aid": self.agent_name,
             "minc": min_confidence,
             "lim": limit,
         }
-        for i, kw in enumerate(keywords[:6]):
+        for i, kw in enumerate(keywords):
             pname = f"kw{i}"
             conditions.append(
                 f"(lower(s.concept) CONTAINS lower(${pname}) "
@@ -1129,9 +1472,17 @@ class CognitiveMemory:
                 {"aid": self.agent_name, "lim": limit},
             )
         else:
+            if len(keywords) > MAX_SEARCH_KEYWORDS:
+                logger.debug(
+                    "Procedure keyword search truncated from %d to %d keywords for query: %r",
+                    len(keywords),
+                    MAX_SEARCH_KEYWORDS,
+                    query,
+                )
+                keywords = keywords[:MAX_SEARCH_KEYWORDS]
             conditions = []
             params: dict = {"aid": self.agent_name, "lim": limit}
-            for i, kw in enumerate(keywords[:6]):
+            for i, kw in enumerate(keywords):
                 pname = f"kw{i}"
                 conditions.append(
                     f"(lower(p.name) CONTAINS lower(${pname}) "
@@ -1235,7 +1586,7 @@ class CognitiveMemory:
                 "dtxt": description,
                 "trig": trigger_condition,
                 "act": action_on_trigger,
-                "stat": "pending",
+                "stat": PROSPECTIVE_STATUS_PENDING,
                 "pri": priority,
                 "ts": now,
             },
@@ -1263,7 +1614,7 @@ class CognitiveMemory:
                    p.action_on_trigger, p.status, p.priority, p.created_at
             ORDER BY p.priority DESC
             """,
-            {"aid": self.agent_name, "stat": "pending"},
+            {"aid": self.agent_name, "stat": PROSPECTIVE_STATUS_PENDING},
         )
 
         candidates: list[ProspectiveMemory] = []
@@ -1293,9 +1644,9 @@ class CognitiveMemory:
                     WHERE p.node_id = $nid
                     SET p.status = $stat
                     """,
-                    {"nid": pm.node_id, "stat": "triggered"},
+                    {"nid": pm.node_id, "stat": PROSPECTIVE_STATUS_TRIGGERED},
                 )
-                pm.status = "triggered"
+                pm.status = PROSPECTIVE_STATUS_TRIGGERED
                 triggered.append(pm)
 
         return triggered
@@ -1312,7 +1663,7 @@ class CognitiveMemory:
             WHERE p.node_id = $nid AND p.agent_id = $aid
             SET p.status = $stat
             """,
-            {"nid": node_id, "aid": self.agent_name, "stat": "resolved"},
+            {"nid": node_id, "aid": self.agent_name, "stat": PROSPECTIVE_STATUS_RESOLVED},
         )
 
     # ==================================================================

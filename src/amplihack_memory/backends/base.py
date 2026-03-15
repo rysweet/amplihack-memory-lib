@@ -1,7 +1,6 @@
 """Abstract base class for memory storage backends."""
 
 from abc import ABC, abstractmethod
-from typing import List
 
 from ..experience import Experience, ExperienceType
 
@@ -36,7 +35,7 @@ class MemoryBackend(ABC):
         limit: int | None = None,
         experience_type: ExperienceType | None = None,
         min_confidence: float = 0.0,
-    ) -> List[Experience]:
+    ) -> list[Experience]:
         """Retrieve experiences.
 
         Args:
@@ -56,7 +55,7 @@ class MemoryBackend(ABC):
         experience_type: ExperienceType | None = None,
         min_confidence: float = 0.0,
         limit: int = 10,
-    ) -> List[Experience]:
+    ) -> list[Experience]:
         """Search experiences by text query.
 
         Args:

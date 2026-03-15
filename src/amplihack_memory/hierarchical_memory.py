@@ -41,6 +41,11 @@ from .similarity import compute_similarity
 
 logger = logging.getLogger(__name__)
 
+# Maximum number of candidate facts checked during supersedes detection.
+# Increasing this improves conflict detection on large graphs at the cost of
+# a larger query result set.
+_SUPERSEDES_CANDIDATE_LIMIT = 20
+
 
 class MemoryCategory(str, Enum):
     """Categories of memory matching cognitive science model."""
@@ -611,7 +616,7 @@ class HierarchicalMemory:
                     },
                 )
         except Exception as e:
-            logger.debug("Failed to create DERIVES_FROM edge: %s", e)
+            logger.warning("Failed to create DERIVES_FROM edge; provenance tracking incomplete: %s", e)
 
     def _detect_supersedes(
         self,
@@ -639,14 +644,14 @@ class HierarchicalMemory:
         try:
             # Find existing facts with same/similar concept and LOWER temporal index
             result = self.connection.execute(
-                """
+                f"""
                 MATCH (m:SemanticMemory)
                 WHERE m.agent_id = $agent_id
                   AND m.memory_id <> $new_id
                   AND (LOWER(m.concept) CONTAINS LOWER($concept_key)
                        OR LOWER($concept_key) CONTAINS LOWER(m.concept))
                 RETURN m.memory_id, m.content, m.concept, m.metadata
-                LIMIT 20
+                LIMIT {_SUPERSEDES_CANDIDATE_LIMIT}
                 """,
                 {
                     "agent_id": self.agent_name,
@@ -1392,9 +1397,8 @@ class HierarchicalMemory:
                 }
 
         except Exception as e:
-            logger.debug("Aggregation query failed (%s): %s", query_type, e)
-
-        return {"count": 0, "query_type": query_type, "error": "Query failed"}
+            logger.warning("Aggregation query failed (%s): %s", query_type, e)
+            return {"count": 0, "query_type": query_type, "error": str(e)}
 
     def get_all_knowledge(self, limit: int = 50) -> list[KnowledgeNode]:
         """Retrieve all semantic knowledge nodes.
@@ -1488,7 +1492,8 @@ class HierarchicalMemory:
                 )
                 if result.has_next():
                     stats["similar_to_edges"] = result.get_next()[0]
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to query SIMILAR_TO edge count: %s", e)
                 stats["similar_to_edges"] = 0
 
             try:
@@ -1502,7 +1507,8 @@ class HierarchicalMemory:
                 )
                 if result.has_next():
                     stats["derives_from_edges"] = result.get_next()[0]
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to query DERIVES_FROM edge count: %s", e)
                 stats["derives_from_edges"] = 0
 
         except Exception as e:
