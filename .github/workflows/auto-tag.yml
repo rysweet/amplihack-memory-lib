@@ -1,0 +1,41 @@
+name: Auto-tag release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version from pyproject.toml
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ -z "$version" ]; then
+            echo "::error::Could not read version from pyproject.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag if it does not exist
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists — skipping."
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "Created and pushed tag $TAG"
+          fi
