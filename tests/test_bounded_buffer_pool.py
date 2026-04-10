@@ -11,7 +11,7 @@ This module covers:
 import pytest
 
 from amplihack_memory import CognitiveMemory, Experience, ExperienceType, MemoryConnector
-from amplihack_memory.graph.kuzu_store import KuzuGraphStore
+from amplihack_memory.graph.ladybug_store import LadybugGraphStore as KuzuGraphStore
 from amplihack_memory.store import ExperienceStore
 
 

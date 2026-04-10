@@ -94,9 +94,9 @@ class TestVectorSchema:
         """Verify embedding column added to pre-existing DB without it."""
         db_path = tmp_path / "migrate_test"
         # Create a DB with the OLD schema (no embedding column)
-        import kuzu
-        db = kuzu.Database(str(db_path))
-        conn = kuzu.Connection(db)
+        import ladybug
+        db = ladybug.Database(str(db_path))
+        conn = ladybug.Connection(db)
         conn.execute("""
             CREATE NODE TABLE IF NOT EXISTS SemanticMemory(
                 node_id STRING,
