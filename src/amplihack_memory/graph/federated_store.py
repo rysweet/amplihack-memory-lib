@@ -115,7 +115,7 @@ class FederatedGraphStore:
     transparently and sets crossed_boundaries=True when results span both.
 
     Args:
-        local_store: The agent's own KuzuGraphStore.
+        local_store: The agent's own LadybugGraphStore.
         hive_store: The shared hive graph store.
     """
 

@@ -1,7 +1,10 @@
 """Backend abstraction layer for memory storage."""
 
 from .base import MemoryBackend
-from .kuzu_backend import KuzuBackend
+from .ladybug_backend import LadybugBackend
 from .sqlite_backend import SQLiteBackend
 
-__all__ = ["MemoryBackend", "KuzuBackend", "SQLiteBackend"]
+# Backward-compatible alias
+KuzuBackend = LadybugBackend
+
+__all__ = ["MemoryBackend", "LadybugBackend", "KuzuBackend", "SQLiteBackend"]

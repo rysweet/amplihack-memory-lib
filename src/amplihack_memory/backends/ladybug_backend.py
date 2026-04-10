@@ -1,18 +1,19 @@
-"""Kuzu graph database backend for memory storage."""
+"""Ladybug graph database backend for memory storage."""
+from ..cognitive_memory import _encode_structured, _decode_structured
 
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import kuzu
+import ladybug
 
 from ..exceptions import InvalidExperienceError
 from ..experience import Experience, ExperienceType
 from .base import MemoryBackend
 
 
-class KuzuBackend(MemoryBackend):
-    """Kuzu graph database backend for memory storage.
+class LadybugBackend(MemoryBackend):
+    """Ladybug graph database backend for memory storage.
 
     Provides graph-based storage with relationship support and
     native text search capabilities.
@@ -25,10 +26,10 @@ class KuzuBackend(MemoryBackend):
         max_memory_mb: int = 100,
         enable_compression: bool = True,
     ):
-        """Initialize Kuzu backend.
+        """Initialize Ladybug backend.
 
         Args:
-            db_path: Path to Kuzu database directory
+            db_path: Path to Ladybug database directory
             agent_name: Agent identifier
             max_memory_mb: Maximum storage size in MB (advisory)
             enable_compression: Enable compression (advisory, Kuzu handles this)
@@ -38,15 +39,15 @@ class KuzuBackend(MemoryBackend):
         self.max_memory_mb = max_memory_mb
         self.enable_compression = enable_compression
 
-        # Initialize Kuzu database (creates directory automatically)
-        # Kuzu creates the directory if it doesn't exist
-        self.db = kuzu.Database(str(self.db_path))
-        self.conn = kuzu.Connection(self.db)
+        # Initialize Ladybug database (creates directory automatically)
+        # Ladybug creates the directory if it doesn't exist
+        self.db = ladybug.Database(str(self.db_path))
+        self.conn = ladybug.Connection(self.db)
 
         self.initialize_schema()
 
     def initialize_schema(self):
-        """Initialize Kuzu graph schema."""
+        """Initialize Ladybug graph schema."""
         # Create Experience node table if not exists
         try:
             self.conn.execute("""
@@ -110,8 +111,8 @@ class KuzuBackend(MemoryBackend):
             raise InvalidExperienceError("confidence must be between 0.0 and 1.0")
 
         # Convert to JSON strings for storage
-        metadata_json = json.dumps(experience.metadata) if experience.metadata else "{}"
-        tags_json = json.dumps(experience.tags) if experience.tags else "[]"
+        metadata_json = _encode_structured(experience.metadata) if experience.metadata else _encode_structured({})
+        tags_json = _encode_structured(experience.tags) if experience.tags else _encode_structured([])
 
         # Store as node in Kuzu
         self.conn.execute(
@@ -194,8 +195,8 @@ class KuzuBackend(MemoryBackend):
                 outcome=row[3],
                 confidence=row[4],
                 timestamp=datetime.fromtimestamp(row[5]),
-                metadata=json.loads(row[6]) if row[6] else {},
-                tags=json.loads(row[7]) if row[7] else [],
+                metadata=_decode_structured(row[6], fallback={}) if row[6] else {},
+                tags=_decode_structured(row[7], fallback=[]) if row[7] else [],
             )
             experiences.append(exp)
 
@@ -267,8 +268,8 @@ class KuzuBackend(MemoryBackend):
                 outcome=row[3],
                 confidence=row[4],
                 timestamp=datetime.fromtimestamp(row[5]),
-                metadata=json.loads(row[6]) if row[6] else {},
-                tags=json.loads(row[7]) if row[7] else [],
+                metadata=_decode_structured(row[6], fallback={}) if row[6] else {},
+                tags=_decode_structured(row[7], fallback=[]) if row[7] else [],
             )
             experiences.append(exp)
 
@@ -348,7 +349,7 @@ class KuzuBackend(MemoryBackend):
         """Get Kuzu connection for advanced operations.
 
         Returns:
-            kuzu.Connection object
+            ladybug.Connection object
         """
         return self.conn
 
@@ -358,7 +359,7 @@ class KuzuBackend(MemoryBackend):
         max_age_days: int | None = None,
         max_experiences: int | None = None,
     ):
-        """Run cleanup operations on Kuzu database.
+        """Run cleanup operations on Ladybug database.
 
         Args:
             auto_compress: Compress old experiences (>30 days)

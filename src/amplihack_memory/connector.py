@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from .backends.base import MemoryBackend
-from .backends.kuzu_backend import KuzuBackend
+from .backends.ladybug_backend import LadybugBackend
 from .backends.sqlite_backend import SQLiteBackend
 from .experience import Experience, ExperienceType
 
@@ -19,7 +19,7 @@ class MemoryConnector:
         storage_path: Directory for database files
         max_memory_mb: Maximum storage size in MB
         enable_compression: Whether to enable compression
-        backend: Backend type ('kuzu' or 'sqlite')
+        backend: Backend type ('ladybug' or 'sqlite')
     """
 
     def __init__(
@@ -37,7 +37,7 @@ class MemoryConnector:
             storage_path: Storage directory (defaults to ~/.amplihack/memory/<agent>)
             max_memory_mb: Maximum storage size in MB
             enable_compression: Enable automatic compression
-            backend: Backend type ('kuzu' or 'sqlite', default: 'sqlite')
+            backend: Backend type ('ladybug' or 'sqlite', default: 'sqlite')
 
         Raises:
             ValueError: If agent_name is invalid or backend is unknown
@@ -68,9 +68,9 @@ class MemoryConnector:
             raise PermissionError(f"Cannot create storage directory: {storage_path}") from e
 
         # Initialize backend
-        if backend == "kuzu":
-            db_path = self.storage_path / "kuzu_db"
-            self._backend: MemoryBackend = KuzuBackend(
+        if backend in ("ladybug", "kuzu"):
+            db_path = self.storage_path / "ladybug_db"
+            self._backend: MemoryBackend = LadybugBackend(
                 db_path=db_path,
                 agent_name=agent_name,
                 max_memory_mb=max_memory_mb,
@@ -85,7 +85,7 @@ class MemoryConnector:
                 enable_compression=enable_compression,
             )
         else:
-            raise ValueError(f"Unknown backend: {backend}. Use 'kuzu' or 'sqlite'.")
+            raise ValueError(f"Unknown backend: {backend}. Use 'ladybug' or 'sqlite'.")
 
         # Store db_path for compatibility
         self.db_path = db_path
