@@ -1,7 +1,7 @@
-"""Hierarchical memory system using Kuzu graph database directly.
+"""Hierarchical memory system using Ladybug graph database directly.
 
 Philosophy:
-- Uses Kuzu directly for full graph control
+- Uses Ladybug directly for full graph control
 - Five memory categories matching cognitive science model
 - Auto-classification of incoming knowledge
 - Similarity edges computed on store for Graph RAG traversal
@@ -33,11 +33,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-import kuzu  # type: ignore[import-not-found]
+import ladybug  # type: ignore[import-not-found]
 
 from .contradiction import detect_contradiction
 from .entity_extraction import extract_entity_name
 from .similarity import compute_similarity
+from .cognitive_memory import _encode_structured, _decode_structured
 
 logger = logging.getLogger(__name__)
 
@@ -245,7 +246,7 @@ def _make_id() -> str:
 
 
 class HierarchicalMemory:
-    """Hierarchical memory system backed by Kuzu graph database.
+    """Hierarchical memory system backed by Ladybug graph database.
 
     Creates and manages a knowledge graph with:
     - SemanticMemory nodes for factual knowledge
@@ -255,7 +256,7 @@ class HierarchicalMemory:
 
     Args:
         agent_name: Name of the owning agent
-        db_path: Path to Kuzu database directory
+        db_path: Path to Ladybug database directory
 
     Example:
         >>> mem = HierarchicalMemory("test_agent", "/tmp/test_mem")
@@ -282,20 +283,20 @@ class HierarchicalMemory:
         elif isinstance(db_path, str):
             db_path = Path(db_path)
 
-        # Kuzu needs a path to its database directory (it creates it)
-        # If the path already exists as a regular directory without Kuzu files, append /kuzu_db
+        # Ladybug needs a path to its database directory (it creates it)
+        # If the path already exists as a regular directory without Ladybug files, append /ladybug_db
         self.db_path = (
-            db_path / "kuzu_db" if db_path.is_dir() and not (db_path / "lock").exists() else db_path
+            db_path / "ladybug_db" if db_path.is_dir() and not (db_path / "lock").exists() else db_path
         )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.database = kuzu.Database(str(self.db_path))
-        self.connection = kuzu.Connection(self.database)
+        self.database = ladybug.Database(str(self.db_path))
+        self.connection = ladybug.Connection(self.database)
         self._classifier = MemoryClassifier()
         self._init_schema()
 
     def _init_schema(self) -> None:
-        """Create Kuzu node and relationship tables if they don't exist."""
+        """Create Ladybug node and relationship tables if they don't exist."""
         try:
             self.connection.execute("""
                 CREATE NODE TABLE IF NOT EXISTS SemanticMemory(
@@ -432,8 +433,8 @@ class HierarchicalMemory:
                 "confidence": confidence,
                 "source_id": source_id,
                 "agent_id": self.agent_name,
-                "tags": json.dumps(tags),
-                "metadata": json.dumps(meta),
+                "tags": _encode_structured(tags),
+                "metadata": _encode_structured(meta),
                 "created_at": now,
                 "entity_name": entity_name,
             },
@@ -582,8 +583,8 @@ class HierarchicalMemory:
                 "content": content.strip(),
                 "source_label": source_label,
                 "agent_id": self.agent_name,
-                "tags": json.dumps([]),
-                "metadata": json.dumps({}),
+                "tags": _encode_structured([]),
+                "metadata": _encode_structured({}),
                 "created_at": now,
             },
         )
@@ -667,7 +668,7 @@ class HierarchicalMemory:
                 old_metadata_str = row[3]
 
                 # Check if old fact has a lower temporal index
-                old_meta = json.loads(old_metadata_str) if old_metadata_str else {}
+                old_meta = _decode_structured(old_metadata_str, fallback={}) if old_metadata_str else {}
                 old_temporal_idx = old_meta.get("temporal_index", 0)
 
                 if old_temporal_idx <= 0 or old_temporal_idx >= new_temporal_idx:
@@ -714,13 +715,13 @@ class HierarchicalMemory:
         """Compute similarity against recent nodes and create SIMILAR_TO edges.
 
         Scans ALL nodes in the knowledge base for similarity comparison.
-        Kuzu graph queries are fast and memory is not a constraint, so there
+        Ladybug graph queries are fast and memory is not a constraint, so there
         is no artificial cap on the scan window. This ensures older facts
         remain reachable via similarity edges regardless of KB size.
         Creates edges for similarity scores > 0.3 and detects contradictions.
         """
         try:
-            # Scan all nodes - no artificial cap. Kuzu handles large scans efficiently.
+            # Scan all nodes - no artificial cap. Ladybug handles large scans efficiently.
             count_result = self.connection.execute(
                 "MATCH (m:SemanticMemory) WHERE m.agent_id = $aid RETURN COUNT(m)",
                 {"aid": self.agent_name},
@@ -748,7 +749,7 @@ class HierarchicalMemory:
                 other_concept = row[2]
                 other_tags_str = row[3]
 
-                other_tags = json.loads(other_tags_str) if other_tags_str else []
+                other_tags = _decode_structured(other_tags_str, fallback=[]) if other_tags_str else []
                 other_node = {
                     "content": other_content,
                     "concept": other_concept,
@@ -777,7 +778,7 @@ class HierarchicalMemory:
                             "aid": node_id,
                             "bid": other_id,
                             "weight": score,
-                            "metadata": json.dumps(edge_meta) if edge_meta else "",
+                            "metadata": _encode_structured(edge_meta) if edge_meta else "",
                         },
                     )
 
@@ -852,8 +853,8 @@ class HierarchicalMemory:
                     nid = row[0]
                     if nid not in seen_ids:
                         seen_ids.add(nid)
-                        tags = json.loads(row[5]) if row[5] else []
-                        metadata = json.loads(row[6]) if row[6] else {}
+                        tags = _decode_structured(row[5], fallback=[]) if row[5] else []
+                        metadata = _decode_structured(row[6], fallback={}) if row[6] else {}
                         node = KnowledgeNode(
                             node_id=nid,
                             category=MemoryCategory.SEMANTIC,
@@ -907,8 +908,8 @@ class HierarchicalMemory:
 
                     if nid not in seen_ids and len(seen_ids) < max_nodes:
                         seen_ids.add(nid)
-                        tags = json.loads(row[5]) if row[5] else []
-                        metadata = json.loads(row[8]) if len(row) > 8 and row[8] else {}
+                        tags = _decode_structured(row[5], fallback=[]) if row[5] else []
+                        metadata = _decode_structured(row[8], fallback={}) if len(row) > 8 and row[8] else {}
                         node = KnowledgeNode(
                             node_id=nid,
                             category=MemoryCategory.SEMANTIC,
@@ -926,7 +927,7 @@ class HierarchicalMemory:
                     edge_meta = {}
                     if len(row) > 9 and row[9]:
                         try:
-                            edge_meta = json.loads(row[9])
+                            edge_meta = _decode_structured(row[9], fallback={})
                         except (json.JSONDecodeError, TypeError):
                             pass
 
@@ -1025,8 +1026,8 @@ class HierarchicalMemory:
                     nid = row[0]
                     if nid not in seen:
                         seen.add(nid)
-                        tags = json.loads(row[5]) if row[5] else []
-                        metadata = json.loads(row[6]) if row[6] else {}
+                        tags = _decode_structured(row[5], fallback=[]) if row[5] else []
+                        metadata = _decode_structured(row[6], fallback={}) if row[6] else {}
                         nodes.append(
                             KnowledgeNode(
                                 node_id=nid,
@@ -1157,8 +1158,8 @@ class HierarchicalMemory:
 
             while result.has_next():
                 row = result.get_next()
-                tags = json.loads(row[5]) if row[5] else []
-                metadata = json.loads(row[6]) if row[6] else {}
+                tags = _decode_structured(row[5], fallback=[]) if row[5] else []
+                metadata = _decode_structured(row[6], fallback={}) if row[6] else {}
                 nodes.append(
                     KnowledgeNode(
                         node_id=row[0],
@@ -1191,8 +1192,8 @@ class HierarchicalMemory:
 
                 while result.has_next():
                     row = result.get_next()
-                    tags = json.loads(row[5]) if row[5] else []
-                    metadata = json.loads(row[6]) if row[6] else {}
+                    tags = _decode_structured(row[5], fallback=[]) if row[5] else []
+                    metadata = _decode_structured(row[6], fallback={}) if row[6] else {}
                     nodes.append(
                         KnowledgeNode(
                             node_id=row[0],
@@ -1260,8 +1261,8 @@ class HierarchicalMemory:
                     nid = row[0]
                     if nid not in seen:
                         seen.add(nid)
-                        tags = json.loads(row[5]) if row[5] else []
-                        metadata = json.loads(row[6]) if row[6] else {}
+                        tags = _decode_structured(row[5], fallback=[]) if row[5] else []
+                        metadata = _decode_structured(row[6], fallback={}) if row[6] else {}
                         nodes.append(
                             KnowledgeNode(
                                 node_id=nid,
@@ -1426,8 +1427,8 @@ class HierarchicalMemory:
 
             while result.has_next():
                 row = result.get_next()
-                tags = json.loads(row[5]) if row[5] else []
-                metadata = json.loads(row[6]) if row[6] else {}
+                tags = _decode_structured(row[5], fallback=[]) if row[5] else []
+                metadata = _decode_structured(row[6], fallback={}) if row[6] else {}
                 category_str = metadata.get("category", "semantic")
                 try:
                     category = MemoryCategory(category_str)
@@ -1555,8 +1556,8 @@ class HierarchicalMemory:
                         "content": row[2],
                         "confidence": row[3],
                         "source_id": row[4] or "",
-                        "tags": json.loads(row[5]) if row[5] else [],
-                        "metadata": json.loads(row[6]) if row[6] else {},
+                        "tags": _decode_structured(row[5], fallback=[]) if row[5] else [],
+                        "metadata": _decode_structured(row[6], fallback={}) if row[6] else {},
                         "created_at": row[7] or "",
                         "entity_name": row[8] or "",
                     }
@@ -1583,8 +1584,8 @@ class HierarchicalMemory:
                         "memory_id": row[0],
                         "content": row[1],
                         "source_label": row[2] or "",
-                        "tags": json.loads(row[3]) if row[3] else [],
-                        "metadata": json.loads(row[4]) if row[4] else {},
+                        "tags": _decode_structured(row[3], fallback=[]) if row[3] else [],
+                        "metadata": _decode_structured(row[4], fallback={}) if row[4] else {},
                         "created_at": row[5] or "",
                     }
                 )
@@ -1606,7 +1607,7 @@ class HierarchicalMemory:
                 edge_meta = {}
                 if row[3]:
                     try:
-                        edge_meta = json.loads(row[3])
+                        edge_meta = _decode_structured(row[3], fallback={})
                     except (json.JSONDecodeError, TypeError):
                         pass
                 export_data["similar_to_edges"].append(
@@ -1737,8 +1738,8 @@ class HierarchicalMemory:
                         "content": ep_node.get("content", ""),
                         "source_label": ep_node.get("source_label", ""),
                         "agent_id": self.agent_name,
-                        "tags": json.dumps(ep_node.get("tags", [])),
-                        "metadata": json.dumps(ep_node.get("metadata", {})),
+                        "tags": _encode_structured(ep_node.get("tags", [])),
+                        "metadata": _encode_structured(ep_node.get("metadata", {})),
                         "created_at": ep_node.get("created_at", ""),
                     },
                 )
@@ -1779,8 +1780,8 @@ class HierarchicalMemory:
                         "confidence": sem_node.get("confidence", 0.8),
                         "source_id": sem_node.get("source_id", ""),
                         "agent_id": self.agent_name,
-                        "tags": json.dumps(sem_node.get("tags", [])),
-                        "metadata": json.dumps(sem_node.get("metadata", {})),
+                        "tags": _encode_structured(sem_node.get("tags", [])),
+                        "metadata": _encode_structured(sem_node.get("metadata", {})),
                         "created_at": sem_node.get("created_at", ""),
                         "entity_name": sem_node.get("entity_name", ""),
                     },
@@ -1803,7 +1804,7 @@ class HierarchicalMemory:
                         "sid": edge["source_id"],
                         "tid": edge["target_id"],
                         "weight": edge.get("weight", 1.0),
-                        "metadata": json.dumps(edge.get("metadata", {}))
+                        "metadata": _encode_structured(edge.get("metadata", {}))
                         if edge.get("metadata")
                         else "",
                     },

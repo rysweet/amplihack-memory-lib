@@ -35,7 +35,7 @@ def temp_storage(tmp_path):
         shutil.rmtree(storage_path, ignore_errors=True)
 
 
-@pytest.fixture(params=["sqlite", "kuzu"])
+@pytest.fixture(params=["sqlite", "ladybug"])
 def backend_type(request):
-    """Parametrize tests to run with both SQLite and Kuzu backends."""
+    """Parametrize tests to run with both SQLite and Ladybug backends."""
     return request.param

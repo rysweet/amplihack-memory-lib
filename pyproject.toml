@@ -4,7 +4,7 @@ version = "0.4.0"
 description = "Standalone memory system for goal-seeking agents"
 requires-python = ">=3.10"
 dependencies = [
-    "kuzu>=0.11.0",
+    "ladybug>=0.11.0",
 ]
 
 [project.optional-dependencies]

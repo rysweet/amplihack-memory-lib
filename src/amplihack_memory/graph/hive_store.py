@@ -1,10 +1,10 @@
 """HiveGraphStore -- Kuzu-backed graph store for the hive mind collective.
 
-Extends KuzuGraphStore with hive-specific schema: agent registry nodes,
+Extends LadybugGraphStore with hive-specific schema: agent registry nodes,
 cross-agent confirmation edges, contradiction edges, and semantic bridges.
 
 Public API:
-    HiveGraphStore: KuzuGraphStore subclass with hive-specific operations.
+    HiveGraphStore: LadybugGraphStore subclass with hive-specific operations.
 """
 
 from __future__ import annotations
@@ -12,14 +12,14 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from .kuzu_store import KuzuGraphStore
+from .ladybug_store import LadybugGraphStore
 from .types import GraphNode
 
 
-class HiveGraphStore(KuzuGraphStore):
+class HiveGraphStore(LadybugGraphStore):
     """The hive mind's own graph -- metadata about the agent collective.
 
-    Adds hive-specific tables on top of the base KuzuGraphStore:
+    Adds hive-specific tables on top of the base LadybugGraphStore:
     - HiveAgent nodes: registry with trust, domain, fact_count
     - CONFIRMED_BY edges: cross-agent fact confirmation
     - CONTRADICTS edges: detected conflicts between agents

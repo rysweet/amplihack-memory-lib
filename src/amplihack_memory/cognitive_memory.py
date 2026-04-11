@@ -2,12 +2,14 @@
 
 Provides a single CognitiveMemory class that manages all six cognitive memory
 types (sensory, working, episodic, semantic, procedural, prospective) backed
-by a Kuzu graph database.
+by a Ladybug graph database.
 
 Each agent gets full isolation via an ``agent_id`` column stored in every
 node table.
 """
 
+import base64
+import fcntl
 import json
 import logging
 import time
@@ -16,7 +18,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
-import kuzu
+import ladybug
 
 logger = logging.getLogger(__name__)
 
@@ -277,22 +279,52 @@ _REL_TABLES = [
 
 
 # ---------------------------------------------------------------------------
+# Safe structured-data encoding for Ladybug
+# ---------------------------------------------------------------------------
+
+
+def _encode_structured(data: dict | list) -> str:
+    """Base64-encode a JSON-serializable value for safe storage in Ladybug.
+
+    Ladybug reinterprets JSON-like STRING values (e.g. '[]', '{}') as Cypher
+    literals. Base64 encoding prevents this.
+    """
+    return base64.b64encode(json.dumps(data).encode()).decode()
+
+
+def _decode_structured(raw: str, fallback=None):
+    """Decode a base64-encoded JSON string stored by ``_encode_structured``."""
+    if not raw:
+        return fallback if fallback is not None else {}
+    try:
+        return json.loads(base64.b64decode(raw).decode())
+    except Exception:
+        # Pre-migration data may be plain JSON
+        try:
+            return json.loads(raw)
+        except Exception:
+            return fallback if fallback is not None else {}
+
+
+# ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
 
 
 class CognitiveMemory:
-    """Six-type cognitive memory backed by Kuzu.
+    """Six-type cognitive memory backed by Ladybug.
 
     Args:
         agent_name: Identifier for the agent (used for row isolation).
-        db_path: Filesystem path for the Kuzu database directory.
-        buffer_pool_size: Kuzu buffer pool size in bytes. Default 0 lets Kuzu
-            use ~80% of system RAM, which causes mmap failures when creating
-            many concurrent databases (e.g. 100 agents). Set to 256MB
-            (268435456) for multi-agent deployments.
-        max_db_size: Maximum database size in bytes. Default 0 lets Kuzu use
-            8TB, which can exhaust virtual address space with many DBs.
+        db_path: Filesystem path for the Ladybug database directory.
+        read_only: Open database in read-only mode for concurrent
+            multi-process reads. Defaults to ``False``.
+        buffer_pool_size: Ladybug buffer pool size in bytes. Default 0 lets
+            Ladybug use ~80% of system RAM, which causes mmap failures when
+            creating many concurrent databases (e.g. 100 agents). Set to
+            256MB (268435456) for multi-agent deployments.
+        max_db_size: Maximum database size in bytes. Default 0 lets Ladybug
+            use 8TB, which can exhaust virtual address space with many DBs.
             Set to 1GB (1073741824) for multi-agent deployments.
     """
 
@@ -302,6 +334,8 @@ class CognitiveMemory:
         self,
         agent_name: str,
         db_path: str | Path,
+        *,
+        read_only: bool = False,
         buffer_pool_size: int = 0,
         max_db_size: int = 0,
     ) -> None:
@@ -310,7 +344,8 @@ class CognitiveMemory:
 
         self.agent_name = agent_name.strip()
         self.db_path = Path(db_path)
-        # Ensure the *parent* directory exists; Kuzu creates the db dir itself.
+        self.read_only = read_only
+        # Ensure the *parent* directory exists; Ladybug creates the db dir itself.
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         db_kwargs: dict[str, int] = {}
@@ -319,9 +354,23 @@ class CognitiveMemory:
         if max_db_size > 0:
             db_kwargs["max_db_size"] = max_db_size
 
-        self._db = kuzu.Database(str(self.db_path), **db_kwargs)
-        self._conn = kuzu.Connection(self._db)
-        self._initialize_schema()
+        if read_only:
+            self._db = ladybug.Database(str(self.db_path), read_only=True, **db_kwargs)
+        else:
+            # Serialize write-mode Database() creation across processes via flock.
+            # Ladybug (like Kuzu) allows only one read-write Database per file.
+            lock_path = self.db_path.parent / ".ladybug.lock"
+            lock_fd = open(lock_path, "w")  # noqa: SIM115
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                self._db = ladybug.Database(str(self.db_path), **db_kwargs)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                lock_fd.close()
+
+        self._conn = ladybug.Connection(self._db)
+        if not read_only:
+            self._initialize_schema()
 
         # Monotonic counters (loaded from DB at startup)
         self._sensory_order = self._load_max_order("SensoryMemory", "observation_order")
@@ -703,7 +752,7 @@ class CognitiveMemory:
             if temporal_index > self._temporal_index:
                 self._temporal_index = temporal_index
 
-        meta_json = json.dumps(metadata) if metadata else "{}"
+        meta_json = _encode_structured(metadata) if metadata else _encode_structured({})
 
         self._conn.execute(
             """
@@ -845,12 +894,7 @@ class CognitiveMemory:
         episodes: list[EpisodicMemory] = []
         while result.has_next():
             row = result.get_next()
-            meta = {}
-            if row[6]:
-                try:
-                    meta = json.loads(row[6])
-                except (json.JSONDecodeError, TypeError):
-                    logger.debug("Failed to parse episode metadata: %s", row[6])
+            meta = _decode_structured(row[6], fallback={}) if row[6] else {}
             episodes.append(
                 EpisodicMemory(
                     node_id=row[0],
@@ -1035,18 +1079,8 @@ class CognitiveMemory:
                 )
                 nbr_score = (edge_sim * 0.5 + kw_score * 0.5) * confidence
 
-                tags: list[str] = []
-                if row[5]:
-                    try:
-                        tags = json.loads(row[5])
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                meta: dict = {}
-                if row[6]:
-                    try:
-                        meta = json.loads(row[6])
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                tags = _decode_structured(row[5], fallback=[]) if row[5] else []
+                meta = _decode_structured(row[6], fallback={}) if row[6] else {}
 
                 scored[nid] = (
                     nbr_score,
@@ -1105,8 +1139,8 @@ class CognitiveMemory:
         """
         node_id = _new_id("sem")
         now = _ts_now()
-        tags_json = json.dumps(tags) if tags else "[]"
-        meta_json = json.dumps(temporal_metadata) if temporal_metadata else "{}"
+        tags_json = _encode_structured(tags) if tags else _encode_structured([])
+        meta_json = _encode_structured(temporal_metadata) if temporal_metadata else _encode_structured({})
 
         # Generate embedding from concept + content for richer semantics
         gen = get_shared_generator()
@@ -1253,17 +1287,8 @@ class CognitiveMemory:
                 continue
 
             tags: list[str] = []
-            if row[6]:
-                try:
-                    tags = json.loads(row[6])
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            meta: dict = {}
-            if row[7]:
-                try:
-                    meta = json.loads(row[7])
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            tags = _decode_structured(row[6], fallback=[]) if row[6] else []
+            meta = _decode_structured(row[7], fallback={}) if row[7] else {}
             facts.append(
                 SemanticFact(
                     node_id=row[0],
@@ -1369,18 +1394,8 @@ class CognitiveMemory:
         facts: list[SemanticFact] = []
         while result.has_next():
             row = result.get_next()
-            tags: list[str] = []
-            if row[5]:
-                try:
-                    tags = json.loads(row[5])
-                except (json.JSONDecodeError, TypeError):
-                    logger.debug("Failed to parse fact tags: %s", row[5])
-            meta: dict = {}
-            if row[6]:
-                try:
-                    meta = json.loads(row[6])
-                except (json.JSONDecodeError, TypeError):
-                    logger.debug("Failed to parse fact metadata: %s", row[6])
+            tags = _decode_structured(row[5], fallback=[]) if row[5] else []
+            meta = _decode_structured(row[6], fallback={}) if row[6] else {}
             facts.append(
                 SemanticFact(
                     node_id=row[0],
@@ -1417,8 +1432,8 @@ class CognitiveMemory:
         """
         node_id = _new_id("proc")
         now = _ts_now()
-        steps_json = json.dumps(steps)
-        prereqs_json = json.dumps(prerequisites) if prerequisites else "[]"
+        steps_json = _encode_structured(steps)
+        prereqs_json = _encode_structured(prerequisites) if prerequisites else _encode_structured([])
 
         self._conn.execute(
             """
@@ -1506,18 +1521,8 @@ class CognitiveMemory:
         procs: list[ProceduralMemory] = []
         while result.has_next():
             row = result.get_next()
-            steps: list[str] = []
-            if row[2]:
-                try:
-                    steps = json.loads(row[2])
-                except (json.JSONDecodeError, TypeError):
-                    logger.debug("Failed to parse procedure steps: %s", row[2])
-            prereqs: list[str] = []
-            if row[3]:
-                try:
-                    prereqs = json.loads(row[3])
-                except (json.JSONDecodeError, TypeError):
-                    logger.debug("Failed to parse procedure prereqs: %s", row[3])
+            steps = _decode_structured(row[2], fallback=[]) if row[2] else []
+            prereqs = _decode_structured(row[3], fallback=[]) if row[3] else []
             procs.append(
                 ProceduralMemory(
                     node_id=row[0],
@@ -1707,6 +1712,6 @@ class CognitiveMemory:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Release the Kuzu connection."""
+        """Release the Ladybug connection."""
         self._conn = None
         self._db = None

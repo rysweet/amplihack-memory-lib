@@ -6,7 +6,7 @@ Public API:
     GraphEdge: Immutable graph edge.
     TraversalResult: Multi-hop traversal result container.
     GraphStore: Protocol all backends implement.
-    KuzuGraphStore: Kuzu-backed concrete implementation.
+    LadybugGraphStore: Kuzu-backed concrete implementation.
     HiveGraphStore: Kuzu-backed hive mind graph with agent registry.
     AnnotatedResult: Search result with provenance metadata.
     FederatedQueryResult: Container for federated query results.
@@ -17,9 +17,12 @@ from __future__ import annotations
 
 from .federated_store import AnnotatedResult, FederatedGraphStore, FederatedQueryResult
 from .hive_store import HiveGraphStore
-from .kuzu_store import KuzuGraphStore
+from .ladybug_store import LadybugGraphStore
 from .protocol import GraphStore
 from .types import Direction, GraphEdge, GraphNode, TraversalResult
+
+# Backward-compatible alias
+KuzuGraphStore = LadybugGraphStore
 
 __all__ = [
     "Direction",
@@ -27,6 +30,7 @@ __all__ = [
     "GraphEdge",
     "TraversalResult",
     "GraphStore",
+    "LadybugGraphStore",
     "KuzuGraphStore",
     "HiveGraphStore",
     "AnnotatedResult",

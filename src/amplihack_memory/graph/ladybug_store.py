@@ -1,10 +1,10 @@
-"""KuzuGraphStore -- Kuzu-backed implementation of the GraphStore protocol.
+"""LadybugGraphStore -- Ladybug-backed implementation of the GraphStore protocol.
 
 Manages dynamic schema (node tables and rel tables created on demand),
 parameterized Cypher queries, and BFS traversal.
 
 Public API:
-    KuzuGraphStore: Concrete GraphStore implementation backed by Kuzu.
+    LadybugGraphStore: Concrete GraphStore implementation backed by Kuzu.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-import kuzu
+import ladybug
 
 from .types import Direction, GraphEdge, GraphNode, TraversalResult
 
@@ -42,7 +42,7 @@ def _validate_identifier(name: str) -> None:
         )
 
 
-class KuzuGraphStore:
+class LadybugGraphStore:
     """Kuzu graph database implementation of the GraphStore protocol.
 
     Supports dynamic schema: node/rel tables are created on first use
@@ -61,15 +61,15 @@ class KuzuGraphStore:
         db_path: Path | str,
         store_id: str | None = None,
         buffer_pool_size: int = 256 * 1024 * 1024,
-        db: "kuzu.Database | None" = None,
+        db: "ladybug.Database | None" = None,
     ) -> None:
         self._db_path = Path(db_path)
         self._store_id = store_id or f"kuzu-{uuid.uuid4().hex[:8]}"
         if db is not None:
             self._db = db
         else:
-            self._db = kuzu.Database(str(self._db_path), buffer_pool_size=buffer_pool_size)
-        self._conn = kuzu.Connection(self._db)
+            self._db = ladybug.Database(str(self._db_path), buffer_pool_size=buffer_pool_size)
+        self._conn = ladybug.Connection(self._db)
         self._lock = threading.RLock()
 
         # Track which tables we have already ensured so we don't
@@ -736,4 +736,4 @@ class KuzuGraphStore:
         return True
 
 
-__all__ = ["KuzuGraphStore"]
+__all__ = ["LadybugGraphStore"]
