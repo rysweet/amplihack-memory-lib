@@ -660,7 +660,8 @@ class LadybugGraphStore:
         graph_origin = str(row_data.get("graph_origin", ""))
 
         # Everything except internal fields goes into properties.
-        skip = {"node_id", "graph_origin", "_id", "_label"}
+        # Kuzu returns internal keys as _ID/_LABEL (uppercase).
+        skip = {"node_id", "graph_origin", "_id", "_label", "_ID", "_LABEL"}
         props = {k: v for k, v in row_data.items() if k not in skip}
 
         self._id_table_cache[node_id] = table
@@ -693,7 +694,8 @@ class LadybugGraphStore:
         eid = str(rel_data.get("edge_id", ""))
         graph_origin = str(rel_data.get("graph_origin", ""))
 
-        skip = {"edge_id", "graph_origin", "_id", "_label", "_src", "_dst"}
+        skip = {"edge_id", "graph_origin", "_id", "_label", "_src", "_dst",
+                "_ID", "_LABEL", "_SRC", "_DST"}
         props = {k: v for k, v in rel_data.items() if k not in skip}
 
         # Kuzu _src/_dst are internal IDs, not our node_ids.
