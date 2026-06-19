@@ -180,33 +180,34 @@ impl LbugGraphStore {
         self.get_node(node_id).map(|n| n.node_type)
     }
 
-    fn query_directed_neighbors(
+    /// Fetch neighbors in a single direction with one label-less query.
+    ///
+    /// When `edge_type` is `None` every relationship type is matched at once
+    /// (the rel's actual type is recovered from [`lbug::RelVal::get_label_name`]),
+    /// so an N-hop traversal no longer issues one query per rel table per node.
+    fn query_neighbors_directed(
         &self,
         node_id: &str,
-        node_table: &str,
-        neighbor_table: &str,
-        rel_name: &str,
+        edge_type: Option<&str>,
         direction: &str,
         limit: usize,
     ) -> Vec<(GraphEdge, GraphNode)> {
         let lc = limit_clause(limit);
         let escaped = escape_cypher(node_id);
+        let rel_pat = match edge_type {
+            Some(et) => format!("r:{et}"),
+            None => "r".to_string(),
+        };
         let cypher = if direction == "outgoing" {
-            format!(
-                "MATCH (a:{node_table})-[r:{rel_name}]->(b:{neighbor_table}) \
-                 WHERE a.node_id = '{escaped}' RETURN r, b{lc}"
-            )
+            format!("MATCH (a)-[{rel_pat}]->(b) WHERE a.node_id = '{escaped}' RETURN r, b{lc}")
         } else {
-            format!(
-                "MATCH (a:{neighbor_table})-[r:{rel_name}]->(b:{node_table}) \
-                 WHERE b.node_id = '{escaped}' RETURN r, a{lc}"
-            )
+            format!("MATCH (a)-[{rel_pat}]->(b) WHERE b.node_id = '{escaped}' RETURN r, a{lc}")
         };
 
         let rows = match self.query_rows(&cypher) {
             Ok(r) => r,
             Err(e) => {
-                warn!("query_directed_neighbors failed: {e}");
+                warn!("query_neighbors_directed failed: {e}");
                 return Vec::new();
             }
         };
@@ -217,12 +218,13 @@ impl LbugGraphStore {
             let rel_v = it.next();
             let node_v = it.next();
             let neighbor = match node_v {
-                Some(Value::Node(nv)) => self.node_val_to_graph_node(&nv, neighbor_table),
+                Some(Value::Node(nv)) => self.node_val_to_graph_node(&nv, ""),
                 _ => continue,
             };
             let edge = match rel_v {
                 Some(Value::Rel(rv)) => {
-                    self.rel_val_to_edge(&rv, rel_name, node_id, direction, &neighbor.node_id)
+                    let rel_name = rv.get_label_name().clone();
+                    self.rel_val_to_edge(&rv, &rel_name, node_id, direction, &neighbor.node_id)
                 }
                 _ => continue,
             };
@@ -296,12 +298,40 @@ impl GraphStore for LbugGraphStore {
         self.ensure_schema_loaded();
         let _guard = self.acquire_lock();
 
+        // Fast path: we already know which table holds this id.
         if let Some(t) = self.id_table_cache.borrow().get(node_id).cloned() {
             if let Some(n) = self.get_node_from_table(node_id, &t) {
                 return Some(n);
             }
         }
 
+        // Cold path: one label-less lookup resolves the node (and its real
+        // label) across every node table in a single query, instead of issuing
+        // one query per table. An unlabeled MATCH is a binder error on an empty
+        // catalog, so it is only attempted once a table exists; any other binder
+        // error (e.g. a catalog table lacking `node_id`) falls through to the
+        // per-table scan below.
+        if !self.known_node_tables.borrow().is_empty() {
+            let cypher = format!(
+                "MATCH (n) WHERE n.node_id = '{}' RETURN n LIMIT 1",
+                escape_cypher(node_id)
+            );
+            if let Ok(rows) = self.query_rows(&cypher) {
+                let found = self.collect_nodes(rows, "").into_iter().next();
+                if let Some(node) = found {
+                    self.id_table_cache
+                        .borrow_mut()
+                        .insert(node_id.to_string(), node.node_type.clone());
+                    return Some(node);
+                }
+                // The query succeeded and matched nothing: the id is absent from
+                // every table, so the per-table scan would also find nothing.
+                return None;
+            }
+        }
+
+        // Fallback per-table scan (pathological catalogs the single query above
+        // could not bind).
         let tables: Vec<String> = self.known_node_tables.borrow().iter().cloned().collect();
         for t in tables {
             if let Some(n) = self.get_node_from_table(node_id, &t) {
@@ -506,46 +536,29 @@ impl GraphStore for LbugGraphStore {
             }
         }
 
-        let node = match self.get_node(node_id) {
-            Some(n) => n,
-            None => return Vec::new(),
-        };
-
+        self.ensure_schema_loaded();
         let _guard = self.acquire_lock();
-        let rel_tables: Vec<(String, String, String)> = self
-            .known_rel_tables
-            .borrow()
-            .iter()
-            .filter(|(rel, _, _)| edge_type.is_none() || edge_type == Some(rel.as_str()))
-            .cloned()
-            .collect();
+
+        // A label-less / typed-rel MATCH binds against the relevant rel tables;
+        // if none exist (or the requested edge_type is unknown) there are no
+        // neighbors and the unlabeled MATCH would be a binder error, so bail out.
+        let has_rel = {
+            let rels = self.known_rel_tables.borrow();
+            match edge_type {
+                Some(et) => rels.iter().any(|(rel, _, _)| rel == et),
+                None => !rels.is_empty(),
+            }
+        };
+        if !has_rel {
+            return Vec::new();
+        }
 
         let mut results = Vec::new();
-        for (rel, from, to) in &rel_tables {
-            if (direction == Direction::Outgoing || direction == Direction::Both)
-                && from == &node.node_type
-            {
-                results.extend(self.query_directed_neighbors(
-                    node_id,
-                    &node.node_type,
-                    to,
-                    rel,
-                    "outgoing",
-                    limit,
-                ));
-            }
-            if (direction == Direction::Incoming || direction == Direction::Both)
-                && to == &node.node_type
-            {
-                results.extend(self.query_directed_neighbors(
-                    node_id,
-                    &node.node_type,
-                    from,
-                    rel,
-                    "incoming",
-                    limit,
-                ));
-            }
+        if direction == Direction::Outgoing || direction == Direction::Both {
+            results.extend(self.query_neighbors_directed(node_id, edge_type, "outgoing", limit));
+        }
+        if direction == Direction::Incoming || direction == Direction::Both {
+            results.extend(self.query_neighbors_directed(node_id, edge_type, "incoming", limit));
         }
 
         if limit < results.len() {

@@ -169,3 +169,84 @@ fn invalid_identifiers_are_rejected() {
         .add_node("Thing", props(&[("bad-key", "v")]), Some("x"))
         .is_err());
 }
+
+#[test]
+fn query_neighbors_all_edge_types_and_directions() {
+    let (_tmp, mut store) = open_temp();
+    for id in ["a1", "b1", "c1"] {
+        store
+            .add_node(
+                "Thing",
+                props(&[("node_id", id), ("agent_id", "a")]),
+                Some(id),
+            )
+            .unwrap();
+    }
+    // a1 -LINKS-> b1, a1 -REFS-> c1, c1 -LINKS-> a1
+    store.add_edge("a1", "b1", "LINKS", None).unwrap();
+    store.add_edge("a1", "c1", "REFS", None).unwrap();
+    store.add_edge("c1", "a1", "LINKS", None).unwrap();
+
+    // edge_type=None must return both outgoing edge types in one pass.
+    let out = store.query_neighbors("a1", None, Direction::Outgoing, 10);
+    assert_eq!(out.len(), 2);
+    let mut types: Vec<&str> = out.iter().map(|(e, _)| e.edge_type.as_str()).collect();
+    types.sort_unstable();
+    assert_eq!(types, ["LINKS", "REFS"]);
+
+    // Incoming should see the c1 -LINKS-> a1 edge.
+    let inc = store.query_neighbors("a1", None, Direction::Incoming, 10);
+    assert_eq!(inc.len(), 1);
+    assert_eq!(inc[0].1.node_id, "c1");
+
+    // Both = outgoing + incoming.
+    let both = store.query_neighbors("a1", None, Direction::Both, 10);
+    assert_eq!(both.len(), 3);
+
+    // Filtering by edge_type narrows results.
+    let refs = store.query_neighbors("a1", Some("REFS"), Direction::Outgoing, 10);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].1.node_id, "c1");
+
+    // Unknown edge type yields nothing (no binder error).
+    assert!(store
+        .query_neighbors("a1", Some("NOPE"), Direction::Both, 10)
+        .is_empty());
+}
+
+#[test]
+fn get_node_resolves_across_types_after_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        store
+            .add_node(
+                "Alpha",
+                props(&[("node_id", "x1"), ("name", "ax")]),
+                Some("x1"),
+            )
+            .unwrap();
+        store
+            .add_node(
+                "Beta",
+                props(&[("node_id", "y1"), ("name", "by")]),
+                Some("y1"),
+            )
+            .unwrap();
+        store.close();
+    }
+
+    // Fresh handle: id_table_cache is cold, so get_node exercises the
+    // single-query label-less resolution across multiple node tables.
+    let store = LbugGraphStore::open(&path, Some("s")).unwrap();
+    let beta = store.get_node("y1").expect("beta resolves after reopen");
+    assert_eq!(beta.node_type, "Beta");
+    assert_eq!(beta.properties.get("name").unwrap(), "by");
+
+    let alpha = store.get_node("x1").expect("alpha resolves after reopen");
+    assert_eq!(alpha.node_type, "Alpha");
+
+    // A missing id resolves to None without error.
+    assert!(store.get_node("missing").is_none());
+}
