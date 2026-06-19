@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use crate::memory_types::ProceduralMemory;
 use crate::{MemoryError, Result};
 
-use crate::graph::protocol::GraphStore;
 use tracing::warn;
 
 use super::converters::node_to_procedural;
@@ -14,13 +13,18 @@ use super::CognitiveMemory;
 
 impl CognitiveMemory {
     /// Store a reusable procedure.
+    ///
+    /// Idempotent by `name` within an agent: re-storing a procedure with a name
+    /// that already exists updates the existing node (steps/prerequisites) in
+    /// place and returns its `node_id` rather than creating a duplicate. This
+    /// matches the semantics consumers expect when re-registering procedures
+    /// (e.g. on agent restart) and avoids unbounded duplicate accumulation.
     pub fn store_procedure(
         &mut self,
         name: &str,
         steps: &[String],
         prerequisites: Option<&[String]>,
     ) -> Result<String> {
-        let node_id = new_id("proc");
         let now = ts_now();
         let steps_json = serde_json::to_string(steps).unwrap_or_else(|e| {
             warn!("store_procedure: failed to serialize steps: {e}");
@@ -35,6 +39,19 @@ impl CognitiveMemory {
             })
             .unwrap_or_else(|| "[]".into());
 
+        // Idempotency: dedup by (agent_id, name). If a procedure with this name
+        // already exists, update it in place instead of inserting a duplicate.
+        if let Some(existing_id) = self.find_procedure_id_by_name(name) {
+            let mut update = HashMap::new();
+            update.insert("steps".to_string(), steps_json);
+            update.insert("prerequisites".to_string(), prereqs_json);
+            if !self.graph.update_node(&existing_id, update) {
+                warn!("store_procedure: failed to update existing procedure {existing_id}");
+            }
+            return Ok(existing_id);
+        }
+
+        let node_id = new_id("proc");
         let mut props = HashMap::new();
         props.insert("node_id".to_string(), node_id.clone());
         props.insert("agent_id".to_string(), self.agent_name.clone());
@@ -49,6 +66,18 @@ impl CognitiveMemory {
             .map_err(|e| MemoryError::Storage(e.to_string()))?;
 
         Ok(node_id)
+    }
+
+    /// Return the `node_id` of an existing procedure with `name` for this agent,
+    /// or `None`. Used to make [`store_procedure`](Self::store_procedure) idempotent.
+    fn find_procedure_id_by_name(&self, name: &str) -> Option<String> {
+        let mut filter = agent_filter(&self.agent_name);
+        filter.insert("name".to_string(), name.to_string());
+        self.graph
+            .query_nodes(NT_PROCEDURAL, Some(&filter), 1)
+            .into_iter()
+            .next()
+            .map(|n| n.node_id)
     }
 
     /// Search procedures matching a query.
@@ -90,7 +119,7 @@ impl CognitiveMemory {
             .map(|n| node_to_procedural(&n.properties))
             .collect();
 
-        procs.sort_by(|a, b| b.usage_count.cmp(&a.usage_count));
+        procs.sort_by_key(|p| std::cmp::Reverse(p.usage_count));
         procs.truncate(limit);
         procs
     }

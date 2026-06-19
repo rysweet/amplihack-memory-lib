@@ -67,6 +67,7 @@ impl PySemanticSearchEngine {
 
     /// Check if the search index is ready.
     fn is_indexed(&self) -> bool {
+        #[allow(deprecated)]
         self.inner.is_indexed()
     }
 
@@ -76,10 +77,12 @@ impl PySemanticSearchEngine {
     }
 
     fn __repr__(&self) -> String {
+        #[allow(deprecated)]
+        let indexed = self.inner.is_indexed();
         format!(
             "SemanticSearchEngine(corpus_size={}, indexed={})",
             self.inner.corpus_size(),
-            self.inner.is_indexed()
+            indexed
         )
     }
 }

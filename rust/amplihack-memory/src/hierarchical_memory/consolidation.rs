@@ -113,7 +113,7 @@ impl HierarchicalMemory {
                     }
                 }
                 let mut sorted: Vec<(String, usize)> = concept_counts.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                sorted.sort_by_key(|c| std::cmp::Reverse(c.1));
                 sorted.truncate(limit);
 
                 let count = sorted.len();

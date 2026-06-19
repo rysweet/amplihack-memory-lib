@@ -90,7 +90,7 @@ fn test_link_fact_to_episode_creates_edge() {
     assert!(cm.link_fact_to_episode(&fact_id, &ep_id).is_ok());
 
     // Verify edge exists via graph query
-    use crate::graph::{Direction as Dir, GraphStore};
+    use crate::graph::Direction as Dir;
     let neighbors = cm
         .graph
         .query_neighbors(&fact_id, Some(ET_DERIVES_FROM), Dir::Outgoing, 10);

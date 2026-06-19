@@ -26,8 +26,8 @@ knowledge storage.
 │  │  (FTS5 search)   │    │  │  KuzuGraphStore (feat: kuzu) │     │
 │  ├──────────────────┤    │  │  HiveGraphStore               │    │
 │  │  KuzuBackend     │    │  │  FederatedGraphStore          │    │
-│  │  (feat: kuzu)    │    │  └─────────────────────────────┘     │
-│  ├──────────────────┤    │                                      │
+│  │  (feat: kuzu)    │    │  │  LbugGraphStore (persistent) │     │
+│  ├──────────────────┤    │  └─────────────────────────────┘     │
 │  │  LadybugBackend  │    │                                      │
 │  │  (feat: ladybug) │    │                                      │
 │  └──────────────────┘    │                                      │
@@ -64,7 +64,7 @@ cargo add amplihack-memory --features ladybug
 cargo add amplihack-memory --features python
 ```
 
-**Minimum Supported Rust Version (MSRV):** 1.80
+**Minimum Supported Rust Version (MSRV):** 1.85
 
 ## Feature Flags
 
@@ -73,10 +73,16 @@ cargo add amplihack-memory --features python
 | *(none)*   | ✅      | SQLite backend with FTS5 full-text search, `InMemoryGraphStore`  |
 | `kuzu`     |         | Kuzu graph database via PyO3 bridge — `KuzuBackend` + `KuzuGraphStore` |
 | `ladybug`  |         | Native LadybugDB graph backend — `LadybugBackend`               |
+| `persistent` |       | Durable `CognitiveMemory` over the published `lbug` crate — `LbugGraphStore` |
 | `python`   |         | PyO3 extension module exposing the full API to Python            |
 
 > **Note:** `kuzu` and `ladybug` are mutually exclusive — enabling both produces a
 > compile error.
+>
+> **Note:** `persistent` compiles the LadybugDB (Kùzu) C++ engine from source via
+> the published [`lbug`](https://crates.io/crates/lbug) crate, so it requires
+> `cmake` and a C++ toolchain at build time. It is the same engine consumers like
+> Simard already depend on.
 
 ## Backend Comparison
 
@@ -152,64 +158,101 @@ let relevant = retrieve_relevant_experiences(
 
 ### Using cognitive memory (six types)
 
+`CognitiveMemory` is scoped to a single agent and exposes a `store_*` method for
+each of the six memory types. Every `store_*` call returns the new node id
+(`Result<String>`); the matching reader / search methods (`get_sensory`,
+`get_working`, `get_episodes`, `search_facts`, `search_procedures`,
+`check_triggers`, …) read the stored data back.
+
 ```rust
-use amplihack_memory::{
-    CognitiveMemory, SensoryItem, WorkingMemorySlot,
-    EpisodicMemory, SemanticFact, ProceduralMemory, ProspectiveMemory,
-};
+use amplihack_memory::CognitiveMemory;
 
-let mut memory = CognitiveMemory::new();
+let mut memory = CognitiveMemory::new("checkout-agent")?;
 
-// Sensory — raw short-lived observations
-memory.add_sensory(SensoryItem {
-    modality: "visual".into(),
-    raw_data: "User clicked submit button".into(),
-    observation_order: 1,
-    expires_at: chrono::Utc::now() + chrono::Duration::seconds(30),
-});
+// Sensory — raw short-lived observations.
+// (modality, raw_data, ttl_seconds)
+memory.store_sensory("visual", "User clicked submit button", 30)?;
 
-// Working — bounded active-task context
-memory.add_working(WorkingMemorySlot {
-    slot_type: "task-context".into(),
-    content: "Processing checkout flow".into(),
-    relevance: 0.95,
-    task_id: "task-42".into(),
-});
+// Working — bounded active-task context.
+// (slot_type, content, task_id, relevance)
+memory.store_working("task-context", "Processing checkout flow", "task-42", 0.95)?;
 
-// Episodic — autobiographical event records
-memory.add_episodic(EpisodicMemory {
-    content: "Resolved cart conflict by merging".into(),
-    source_label: "checkout-agent".into(),
-    temporal_index: 1,
-    compressed: false,
-});
+// Episodic — autobiographical event records.
+// (content, source_label, temporal_index, metadata)
+memory.store_episode("Resolved cart conflict by merging", "checkout-agent", None, None)?;
 
-// Semantic — long-lived knowledge facts
-memory.add_semantic(SemanticFact {
-    concept: "cart-merge".into(),
-    content: "When items conflict, prefer the newer addition".into(),
-    confidence: 0.88,
-    source_id: "exp_20250101_120000_abc123".into(),
-    tags: vec!["checkout".into(), "conflict-resolution".into()],
-});
+// Semantic — long-lived knowledge facts.
+// (concept, content, confidence, source_id, tags, metadata)
+let tags = ["checkout".to_string(), "conflict-resolution".to_string()];
+memory.store_fact(
+    "cart-merge",
+    "When items conflict, prefer the newer addition",
+    0.88,
+    "exp_20250101_120000_abc123",
+    Some(&tags),
+    None,
+)?;
 
-// Procedural — reusable step-by-step procedures
-memory.add_procedural(ProceduralMemory {
-    name: "resolve-cart-conflict".into(),
-    steps: vec!["Compare timestamps".into(), "Keep newer item".into()],
-    prerequisites: vec!["cart-access".into()],
-    usage_count: 0,
-});
+// Procedural — reusable step-by-step procedures (idempotent by name).
+// (name, steps, prerequisites)
+let steps = ["Compare timestamps".to_string(), "Keep newer item".to_string()];
+let prereqs = ["cart-access".to_string()];
+memory.store_procedure("resolve-cart-conflict", &steps, Some(&prereqs))?;
 
-// Prospective — future trigger → action pairs
-memory.add_prospective(ProspectiveMemory {
-    description: "Alert on cart abandonment".into(),
-    trigger_condition: "no_activity > 15min".into(),
-    action_on_trigger: "Send reminder email".into(),
-    status: "active".into(),
-    priority: 1,
-});
+// Prospective — future trigger → action pairs.
+// (description, trigger_condition, action_on_trigger, priority)
+memory.store_prospective(
+    "Alert on cart abandonment",
+    "no_activity 15min",
+    "Send reminder email",
+    1,
+)?;
+
+// Recall: keyword search over stored facts (query, limit, min_confidence).
+let facts = memory.search_facts("cart", 10, 0.0);
+
+// Fire any prospective memory whose trigger keywords appear in the content.
+let fired = memory.check_triggers("no_activity detected on the checkout page");
 ```
+
+### Persistent cognitive memory (`persistent` feature)
+
+`CognitiveMemory` talks to its storage exclusively through the `GraphStore`
+trait, so it is backend-pluggable. By default it uses an in-memory store; with
+the `persistent` feature it can be backed by a durable, crash-safe
+[LadybugDB](https://ladybugdb.com/) (Kùzu) database via the published `lbug`
+crate — the same engine downstream consumers already use.
+
+```rust
+use amplihack_memory::CognitiveMemory;
+
+// In-memory (default, unchanged): nothing is persisted.
+let mut mem = CognitiveMemory::new("agent-1")?;
+
+// Durable: data is stored at the given path and survives process restarts.
+// (Requires the `persistent` feature.)
+let mut mem = CognitiveMemory::open_persistent("/var/lib/agent/cognitive.ladybug", "agent-1")?;
+mem.store_fact("rust", "memory safety without a GC", 0.9, "book", None, None)?;
+mem.store_procedure("deploy", &["build".into(), "rollout".into()], None)?;
+drop(mem); // flushes to disk
+
+// Reopen later — facts, procedures, episodes and triggers are all still there.
+let mem = CognitiveMemory::open_persistent("/var/lib/agent/cognitive.ladybug", "agent-1")?;
+assert_eq!(mem.search_facts("safety", 10, 0.0).len(), 1);
+```
+
+You can also plug in any `GraphStore` implementation directly:
+
+```rust,ignore
+let store = Box::new(MyCustomGraphStore::new());
+let mem = CognitiveMemory::with_store("agent-1", store)?;
+```
+
+The persistent backend (`LbugGraphStore`) provides per-write `fsync` durability
+barriers, crash-atomic multi-statement transactions, reopen-safe schema
+introspection, agent isolation, and the corrected retrieval semantics
+(tokenized multi-word recall, keyword-overlap trigger matching, idempotent
+procedure storage). See `src/graph/lbug_store/` for details.
 
 ### Pattern detection
 
@@ -270,17 +313,17 @@ maturin develop --features python
 ### Basic usage from Python
 
 ```python
-from amplihack_memory_rs import PyMemoryConnector, PyExperience
+from amplihack_memory_rs import MemoryConnector, Experience
 
-# Create a connector
-conn = PyMemoryConnector("my-agent", "/tmp/agent-memory", 256)
+# Create a connector (agent_name, db_path)
+conn = MemoryConnector("my-agent", "/tmp/agent-memory")
 
 # Store an experience
-exp = PyExperience("success", "Parsed query", "Found 3 slots", 0.92)
+exp = Experience("success", "Parsed query", "Found 3 slots", 0.92)
 exp_id = conn.store_experience(exp)
 print(f"Stored: {exp_id}")
 
-# Search
+# Search (query, experience_type, min_confidence, limit)
 results = conn.search("query parsing", None, 0.5, 10)
 for r in results:
     print(f"  [{r.confidence:.0%}] {r.context}")
@@ -289,15 +332,17 @@ for r in results:
 ### Cognitive memory and pattern detection
 
 ```python
-from amplihack_memory_rs import PyCognitiveMemory, PyPatternDetector
+from amplihack_memory_rs import CognitiveMemory, PatternDetector
 
-memory = PyCognitiveMemory()
-# Add items to each of the six memory types via add_sensory(),
-# add_working(), add_episodic(), add_semantic(), add_procedural(),
-# add_prospective() methods.
+memory = CognitiveMemory("my-agent")
+# Store items in each of the six memory types via record_sensory(),
+# push_working(), store_episode(), store_fact(), store_procedure(), and
+# store_prospective(); read them back with the matching get_recent_sensory(),
+# recall_working(), recall_episodes(), search_facts(), recall_procedures(),
+# and check_triggers() methods.
 
-detector = PyPatternDetector(threshold=3, min_confidence=0.6)
-# Feed experiences, then query recognised patterns.
+detector = PatternDetector(threshold=3, min_confidence=0.6)
+# Feed experiences via add_discovery(), then query recognised patterns.
 ```
 
 ### Utility functions
@@ -320,12 +365,12 @@ contradiction = detect_contradiction("sky is blue", "sky is green", "sky", "sky"
 | Module                 | Description                                                      |
 |------------------------|------------------------------------------------------------------|
 | `backends`             | `MemoryBackend` / `ExperienceBackend` traits and implementations (SQLite, Kuzu, LadybugDB) |
-| `cognitive_memory`     | Six-type cognitive memory system backed by an in-memory graph    |
+| `cognitive_memory`     | Six-type cognitive memory over a pluggable `GraphStore` (in-memory by default; durable LadybugDB via the `persistent` feature) |
 | `connector`            | `MemoryConnector` — factory for backend lifecycle management     |
 | `contradiction`        | Contradiction detection between semantic facts                   |
 | `entity_extraction`    | Entity-name extraction from free text                            |
 | `experience`           | `Experience` and `ExperienceType` data model                     |
-| `graph`                | `GraphStore` trait with `InMemoryGraphStore`, `HiveGraphStore`, `FederatedGraphStore`, `KuzuGraphStore` |
+| `graph`                | `GraphStore` trait with `InMemoryGraphStore`, `HiveGraphStore`, `FederatedGraphStore`, `KuzuGraphStore`, `LbugGraphStore` (feat: `persistent`) |
 | `hierarchical_memory`  | `HierarchicalMemory` — knowledge graph for Graph RAG retrieval   |
 | `memory_types`         | `MemoryCategory` enum and structs for the six cognitive types    |
 | `pattern_recognition`  | `PatternDetector` and pattern-confidence scoring                 |
@@ -342,8 +387,8 @@ contradiction = detect_contradiction("sky is blue", "sky is green", "sky", "sky"
    before committing.
 2. **Tests** — `cargo test` must pass. Integration tests live in `tests/`.
 3. **Benchmarks** — `cargo bench` (uses Criterion). Benchmark sources are in `benches/`.
-4. **Feature matrix** — test with `--features kuzu`, `--features ladybug`, and
-   default features separately.
+4. **Feature matrix** — test with `--features kuzu`, `--features ladybug`,
+   `--features persistent`, and default features separately.
 
 See [`AGENTS.md`](../../AGENTS.md) in the repository root for full contributor
 guidelines.

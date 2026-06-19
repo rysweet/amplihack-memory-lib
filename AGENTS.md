@@ -4,6 +4,16 @@
 
 ## 🎯 USER PREFERENCES (MANDATORY - MUST FOLLOW)
 
+## Amplihack Copilot Workflow Rules
+
+A recipe-managed workflow is already active for this session.
+
+Do NOT invoke `Skill(skill="dev-orchestrator")`, do NOT run `run_recipe_by_name("smart-orchestrator")`, and do NOT reinterpret the current prompt as a new top-level task.
+
+Follow the current prompt exactly. Return only the requested output format. Use tools only when the prompt explicitly requires them.
+
+## User Preferences
+
 # User Preferences
 
 **MANDATORY**: These preferences MUST be followed by all agents. Priority #2 (only explicit user requirements override).
@@ -45,6 +55,5 @@ Use CONSENSUS_WORKFLOW for: ambiguous requirements, architectural changes, criti
 ## Managing Preferences
 
 Use `/amplihack:customize` to view or modify (`set`, `show`, `reset`, `learn`).
-
 
 <!-- AMPLIHACK_CONTEXT_END -->

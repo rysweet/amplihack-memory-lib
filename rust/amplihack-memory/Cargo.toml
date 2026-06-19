@@ -23,6 +23,9 @@ thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 ladybug-graph-rs = { path = "../../ladybug-graph-rs", optional = true }
+# Published LadybugDB (Kùzu) bindings used by the persistent GraphStore backend.
+# Same crate/version Simard depends on; only pulled in by the `persistent` feature.
+lbug = { version = "=0.15.3", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -36,8 +39,20 @@ harness = false
 [features]
 default = []
 kuzu = ["dep:pyo3", "pyo3/auto-initialize"]
-python = ["dep:pyo3", "pyo3/extension-module"]
+# Enables the PyO3 bindings (the `#[pyclass]` wrappers). On its own this links
+# against libpython, so `cargo test --features python` / `cargo clippy` work in
+# CI. To build the importable extension module, also enable `extension-module`.
+python = ["dep:pyo3"]
+# Build the importable CPython extension module (.so). `pyo3/extension-module`
+# suppresses libpython linkage so symbols resolve against the host interpreter
+# at import time; that makes a standalone `cargo test` binary fail to link, so
+# this is kept opt-in. Enable it only when packaging the extension, e.g.
+# `maturin build --features extension-module`.
+extension-module = ["python", "pyo3/extension-module"]
 ladybug = ["dep:ladybug-graph-rs"]
+# Persistent GraphStore backend over the published LadybugDB (`lbug`) crate.
+# Compiles the LadybugDB C++ engine from source (requires cmake + a C++ toolchain).
+persistent = ["dep:lbug"]
 
 [dependencies.pyo3]
 version = "0.22"

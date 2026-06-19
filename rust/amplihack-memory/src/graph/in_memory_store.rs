@@ -62,7 +62,7 @@ impl InMemoryGraphStore {
         let query_lower = query.to_lowercase();
         self.nodes
             .values()
-            .filter(|n| node_type.map_or(true, |t| n.node_type == t))
+            .filter(|n| node_type.is_none_or(|t| n.node_type == t))
             .filter(|n| {
                 n.properties
                     .values()
@@ -234,7 +234,7 @@ impl GraphStore for InMemoryGraphStore {
     ) -> Vec<(GraphEdge, GraphNode)> {
         let mut results = Vec::new();
 
-        let type_ok = |e: &GraphEdge| edge_type.map_or(true, |et| e.edge_type == et);
+        let type_ok = |e: &GraphEdge| edge_type.is_none_or(|et| e.edge_type == et);
 
         let push_if_valid =
             |edge: &GraphEdge, neighbor_id: &str, results: &mut Vec<(GraphEdge, GraphNode)>| {

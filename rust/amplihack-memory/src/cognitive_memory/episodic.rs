@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use crate::memory_types::EpisodicMemory;
 use crate::{MemoryError, Result};
 
-use crate::graph::protocol::GraphStore;
 use tracing::warn;
 
 use super::converters::node_to_episodic;
@@ -80,14 +79,14 @@ impl CognitiveMemory {
                 if include_compressed {
                     true
                 } else {
-                    n.properties.get("compressed").map_or(true, |v| v != "true")
+                    n.properties.get("compressed").is_none_or(|v| v != "true")
                 }
             })
             .map(|n| node_to_episodic(&n.properties))
             .collect();
 
         // Sort by temporal_index descending
-        episodes.sort_by(|a, b| b.temporal_index.cmp(&a.temporal_index));
+        episodes.sort_by_key(|e| std::cmp::Reverse(e.temporal_index));
         episodes.truncate(limit);
         episodes
     }
@@ -125,7 +124,7 @@ impl CognitiveMemory {
         // Collect un-compressed episodes sorted by temporal_index ascending
         let mut candidates: Vec<(String, String, i64)> = nodes
             .into_iter()
-            .filter(|n| n.properties.get("compressed").map_or(true, |v| v != "true"))
+            .filter(|n| n.properties.get("compressed").is_none_or(|v| v != "true"))
             .map(|mut n| {
                 let tidx: i64 = n
                     .properties

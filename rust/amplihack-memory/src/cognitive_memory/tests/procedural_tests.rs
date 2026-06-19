@@ -70,3 +70,66 @@ fn test_search_procedures_mut_multiple_increments() {
     let procs = cm.search_procedures("build", 10);
     assert_eq!(procs[0].usage_count, 3);
 }
+
+// -- Corrected retrieval semantics (the consumer-fork bugs) --
+
+#[test]
+fn test_search_procedures_tokenized_multiword_or() {
+    let mut cm = make_cm();
+    cm.store_procedure(
+        "release-pipeline",
+        &[
+            "compile sources".into(),
+            "build container image".into(),
+            "deploy".into(),
+        ],
+        None,
+    )
+    .unwrap();
+
+    // Out-of-order, mixed-case, matched across name + steps via tokenized
+    // CONTAINS (not a whole-string match).
+    assert_eq!(
+        cm.search_procedures("IMAGE compile", 10).len(),
+        1,
+        "tokenized procedure recall should match across name and steps"
+    );
+
+    // OR semantics: one overlapping token suffices.
+    assert_eq!(
+        cm.search_procedures("image nonexistent", 10).len(),
+        1,
+        "one overlapping token should match (OR per token)"
+    );
+
+    // No overlap -> no match.
+    assert!(cm.search_procedures("kubernetes helm", 10).is_empty());
+}
+
+#[test]
+fn test_store_procedure_is_idempotent_by_name() {
+    let mut cm = make_cm();
+
+    let id1 = cm
+        .store_procedure("build", &["step-a".into()], None)
+        .unwrap();
+    let id2 = cm
+        .store_procedure("build", &["step-a".into(), "step-b".into()], None)
+        .unwrap();
+
+    // Re-storing the same name reuses the node instead of inserting a duplicate.
+    assert_eq!(id1, id2, "re-storing the same name must reuse the node");
+    assert_eq!(
+        cm.get_memory_stats().get("procedural"),
+        Some(&1),
+        "idempotent store must not accumulate duplicates"
+    );
+
+    // The second store updated the steps in place.
+    let procs = cm.search_procedures("build", 10);
+    assert_eq!(procs.len(), 1);
+    assert_eq!(
+        procs[0].steps,
+        vec!["step-a".to_string(), "step-b".to_string()]
+    );
+}

@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use crate::memory_types::ProspectiveMemory;
 use crate::{MemoryError, Result};
 
-use crate::graph::protocol::GraphStore;
 use tracing::warn;
 
 use super::converters::node_to_prospective;
@@ -65,7 +64,7 @@ impl CognitiveMemory {
             .collect();
 
         // Sort by priority descending
-        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+        candidates.sort_by_key(|pm| std::cmp::Reverse(pm.priority));
 
         let content_lower = content.to_lowercase();
         let mut triggered = Vec::new();

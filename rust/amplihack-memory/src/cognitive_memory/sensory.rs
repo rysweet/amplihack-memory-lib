@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use crate::memory_types::SensoryItem;
 use crate::Result;
 
-use crate::graph::protocol::GraphStore;
 use tracing::warn;
 
 use super::converters::node_to_sensory;
@@ -65,7 +64,7 @@ impl CognitiveMemory {
             .collect();
 
         // Sort by observation_order descending
-        items.sort_by(|a, b| b.observation_order.cmp(&a.observation_order));
+        items.sort_by_key(|i| std::cmp::Reverse(i.observation_order));
         items.truncate(limit);
         items
     }

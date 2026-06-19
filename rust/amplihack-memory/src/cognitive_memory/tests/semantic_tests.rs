@@ -156,3 +156,44 @@ fn test_store_fact_returns_searchable_id() {
     let facts = cm.search_facts("rust", 10, 0.0);
     assert!(facts.iter().any(|f| f.node_id == id));
 }
+
+// -- Corrected retrieval semantics (the consumer-fork bugs) --
+//
+// These guard the tokenized recall behavior at the *default* (in-memory)
+// gate, since the semantics live in the shared cognitive layer and apply to
+// every backend. A regression to whole-string CONTAINS or AND-of-tokens
+// matching would fail here without needing the `persistent` feature.
+
+#[test]
+fn test_search_facts_tokenized_multiword_or() {
+    let mut cm = make_cm();
+    cm.store_fact(
+        "concurrency",
+        "The quick brown fox jumps over the lazy dog",
+        0.8,
+        "src",
+        None,
+        None,
+    )
+    .unwrap();
+
+    // Multi-word, out-of-order, mixed-case query. Tokens are OR-matched as
+    // CONTAINS substrings, NOT a whole-string CONTAINS — "fox quick" is not a
+    // substring of the content, so whole-string matching would return 0.
+    assert_eq!(
+        cm.search_facts("FOX quick", 10, 0.0).len(),
+        1,
+        "tokenized, case-insensitive multi-word recall should match"
+    );
+
+    // OR semantics: a single overlapping token is sufficient even when another
+    // query token is absent. AND-of-tokens matching would return 0 here.
+    assert_eq!(
+        cm.search_facts("FOX elephant", 10, 0.0).len(),
+        1,
+        "one overlapping token should match (OR per token)"
+    );
+
+    // No token overlaps -> no match.
+    assert!(cm.search_facts("elephant zebra", 10, 0.0).is_empty());
+}
