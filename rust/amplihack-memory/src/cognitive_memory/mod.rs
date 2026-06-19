@@ -40,14 +40,14 @@ use types::{
 
 /// Six-type cognitive memory over a pluggable [`GraphStore`] backend.
 ///
-/// The struct owns a `Box<dyn GraphStore>` and provides methods corresponding
+/// The struct owns a `Box<dyn GraphStore + Send>` and provides methods corresponding
 /// to every public method in the Python `CognitiveMemory` class. The default
 /// [`CognitiveMemory::new`] uses an [`InMemoryGraphStore`]; [`CognitiveMemory::with_store`]
 /// accepts any backend, and `CognitiveMemory::open_persistent` (feature
 /// `persistent`) opens a LadybugDB-backed durable instance.
 pub struct CognitiveMemory {
     agent_name: String,
-    graph: Box<dyn GraphStore>,
+    graph: Box<dyn GraphStore + Send>,
     sensory_order: i64,
     temporal_index: i64,
 }
@@ -74,6 +74,9 @@ impl CognitiveMemory {
     ///
     /// This is the seam that makes the cognitive memory backend-pluggable:
     /// supply an in-memory, LadybugDB, or any other `GraphStore` implementation.
+    /// The backend must be [`Send`] so the resulting `CognitiveMemory` can cross
+    /// thread boundaries (required by the PyO3 `#[pyclass]` wrapper and by any
+    /// consumer that moves it between threads).
     /// Counters (`temporal_index`, `sensory_order`) are recovered from any
     /// pre-existing data for this agent so auto-incrementing indices continue
     /// monotonically across reopens.
@@ -81,7 +84,7 @@ impl CognitiveMemory {
     /// # Errors
     ///
     /// Returns `MemoryError::InvalidInput` if `agent_name` is empty.
-    pub fn with_store(agent_name: &str, store: Box<dyn GraphStore>) -> Result<Self> {
+    pub fn with_store(agent_name: &str, store: Box<dyn GraphStore + Send>) -> Result<Self> {
         let trimmed = Self::validate_agent_name(agent_name)?;
         let mut cm = Self {
             agent_name: trimmed,
