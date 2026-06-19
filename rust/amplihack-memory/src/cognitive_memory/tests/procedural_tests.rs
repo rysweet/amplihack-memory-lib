@@ -133,3 +133,35 @@ fn test_store_procedure_is_idempotent_by_name() {
         vec!["step-a".to_string(), "step-b".to_string()]
     );
 }
+
+// -- procedure reinforcement on recall (in-memory mirror) --
+
+#[test]
+fn test_recall_procedure_increments_and_orders_by_usage() {
+    let mut cm = make_cm();
+    cm.store_procedure("alpha task", &["shared work".into()], None)
+        .unwrap();
+    cm.store_procedure("beta task", &["shared work".into()], None)
+        .unwrap();
+
+    // Reinforce alpha via a query that matches only alpha.
+    for _ in 0..3 {
+        let only_alpha = cm.recall_procedure("alpha", 10);
+        assert_eq!(only_alpha.len(), 1);
+        assert_eq!(only_alpha[0].name, "alpha task");
+    }
+
+    // A query matching both returns them ordered by usage_count descending,
+    // carrying pre-increment counts.
+    let both = cm.recall_procedure("shared", 10);
+    assert_eq!(both.len(), 2);
+    assert_eq!(both[0].name, "alpha task");
+    assert_eq!(both[0].usage_count, 3);
+    assert_eq!(both[1].name, "beta task");
+    assert_eq!(both[1].usage_count, 0);
+
+    // The reinforced (post-increment) counts now drive ordering.
+    let ranked = cm.search_procedures("shared", 10);
+    assert_eq!(ranked[0].usage_count, 4);
+    assert_eq!(ranked[1].usage_count, 1);
+}

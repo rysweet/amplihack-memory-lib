@@ -43,6 +43,7 @@ pub(crate) fn episode_to_dict(py: Python<'_>, e: &EpisodicMemory) -> PyResult<Py
     d.set_item("source_label", &e.source_label)?;
     d.set_item("temporal_index", e.temporal_index)?;
     d.set_item("compressed", e.compressed)?;
+    d.set_item("distilled", e.distilled)?;
     d.set_item("created_at", e.created_at.to_rfc3339())?;
     d.set_item("metadata", hashmap_to_pydict(py, &e.metadata)?)?;
     Ok(d.to_object(py))

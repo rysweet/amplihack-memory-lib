@@ -74,6 +74,7 @@ pub(crate) fn node_to_episodic(props: &HashMap<String, String>) -> EpisodicMemor
         source_label: prop_str(props, "source_label"),
         temporal_index: prop_i64(props, "temporal_index"),
         compressed: prop_str(props, "compressed") == "true",
+        distilled: prop_str(props, "distilled") == "true",
         created_at: prop_datetime(props, "created_at"),
         metadata,
     }
