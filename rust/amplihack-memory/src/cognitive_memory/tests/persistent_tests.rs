@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use crate::cognitive_memory::CognitiveMemory;
+use crate::cognitive_memory::WORKING_MEMORY_CAPACITY;
 
 fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
@@ -266,4 +267,354 @@ fn metadata_round_trips_through_persistence() {
             .unwrap(),
         "high"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Gap 1: distilled-episode flag (mark_episode_distilled / list_undistilled_episodes)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn distilled_flag_persists_across_reopen() {
+    let (_tmp, path) = temp_db();
+    let ep;
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        ep = cm
+            .store_episode("episode to distill", "src", Some(1), None)
+            .unwrap();
+
+        // A freshly stored episode is undistilled.
+        let undistilled = cm.list_undistilled_episodes(10);
+        assert_eq!(undistilled.len(), 1);
+        assert!(!undistilled[0].distilled);
+
+        // Mark it distilled (one-way latch).
+        assert!(cm.mark_episode_distilled(&ep));
+        cm.close();
+    } // dropped -> flushed to disk
+
+    let cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+    // The distilled flag survived the reopen.
+    let all = cm.search_episodes(10);
+    assert_eq!(all.len(), 1);
+    assert!(
+        all[0].distilled,
+        "distilled flag must persist across close + reopen"
+    );
+    // And the distilled episode is excluded from the undistilled list.
+    assert!(
+        cm.list_undistilled_episodes(10).is_empty(),
+        "distilled episodes must not appear in list_undistilled_episodes"
+    );
+}
+
+#[test]
+fn list_undistilled_episodes_orders_newest_first_and_honors_limit() {
+    let (_tmp, path) = temp_db();
+    let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+
+    let e1 = cm.store_episode("first", "src", None, None).unwrap(); // temporal_index 1
+    cm.store_episode("second", "src", None, None).unwrap(); // 2
+    cm.store_episode("third", "src", None, None).unwrap(); // 3
+
+    // Distill the oldest episode.
+    assert!(cm.mark_episode_distilled(&e1));
+
+    let undistilled = cm.list_undistilled_episodes(10);
+    assert_eq!(undistilled.len(), 2, "distilled episode must be excluded");
+    // Newest-first ordering by temporal_index.
+    assert_eq!(undistilled[0].content, "third");
+    assert_eq!(undistilled[1].content, "second");
+    assert!(undistilled.iter().all(|e| !e.distilled));
+
+    // The limit argument is honored.
+    let limited = cm.list_undistilled_episodes(1);
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].content, "third");
+}
+
+#[test]
+fn mark_episode_distilled_latch_and_ownership() {
+    let (_tmp, path) = temp_db();
+    let mut alice = CognitiveMemory::open_persistent(&path, "alice").unwrap();
+    let ep = alice
+        .store_episode("alice event", "src", Some(1), None)
+        .unwrap();
+
+    // Unknown id is rejected.
+    assert!(!alice.mark_episode_distilled("epi_does_not_exist"));
+
+    // Owned episode is marked, and the latch is idempotent (stays true).
+    assert!(alice.mark_episode_distilled(&ep));
+    assert!(alice.mark_episode_distilled(&ep));
+
+    // A different agent sharing the DB cannot distill alice's episode.
+    let mut bob = CognitiveMemory::open_persistent(&path, "bob").unwrap();
+    assert!(
+        !bob.mark_episode_distilled(&ep),
+        "cross-agent distill must be rejected (ownership check)"
+    );
+
+    // Alice's episode is still distilled; bob owns nothing undistilled.
+    assert!(alice.list_undistilled_episodes(10).is_empty());
+    assert!(bob.list_undistilled_episodes(10).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Gap 2: procedure reinforcement on recall (usage_count increments + ordering)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recall_procedure_increments_usage_and_persists() {
+    let (_tmp, path) = temp_db();
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        cm.store_procedure("deploy", &steps(&["build", "ship"]), None)
+            .unwrap();
+
+        // First recall reinforces the matched procedure (stored count -> 1).
+        let r1 = cm.recall_procedure("deploy", 10);
+        assert_eq!(r1.len(), 1);
+        assert_eq!(cm.search_procedures("deploy", 10)[0].usage_count, 1);
+
+        // Second recall bumps it again (stored count -> 2).
+        cm.recall_procedure("deploy", 10);
+        assert_eq!(cm.search_procedures("deploy", 10)[0].usage_count, 2);
+        cm.close();
+    }
+
+    // The reinforced usage_count persisted across the reopen.
+    let cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+    assert_eq!(
+        cm.search_procedures("deploy", 10)[0].usage_count,
+        2,
+        "reinforced usage_count must persist across reopen"
+    );
+}
+
+#[test]
+fn recall_procedure_orders_by_usage_desc_and_persists() {
+    let (_tmp, path) = temp_db();
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        // Both procedures share the keyword "shared" via their steps.
+        cm.store_procedure("alpha task", &steps(&["shared work"]), None)
+            .unwrap();
+        cm.store_procedure("beta task", &steps(&["shared work"]), None)
+            .unwrap();
+
+        // Reinforce alpha three times via a query that matches only alpha.
+        for _ in 0..3 {
+            let only_alpha = cm.recall_procedure("alpha", 10);
+            assert_eq!(only_alpha.len(), 1, "'alpha' matches only the alpha task");
+            assert_eq!(only_alpha[0].name, "alpha task");
+        }
+
+        // A query matching both returns them ordered by usage_count descending.
+        let both = cm.recall_procedure("shared", 10);
+        assert_eq!(both.len(), 2);
+        assert_eq!(
+            both[0].name, "alpha task",
+            "more-used procedure ranks first"
+        );
+        assert_eq!(both[1].name, "beta task");
+        assert_eq!(both[0].usage_count, 3);
+        assert_eq!(both[1].usage_count, 0);
+        cm.close();
+    }
+
+    // After reopen the persisted usage drives the same ordering.
+    let cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+    let ranked = cm.search_procedures("shared", 10);
+    assert_eq!(ranked.len(), 2);
+    assert_eq!(ranked[0].name, "alpha task");
+    assert_eq!(ranked[1].name, "beta task");
+    // alpha: 3 (alpha-only recalls) + 1 (the shared recall) = 4; beta: 1 (shared recall).
+    assert_eq!(ranked[0].usage_count, 4);
+    assert_eq!(ranked[1].usage_count, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Gap 3: episodic content keyword search (case-insensitive substring)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn search_episodes_by_keyword_is_case_insensitive_substring() {
+    let (_tmp, path) = temp_db();
+    let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+
+    cm.store_episode("Deployed the Payment service to PROD", "ops", None, None)
+        .unwrap();
+    cm.store_episode("rolled back the cache layer", "ops", None, None)
+        .unwrap();
+    cm.store_episode("Deployed the Payment service again", "ops", None, None)
+        .unwrap();
+
+    // Case-insensitive substring match over content, newest-first.
+    let hits = cm.search_episodes_by_keyword("payment", 10);
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].content, "Deployed the Payment service again");
+    assert_eq!(hits[1].content, "Deployed the Payment service to PROD");
+
+    // Substring (not whole-token) match, case-insensitive.
+    let prod = cm.search_episodes_by_keyword("prod", 10);
+    assert_eq!(prod.len(), 1);
+    assert_eq!(prod[0].content, "Deployed the Payment service to PROD");
+
+    // A non-matching query returns nothing.
+    assert!(cm.search_episodes_by_keyword("kubernetes", 10).is_empty());
+
+    // The limit argument is honored.
+    assert_eq!(cm.search_episodes_by_keyword("payment", 1).len(), 1);
+
+    // Compressed episodes are excluded from keyword search.
+    cm.consolidate_episodes::<fn(&[String]) -> String>(3, None)
+        .unwrap();
+    assert!(
+        cm.search_episodes_by_keyword("payment", 10).is_empty(),
+        "compressed episodes must be excluded from keyword search"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sensory + working durability (round-trip across reopen)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sensory_round_trip_and_ttl_prune_across_reopen() {
+    let (_tmp, path) = temp_db();
+    let valid_id;
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        // Long TTL survives; non-positive TTL is already expired (deterministic, no sleep).
+        valid_id = cm.store_sensory("text", "keep me", 3600).unwrap();
+        cm.store_sensory("text", "drop me", 0).unwrap();
+
+        // The expired item is never returned by get_sensory, even before prune.
+        let live = cm.get_sensory(10);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].raw_data, "keep me");
+        cm.close();
+    }
+
+    let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+    // The valid item survived the reopen.
+    let recalled = cm.get_sensory(10);
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].node_id, valid_id);
+    assert_eq!(recalled[0].raw_data, "keep me");
+
+    // Pruning removes the persisted-but-expired item and keeps the valid one.
+    let pruned = cm.prune_expired_sensory();
+    assert_eq!(pruned, 1, "exactly the expired sensory item is pruned");
+    assert_eq!(cm.get_sensory(10).len(), 1);
+}
+
+#[test]
+fn working_round_trip_and_capacity_eviction_across_reopen() {
+    let (_tmp, path) = temp_db();
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        cm.store_working("goal", "primary goal", "task-1", 0.9)
+            .unwrap();
+        cm.store_working("context", "some context", "task-1", 0.4)
+            .unwrap();
+        // A different task is isolated.
+        cm.store_working("goal", "other-task goal", "task-2", 0.5)
+            .unwrap();
+        cm.close();
+    }
+
+    let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+    // Slots persisted and are returned ordered by relevance descending.
+    let slots = cm.get_working("task-1");
+    assert_eq!(slots.len(), 2);
+    assert_eq!(slots[0].content, "primary goal");
+    assert_eq!(slots[1].content, "some context");
+    assert_eq!(cm.get_working("task-2").len(), 1);
+
+    // Capacity eviction: filling beyond capacity drops the least-relevant slot.
+    cm.clear_working("task-1");
+    for i in 0..WORKING_MEMORY_CAPACITY {
+        // Relevance increases with i, so "slot-0" is the least relevant.
+        let rel = (i as f64 + 1.0) / (WORKING_MEMORY_CAPACITY as f64 + 1.0);
+        cm.store_working("context", &format!("slot-{i}"), "task-cap", rel)
+            .unwrap();
+    }
+    assert_eq!(cm.get_working("task-cap").len(), WORKING_MEMORY_CAPACITY);
+
+    // One more high-relevance slot evicts the least-relevant existing slot ("slot-0").
+    cm.store_working("context", "newcomer", "task-cap", 1.0)
+        .unwrap();
+    let capped = cm.get_working("task-cap");
+    assert_eq!(
+        capped.len(),
+        WORKING_MEMORY_CAPACITY,
+        "working capacity must be enforced"
+    );
+    assert!(
+        !capped.iter().any(|s| s.content == "slot-0"),
+        "least-relevant slot must be evicted at capacity"
+    );
+    assert!(capped.iter().any(|s| s.content == "newcomer"));
+}
+
+// ---------------------------------------------------------------------------
+// Gap 4: episode temporal ordering is monotonic and persists
+// ---------------------------------------------------------------------------
+
+#[test]
+fn episode_temporal_index_is_monotonic_and_persists() {
+    let (_tmp, path) = temp_db();
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        cm.store_episode("e1", "src", None, None).unwrap();
+        cm.store_episode("e2", "src", None, None).unwrap();
+        cm.store_episode("e3", "src", None, None).unwrap();
+
+        let eps = cm.get_episodes(10, false);
+        // Newest-first, with strictly increasing temporal indices.
+        assert_eq!(eps[0].content, "e3");
+        assert_eq!(eps[1].content, "e2");
+        assert_eq!(eps[2].content, "e1");
+        assert!(eps[0].temporal_index > eps[1].temporal_index);
+        assert!(eps[1].temporal_index > eps[2].temporal_index);
+        // Auto-index must be a real monotonic counter, never the always-zero default.
+        assert!(eps.iter().all(|e| e.temporal_index > 0));
+        cm.close();
+    }
+
+    // Counter recovers after reopen: a new auto-index exceeds all persisted ones.
+    let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+    let prev_max = cm
+        .get_episodes(10, false)
+        .iter()
+        .map(|e| e.temporal_index)
+        .max()
+        .unwrap();
+    cm.store_episode("e4", "src", None, None).unwrap();
+    let e4 = cm
+        .get_episodes(10, false)
+        .into_iter()
+        .find(|e| e.content == "e4")
+        .unwrap();
+    assert!(
+        e4.temporal_index > prev_max,
+        "auto temporal_index must keep increasing across reopen"
+    );
+
+    // Consolidation is deterministic oldest-first: the two oldest are compressed.
+    let cons = cm
+        .consolidate_episodes(2, Some(|c: &[String]| c.join(",")))
+        .unwrap()
+        .unwrap();
+    assert!(cons.starts_with("con_"));
+    let remaining = cm.get_episodes(10, false);
+    assert!(remaining.iter().any(|e| e.content == "e3"));
+    assert!(remaining.iter().any(|e| e.content == "e4"));
+    assert!(
+        !remaining.iter().any(|e| e.content == "e1"),
+        "oldest episode (e1) must be consolidated first"
+    );
+    assert!(!remaining.iter().any(|e| e.content == "e2"));
 }
