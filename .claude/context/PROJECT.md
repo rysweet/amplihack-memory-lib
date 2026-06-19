@@ -10,7 +10,7 @@ Replace the sections below with information about your project.
 
 ---
 
-## Project: amlrs
+## Project: issue-84-keystone-de-fork-task-for-amplihack-memory-lib-sim
 
 ## Overview
 
@@ -27,6 +27,8 @@ Replace the sections below with information about your project.
 ### Technology Stack
 
 - **Language**: Python
+- **Language**: JavaScript/TypeScript
+- **Language**: Rust
 - **Framework**: [Main framework if applicable]
 - **Database**: [Database system if applicable]
 
