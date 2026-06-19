@@ -433,7 +433,9 @@ impl GraphStore for LbugGraphStore {
             set_parts.join(", ")
         );
         if self.execute(&cypher).is_ok() {
-            let _ = self.post_write_barrier();
+            if let Err(e) = self.post_write_barrier() {
+                warn!("update_node: durability barrier failed for {node_id}: {e}");
+            }
             true
         } else {
             false
@@ -453,7 +455,9 @@ impl GraphStore for LbugGraphStore {
         );
         if self.execute(&cypher).is_ok() {
             self.id_table_cache.borrow_mut().remove(node_id);
-            let _ = self.post_write_barrier();
+            if let Err(e) = self.post_write_barrier() {
+                warn!("delete_node: durability barrier failed for {node_id}: {e}");
+            }
             true
         } else {
             false
@@ -591,7 +595,9 @@ impl GraphStore for LbugGraphStore {
             escape_cypher(target_id)
         );
         if self.execute(&cypher).is_ok() {
-            let _ = self.post_write_barrier();
+            if let Err(e) = self.post_write_barrier() {
+                warn!("delete_edge: durability barrier failed for {source_id}->{target_id}: {e}");
+            }
             true
         } else {
             false
@@ -625,7 +631,9 @@ impl GraphStore for LbugGraphStore {
         let _guard = self.acquire_lock();
         // Best-effort: flush the WAL into the main DB file so a subsequent open
         // (after this handle is dropped) sees all committed writes.
-        let _ = self.execute("CHECKPOINT");
+        if let Err(e) = self.execute("CHECKPOINT") {
+            warn!("close: CHECKPOINT failed; relying on WAL flush at drop: {e}");
+        }
         self.id_table_cache.borrow_mut().clear();
         self.schema_loaded.set(false);
         self.known_node_tables.borrow_mut().clear();
