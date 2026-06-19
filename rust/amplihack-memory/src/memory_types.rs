@@ -138,6 +138,14 @@ pub struct EpisodicMemory {
     pub temporal_index: i64,
     /// Whether this episode has been compressed during consolidation.
     pub compressed: bool,
+    /// Whether this episode has been distilled into procedural knowledge.
+    ///
+    /// One-way latch: set by `mark_episode_distilled` and never cleared. Used by
+    /// the episode→procedure distillation pipeline to skip already-processed
+    /// episodes. Defaults to `false` for episodes stored before this field
+    /// existed.
+    #[serde(default)]
+    pub distilled: bool,
     /// When this episode was recorded.
     pub created_at: DateTime<Utc>,
     /// Arbitrary key-value metadata attached to the episode.

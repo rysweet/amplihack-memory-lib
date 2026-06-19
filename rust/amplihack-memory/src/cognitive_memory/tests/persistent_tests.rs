@@ -618,3 +618,58 @@ fn episode_temporal_index_is_monotonic_and_persists() {
     );
     assert!(!remaining.iter().any(|e| e.content == "e2"));
 }
+
+// ---------------------------------------------------------------------------
+// Cypher-injection safety: special characters round-trip through persistence
+// ---------------------------------------------------------------------------
+
+#[test]
+fn special_characters_round_trip_safely() {
+    let (_tmp, path) = temp_db();
+
+    // Content and a procedure name laced with Cypher-significant characters:
+    // single quotes, double quotes, backslashes, and a newline. If inputs were
+    // not escaped these would corrupt the generated Cypher (or inject).
+    let nasty_content = "O'Brien said: \"DROP\" \\ all // tables\nline2";
+    let nasty_name = "deploy '; MATCH (n) DETACH DELETE n; //";
+    let nasty_step = "rm -rf / && echo \"don't\"";
+    let ep;
+
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        ep = cm
+            .store_episode(nasty_content, "src", Some(1), None)
+            .unwrap();
+        cm.store_procedure(nasty_name, &steps(&[nasty_step]), None)
+            .unwrap();
+        cm.store_fact("c", nasty_content, 0.9, "s", None, None)
+            .unwrap();
+        cm.close();
+    }
+
+    let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+
+    // The episode survived intact (no truncation, no corruption, no deletion).
+    let episodes = cm.search_episodes(10);
+    assert_eq!(episodes.len(), 1, "no injection deleted the data");
+    assert_eq!(episodes[0].node_id, ep);
+    assert_eq!(episodes[0].content, nasty_content);
+
+    // Keyword search over the escaped content still matches a literal substring.
+    assert_eq!(cm.search_episodes_by_keyword("O'Brien", 10).len(), 1);
+
+    // The procedure name and step round-tripped verbatim.
+    let procs = cm.search_procedures("deploy", 10);
+    assert_eq!(procs.len(), 1);
+    assert_eq!(procs[0].name, nasty_name);
+    assert_eq!(procs[0].steps, steps(&[nasty_step]));
+
+    // Distillation still works on the special-character episode.
+    assert!(cm.mark_episode_distilled(&ep));
+    assert!(cm.list_undistilled_episodes(10).is_empty());
+
+    // The fact persisted with its special-character content intact.
+    let facts = cm.get_all_facts(10);
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].content, nasty_content);
+}

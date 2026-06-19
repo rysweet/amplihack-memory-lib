@@ -139,6 +139,17 @@ impl CognitiveMemory {
         procs
     }
 
+    /// Recall procedures matching `query`, reinforcing each match.
+    ///
+    /// On every recall the matched procedures' persisted `usage_count` is
+    /// incremented (reinforcement), and results are returned ordered by
+    /// `usage_count` descending so frequently-used procedures rank first. The
+    /// returned structs carry the pre-increment counts; the reinforced values
+    /// are what persist and drive subsequent orderings.
+    pub fn recall_procedure(&mut self, query: &str, limit: usize) -> Vec<ProceduralMemory> {
+        self.search_procedures_mut(query, limit)
+    }
+
     /// Deprecated: renamed to [`search_procedures`](Self::search_procedures).
     #[deprecated(since = "0.2.0", note = "renamed to search_procedures")]
     pub fn recall_procedures(&self, query: &str, limit: usize) -> Vec<ProceduralMemory> {

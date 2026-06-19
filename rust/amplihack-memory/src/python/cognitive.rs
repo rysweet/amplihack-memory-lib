@@ -117,6 +117,36 @@ impl PyCognitiveMemory {
             .collect()
     }
 
+    /// Search episodes by case-insensitive substring over content.
+    #[pyo3(signature = (query, limit=10))]
+    fn search_episodes_by_keyword(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        limit: usize,
+    ) -> PyResult<Vec<PyObject>> {
+        self.inner
+            .search_episodes_by_keyword(query, limit)
+            .iter()
+            .map(|e| episode_to_dict(py, e))
+            .collect()
+    }
+
+    /// Mark an episode as distilled (one-way latch). Returns whether it was set.
+    fn mark_episode_distilled(&mut self, episode_id: &str) -> bool {
+        self.inner.mark_episode_distilled(episode_id)
+    }
+
+    /// List episodes that have not yet been distilled (newest-first).
+    #[pyo3(signature = (limit=10))]
+    fn list_undistilled_episodes(&self, py: Python<'_>, limit: usize) -> PyResult<Vec<PyObject>> {
+        self.inner
+            .list_undistilled_episodes(limit)
+            .iter()
+            .map(|e| episode_to_dict(py, e))
+            .collect()
+    }
+
     // -- Semantic --
 
     /// Store a semantic fact.
@@ -189,6 +219,21 @@ impl PyCognitiveMemory {
     ) -> PyResult<Vec<PyObject>> {
         self.inner
             .search_procedures_mut(query, limit)
+            .iter()
+            .map(|p| procedure_to_dict(py, p))
+            .collect()
+    }
+
+    /// Recall procedures matching a query, reinforcing the matches' usage_count.
+    #[pyo3(signature = (query, limit=5))]
+    fn recall_procedure(
+        &mut self,
+        py: Python<'_>,
+        query: &str,
+        limit: usize,
+    ) -> PyResult<Vec<PyObject>> {
+        self.inner
+            .recall_procedure(query, limit)
             .iter()
             .map(|p| procedure_to_dict(py, p))
             .collect()

@@ -54,6 +54,7 @@ impl CognitiveMemory {
         props.insert("source_label".to_string(), source_label.to_string());
         props.insert("temporal_index".to_string(), tidx.to_string());
         props.insert("compressed".to_string(), "false".to_string());
+        props.insert("distilled".to_string(), "false".to_string());
         props.insert("metadata".to_string(), meta_json);
         props.insert("created_at".to_string(), now.to_string());
 
@@ -94,6 +95,80 @@ impl CognitiveMemory {
     /// Search episodes, excluding compressed ones.
     pub fn search_episodes(&self, limit: usize) -> Vec<EpisodicMemory> {
         self.get_episodes(limit, false)
+    }
+
+    /// Search episodes by case-insensitive substring over content.
+    ///
+    /// Returns un-compressed episodes whose lowercased `content` contains the
+    /// lowercased `query`, newest-first (temporal_index descending), capped at
+    /// `limit`. This is a whole-query substring match — distinct from semantic
+    /// fact search, which OR-matches individual tokens.
+    pub fn search_episodes_by_keyword(&self, query: &str, limit: usize) -> Vec<EpisodicMemory> {
+        let query_lc = query.to_lowercase();
+        let filter = agent_filter(&self.agent_name);
+        let nodes = self
+            .graph
+            .query_nodes(NT_EPISODIC, Some(&filter), usize::MAX);
+
+        let mut episodes: Vec<EpisodicMemory> = nodes
+            .into_iter()
+            .filter(|n| n.properties.get("compressed").is_none_or(|v| v != "true"))
+            .filter(|n| {
+                n.properties
+                    .get("content")
+                    .map(|c| c.to_lowercase().contains(&query_lc))
+                    .unwrap_or(false)
+            })
+            .map(|n| node_to_episodic(&n.properties))
+            .collect();
+
+        episodes.sort_by_key(|e| std::cmp::Reverse(e.temporal_index));
+        episodes.truncate(limit);
+        episodes
+    }
+
+    /// Mark an episode as distilled — a one-way latch that persists across reopen.
+    ///
+    /// Returns `true` when the episode exists, is an episodic node owned by this
+    /// agent, and the flag was persisted. Returns `false` for unknown ids,
+    /// non-episode nodes, or episodes owned by a different agent. Idempotent:
+    /// re-marking an already-distilled episode still returns `true`.
+    pub fn mark_episode_distilled(&mut self, episode_id: &str) -> bool {
+        let Some(node) = self.graph.get_node(episode_id) else {
+            return false;
+        };
+        if node.node_type != NT_EPISODIC {
+            return false;
+        }
+        if node.properties.get("agent_id").map(String::as_str) != Some(self.agent_name.as_str()) {
+            return false;
+        }
+        let mut update = HashMap::new();
+        update.insert("distilled".to_string(), "true".to_string());
+        self.graph.update_node(episode_id, update)
+    }
+
+    /// List this agent's episodes that have not yet been distilled.
+    ///
+    /// Excludes episodes whose `distilled` flag is set, ordered newest-first
+    /// (temporal_index descending) and capped at `limit`. Compressed episodes
+    /// are intentionally NOT excluded: distillation may consume any
+    /// not-yet-distilled episode regardless of its consolidation state.
+    pub fn list_undistilled_episodes(&self, limit: usize) -> Vec<EpisodicMemory> {
+        let filter = agent_filter(&self.agent_name);
+        let nodes = self
+            .graph
+            .query_nodes(NT_EPISODIC, Some(&filter), usize::MAX);
+
+        let mut episodes: Vec<EpisodicMemory> = nodes
+            .into_iter()
+            .filter(|n| n.properties.get("distilled").is_none_or(|v| v != "true"))
+            .map(|n| node_to_episodic(&n.properties))
+            .collect();
+
+        episodes.sort_by_key(|e| std::cmp::Reverse(e.temporal_index));
+        episodes.truncate(limit);
+        episodes
     }
 
     /// Deprecated: renamed to [`search_episodes`](Self::search_episodes).
