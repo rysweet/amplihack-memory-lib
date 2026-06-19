@@ -64,7 +64,7 @@ cargo add amplihack-memory --features ladybug
 cargo add amplihack-memory --features python
 ```
 
-**Minimum Supported Rust Version (MSRV):** 1.80
+**Minimum Supported Rust Version (MSRV):** 1.85
 
 ## Feature Flags
 
@@ -232,8 +232,7 @@ use amplihack_memory::CognitiveMemory;
 let mut mem = CognitiveMemory::new("agent-1")?;
 
 // Durable: data is stored at the given path and survives process restarts.
-# #[cfg(feature = "persistent")]
-# {
+// (Requires the `persistent` feature.)
 let mut mem = CognitiveMemory::open_persistent("/var/lib/agent/cognitive.ladybug", "agent-1")?;
 mem.store_fact("rust", "memory safety without a GC", 0.9, "book", None, None)?;
 mem.store_procedure("deploy", &["build".into(), "rollout".into()], None)?;
@@ -242,8 +241,6 @@ drop(mem); // flushes to disk
 // Reopen later — facts, procedures, episodes and triggers are all still there.
 let mem = CognitiveMemory::open_persistent("/var/lib/agent/cognitive.ladybug", "agent-1")?;
 assert_eq!(mem.search_facts("safety", 10, 0.0).len(), 1);
-# }
-# Ok::<(), amplihack_memory::MemoryError>(())
 ```
 
 You can also plug in any `GraphStore` implementation directly:
@@ -373,7 +370,7 @@ contradiction = detect_contradiction("sky is blue", "sky is green", "sky", "sky"
 | `contradiction`        | Contradiction detection between semantic facts                   |
 | `entity_extraction`    | Entity-name extraction from free text                            |
 | `experience`           | `Experience` and `ExperienceType` data model                     |
-| `graph`                | `GraphStore` trait with `InMemoryGraphStore`, `HiveGraphStore`, `FederatedGraphStore`, `KuzuGraphStore` |
+| `graph`                | `GraphStore` trait with `InMemoryGraphStore`, `HiveGraphStore`, `FederatedGraphStore`, `KuzuGraphStore`, `LbugGraphStore` (feat: `persistent`) |
 | `hierarchical_memory`  | `HierarchicalMemory` — knowledge graph for Graph RAG retrieval   |
 | `memory_types`         | `MemoryCategory` enum and structs for the six cognitive types    |
 | `pattern_recognition`  | `PatternDetector` and pattern-confidence scoring                 |
@@ -390,8 +387,8 @@ contradiction = detect_contradiction("sky is blue", "sky is green", "sky", "sky"
    before committing.
 2. **Tests** — `cargo test` must pass. Integration tests live in `tests/`.
 3. **Benchmarks** — `cargo bench` (uses Criterion). Benchmark sources are in `benches/`.
-4. **Feature matrix** — test with `--features kuzu`, `--features ladybug`, and
-   default features separately.
+4. **Feature matrix** — test with `--features kuzu`, `--features ladybug`,
+   `--features persistent`, and default features separately.
 
 See [`AGENTS.md`](../../AGENTS.md) in the repository root for full contributor
 guidelines.
