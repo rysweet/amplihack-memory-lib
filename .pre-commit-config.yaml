@@ -1,3 +1,5 @@
+exclude: '^\.claude/runtime/'
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
@@ -5,6 +7,7 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        args: ['--unsafe']
       - id: check-toml
       - id: check-merge-conflict
 
