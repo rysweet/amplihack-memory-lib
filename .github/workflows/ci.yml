@@ -94,7 +94,15 @@ jobs:
 
       - name: Security audit
         working-directory: rust/amplihack-memory
-        run: cargo audit
+        # pyo3 0.22 is an OPTIONAL dependency (only the python/kuzu features pull
+        # it in; the default build and the persistent/lbug backend do not). It has
+        # two open RUSTSEC advisories whose only fix is a major upgrade to
+        # pyo3 >= 0.29, tracked separately from this de-fork work. cargo-deny's
+        # feature-aware check already excludes pyo3 from the default graph;
+        # cargo-audit scans the whole lockfile, so ignore them explicitly here:
+        #   RUSTSEC-2026-0177 - missing Sync bound on PyCFunction::new_closure
+        #   RUSTSEC-2025-0020 - buffer-overflow risk in PyString::from_object
+        run: cargo audit --ignore RUSTSEC-2026-0177 --ignore RUSTSEC-2025-0020
 
       - name: Install cargo-deny
         run: cargo install cargo-deny
