@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use lbug::{Connection, Database, SystemConfig, Value};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::MemoryError;
 
@@ -129,19 +129,30 @@ impl LbugGraphStore {
     }
 
     /// Run a Cypher statement, discarding the result. Returns an error on failure.
+    ///
+    /// The returned error deliberately omits the Cypher text: because all values
+    /// are interpolated into the query string, embedding it in a propagating
+    /// error would leak stored memory content (and the agent's `agent_id`) into
+    /// logs or any caller that surfaces the error. The full query is emitted at
+    /// `debug` level for operators instead (mirrors the other backends).
     pub(crate) fn execute(&self, cypher: &str) -> crate::Result<()> {
-        self.conn()?
-            .query(cypher)
-            .map_err(|e| MemoryError::Storage(format!("{e}\nCypher: {cypher}")))?;
+        self.conn()?.query(cypher).map_err(|e| {
+            debug!("lbug_store: Cypher execution failed — query: {cypher}");
+            MemoryError::Storage(format!("Cypher execution failed: {e}"))
+        })?;
         Ok(())
     }
 
     /// Run a Cypher query and materialize all result rows.
+    ///
+    /// See [`execute`](Self::execute) for why the interpolated query is not
+    /// included in the returned error.
     pub(crate) fn query_rows(&self, cypher: &str) -> crate::Result<Vec<Vec<Value>>> {
         let conn = self.conn()?;
-        let result = conn
-            .query(cypher)
-            .map_err(|e| MemoryError::Storage(format!("{e}\nCypher: {cypher}")))?;
+        let result = conn.query(cypher).map_err(|e| {
+            debug!("lbug_store: Cypher query failed — query: {cypher}");
+            MemoryError::Storage(format!("Cypher query failed: {e}"))
+        })?;
         Ok(result.collect())
     }
 

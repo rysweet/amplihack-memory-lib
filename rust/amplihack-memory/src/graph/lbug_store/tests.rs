@@ -250,3 +250,31 @@ fn get_node_resolves_across_types_after_reopen() {
     // A missing id resolves to None without error.
     assert!(store.get_node("missing").is_none());
 }
+
+#[test]
+fn execute_error_does_not_leak_query_values() {
+    // A failing statement must not surface interpolated string values (stored
+    // memory content, agent_id) in the propagating error. The engine may echo
+    // schema identifiers (validated to [A-Za-z_][A-Za-z0-9_]*), but never the
+    // single-quoted values; the full query text is logged at debug level only.
+    let (_tmp, store) = open_temp();
+    let secret = "s3cr3t-memory-value";
+
+    let cypher = format!("MATCH (n:Missing) WHERE n.node_id = '{secret}' RETURN bogus_fn(n)");
+    let err = store
+        .execute(&cypher)
+        .expect_err("invalid Cypher should error");
+    assert!(
+        !err.to_string().contains(secret),
+        "error must not leak interpolated values: {err}"
+    );
+
+    let qerr = store
+        .query_rows(&cypher)
+        .expect_err("invalid query should error");
+    assert!(
+        !qerr.to_string().contains(secret),
+        "error must not leak interpolated values: {qerr}"
+    );
+    assert!(qerr.to_string().contains("Cypher query failed"));
+}
