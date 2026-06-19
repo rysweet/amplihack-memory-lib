@@ -24,6 +24,25 @@ fn limit_clause(limit: usize) -> String {
     }
 }
 
+/// Append `n.key = 'value'` equality predicates to `where_parts` for each
+/// supplied filter. Returns `false` if any key is not a safe identifier, in
+/// which case the caller should yield no rows rather than risk injection.
+fn append_equality_filters(
+    where_parts: &mut Vec<String>,
+    filters: Option<&HashMap<String, String>>,
+) -> bool {
+    let Some(filters) = filters else {
+        return true;
+    };
+    for (k, v) in filters {
+        if !is_valid_identifier(k) {
+            return false;
+        }
+        where_parts.push(format!("n.{k} = '{}'", escape_cypher(v)));
+    }
+    true
+}
+
 impl LbugGraphStore {
     /// Build a [`GraphNode`] from an lbug node value.
     ///
@@ -115,6 +134,29 @@ impl LbugGraphStore {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Run `MATCH (n:node_type) [WHERE ...] RETURN n [LIMIT k]` and collect the
+    /// nodes. A missing table (fresh/never-created type) simply yields no rows.
+    fn match_return_nodes(
+        &self,
+        node_type: &str,
+        where_parts: &[String],
+        limit: usize,
+    ) -> Vec<GraphNode> {
+        let where_clause = if where_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_parts.join(" AND "))
+        };
+        let cypher = format!(
+            "MATCH (n:{node_type}){where_clause} RETURN n{}",
+            limit_clause(limit)
+        );
+        match self.query_rows(&cypher) {
+            Ok(rows) => self.collect_nodes(rows, node_type),
+            Err(_) => Vec::new(),
+        }
     }
 
     fn get_node_from_table(&self, node_id: &str, table: &str) -> Option<GraphNode> {
@@ -284,29 +326,10 @@ impl GraphStore for LbugGraphStore {
         let _guard = self.acquire_lock();
 
         let mut where_parts: Vec<String> = Vec::new();
-        if let Some(f) = filters {
-            for (k, v) in f {
-                if !is_valid_identifier(k) {
-                    return Vec::new();
-                }
-                where_parts.push(format!("n.{k} = '{}'", escape_cypher(v)));
-            }
+        if !append_equality_filters(&mut where_parts, filters) {
+            return Vec::new();
         }
-        let where_clause = if where_parts.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", where_parts.join(" AND "))
-        };
-        let cypher = format!(
-            "MATCH (n:{node_type}){where_clause} RETURN n{}",
-            limit_clause(limit)
-        );
-
-        // A missing table (fresh type, or never created) simply yields no rows.
-        match self.query_rows(&cypher) {
-            Ok(rows) => self.collect_nodes(rows, node_type),
-            Err(_) => Vec::new(),
-        }
+        self.match_return_nodes(node_type, &where_parts, limit)
     }
 
     fn search_nodes(
@@ -327,39 +350,19 @@ impl GraphStore for LbugGraphStore {
         }
         let _guard = self.acquire_lock();
 
-        let qlower = escape_cypher(&query.to_lowercase());
         let mut where_parts: Vec<String> = Vec::new();
-
         if !text_fields.is_empty() {
+            let qlower = escape_cypher(&query.to_lowercase());
             let clauses: Vec<String> = text_fields
                 .iter()
                 .map(|fld| format!("lower(n.{fld}) CONTAINS '{qlower}'"))
                 .collect();
             where_parts.push(format!("({})", clauses.join(" OR ")));
         }
-        if let Some(f) = filters {
-            for (k, v) in f {
-                if !is_valid_identifier(k) {
-                    return Vec::new();
-                }
-                where_parts.push(format!("n.{k} = '{}'", escape_cypher(v)));
-            }
+        if !append_equality_filters(&mut where_parts, filters) {
+            return Vec::new();
         }
-
-        let where_clause = if where_parts.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", where_parts.join(" AND "))
-        };
-        let cypher = format!(
-            "MATCH (n:{node_type}){where_clause} RETURN n{}",
-            limit_clause(limit)
-        );
-
-        match self.query_rows(&cypher) {
-            Ok(rows) => self.collect_nodes(rows, node_type),
-            Err(_) => Vec::new(),
-        }
+        self.match_return_nodes(node_type, &where_parts, limit)
     }
 
     fn update_node(&mut self, node_id: &str, properties: HashMap<String, String>) -> bool {

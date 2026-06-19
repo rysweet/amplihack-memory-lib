@@ -20,11 +20,12 @@
 //! * **Reopen-safe** — on first access the existing catalog is introspected
 //!   (`CALL show_tables` / `CALL table_info`) so data written in a previous
 //!   process is visible after `close` + reopen.
-//! * **Durability** — every mutating operation issues a per-write `fsync`
-//!   barrier (data file + parent directory), and multi-statement operations run
-//!   inside a `BEGIN TRANSACTION` / `COMMIT` block so a crash never leaves a
-//!   partially-applied write. Both behaviors are ported from Simard's
-//!   battle-tested native module.
+//! * **Durability** — writes are serialized through a [`Mutex`], every mutating
+//!   operation issues a per-write `fsync` barrier (data file + parent
+//!   directory), and `close` issues a `CHECKPOINT` so a subsequent reopen sees
+//!   all committed writes. Without the barrier a crash between two writes could
+//!   lose an acknowledged write, since LadybugDB only flushes its WAL on
+//!   `Database::drop`.
 //! * **Injection-safe** — table/column/edge identifiers are validated against
 //!   `[A-Za-z_][A-Za-z0-9_]*`, all string values are escaped via `escape_cypher`,
 //!   and `LIMIT` is a type-safe `usize`.
@@ -49,8 +50,6 @@ pub struct LbugGraphStore {
     pub(crate) store_id: String,
     pub(crate) db_path: PathBuf,
     pub(crate) db: Database,
-    /// Whether mutating ops must fsync after every successful write.
-    pub(crate) durable_writes: bool,
     /// Serializes writes and schema-cache mutations across threads.
     pub(crate) lock: Mutex<()>,
     /// Set once the on-disk catalog has been introspected into the caches below.
@@ -108,7 +107,6 @@ impl LbugGraphStore {
             store_id: id,
             db_path: db_path.to_path_buf(),
             db,
-            durable_writes: true,
             lock: Mutex::new(()),
             schema_loaded: Cell::new(false),
             known_node_tables: RefCell::new(HashSet::new()),
@@ -147,29 +145,6 @@ impl LbugGraphStore {
         Ok(result.collect())
     }
 
-    /// Execute multiple statements atomically inside a single transaction.
-    ///
-    /// On any failure a best-effort `ROLLBACK` is issued so no partial state is
-    /// visible to subsequent reads. This is the crash-atomicity primitive used
-    /// by consolidation (multi-write) operations.
-    #[allow(dead_code)]
-    pub(crate) fn execute_in_transaction(&self, statements: &[String]) -> crate::Result<()> {
-        let conn = self.conn()?;
-        conn.query("BEGIN TRANSACTION")
-            .map_err(|e| MemoryError::Storage(format!("BEGIN TRANSACTION failed: {e}")))?;
-        for stmt in statements {
-            if let Err(e) = conn.query(stmt) {
-                let _ = conn.query("ROLLBACK");
-                return Err(MemoryError::Storage(format!("{e}\nCypher: {stmt}")));
-            }
-        }
-        conn.query("COMMIT").map_err(|e| {
-            let _ = conn.query("ROLLBACK");
-            MemoryError::Storage(format!("COMMIT failed: {e}"))
-        })?;
-        Ok(())
-    }
-
     // -- durability ----------------------------------------------------------
 
     /// fsync the database file and its parent directory after a successful write.
@@ -179,9 +154,6 @@ impl LbugGraphStore {
     /// `Database::drop`. Best-effort: a missing data file (LadybugDB may operate
     /// purely from the WAL before its first checkpoint) is tolerated.
     pub(crate) fn post_write_barrier(&self) -> crate::Result<()> {
-        if !self.durable_writes {
-            return Ok(());
-        }
         if self.db_path.exists() {
             if let Err(e) = open_and_fsync(&self.db_path) {
                 if !is_not_found(&e) {
