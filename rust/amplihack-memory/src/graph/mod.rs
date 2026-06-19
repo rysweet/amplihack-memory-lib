@@ -9,6 +9,9 @@ pub mod in_memory_store;
 /// Kùzu-backed persistent graph store (requires the `kuzu` feature).
 #[cfg(feature = "kuzu")]
 pub mod kuzu_store;
+/// LadybugDB-backed persistent graph store (requires the `persistent` feature).
+#[cfg(feature = "persistent")]
+pub mod lbug_store;
 /// Common graph store trait defining the storage protocol.
 pub mod protocol;
 /// Multi-hop graph traversal algorithms.
@@ -25,6 +28,9 @@ pub use in_memory_store::InMemoryGraphStore;
 /// Kùzu-backed graph store implementation.
 #[cfg(feature = "kuzu")]
 pub use kuzu_store::KuzuGraphStore;
+/// LadybugDB-backed persistent graph store implementation.
+#[cfg(feature = "persistent")]
+pub use lbug_store::LbugGraphStore;
 /// The common `GraphStore` trait all backends implement.
 pub use protocol::GraphStore;
 /// Core graph primitives re-exported for convenience.

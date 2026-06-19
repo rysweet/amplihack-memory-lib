@@ -1,5 +1,7 @@
 mod episodic_tests;
 mod integration_tests;
+#[cfg(feature = "persistent")]
+mod persistent_tests;
 mod procedural_tests;
 mod prospective_tests;
 mod semantic_tests;

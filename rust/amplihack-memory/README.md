@@ -73,10 +73,16 @@ cargo add amplihack-memory --features python
 | *(none)*   | ✅      | SQLite backend with FTS5 full-text search, `InMemoryGraphStore`  |
 | `kuzu`     |         | Kuzu graph database via PyO3 bridge — `KuzuBackend` + `KuzuGraphStore` |
 | `ladybug`  |         | Native LadybugDB graph backend — `LadybugBackend`               |
+| `persistent` |       | Durable `CognitiveMemory` over the published `lbug` crate — `LbugGraphStore` |
 | `python`   |         | PyO3 extension module exposing the full API to Python            |
 
 > **Note:** `kuzu` and `ladybug` are mutually exclusive — enabling both produces a
 > compile error.
+>
+> **Note:** `persistent` compiles the LadybugDB (Kùzu) C++ engine from source via
+> the published [`lbug`](https://crates.io/crates/lbug) crate, so it requires
+> `cmake` and a C++ toolchain at build time. It is the same engine consumers like
+> Simard already depend on.
 
 ## Backend Comparison
 
@@ -210,6 +216,48 @@ memory.add_prospective(ProspectiveMemory {
     priority: 1,
 });
 ```
+
+### Persistent cognitive memory (`persistent` feature)
+
+`CognitiveMemory` talks to its storage exclusively through the `GraphStore`
+trait, so it is backend-pluggable. By default it uses an in-memory store; with
+the `persistent` feature it can be backed by a durable, crash-safe
+[LadybugDB](https://ladybugdb.com/) (Kùzu) database via the published `lbug`
+crate — the same engine downstream consumers already use.
+
+```rust
+use amplihack_memory::CognitiveMemory;
+
+// In-memory (default, unchanged): nothing is persisted.
+let mut mem = CognitiveMemory::new("agent-1")?;
+
+// Durable: data is stored at the given path and survives process restarts.
+# #[cfg(feature = "persistent")]
+# {
+let mut mem = CognitiveMemory::open_persistent("/var/lib/agent/cognitive.ladybug", "agent-1")?;
+mem.store_fact("rust", "memory safety without a GC", 0.9, "book", None, None)?;
+mem.store_procedure("deploy", &["build".into(), "rollout".into()], None)?;
+drop(mem); // flushes to disk
+
+// Reopen later — facts, procedures, episodes and triggers are all still there.
+let mem = CognitiveMemory::open_persistent("/var/lib/agent/cognitive.ladybug", "agent-1")?;
+assert_eq!(mem.search_facts("safety", 10, 0.0).len(), 1);
+# }
+# Ok::<(), amplihack_memory::MemoryError>(())
+```
+
+You can also plug in any `GraphStore` implementation directly:
+
+```rust,ignore
+let store = Box::new(MyCustomGraphStore::new());
+let mem = CognitiveMemory::with_store("agent-1", store)?;
+```
+
+The persistent backend (`LbugGraphStore`) provides per-write `fsync` durability
+barriers, crash-atomic multi-statement transactions, reopen-safe schema
+introspection, agent isolation, and the corrected retrieval semantics
+(tokenized multi-word recall, keyword-overlap trigger matching, idempotent
+procedure storage). See `src/graph/lbug_store/` for details.
 
 ### Pattern detection
 

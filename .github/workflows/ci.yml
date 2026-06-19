@@ -77,6 +77,14 @@ jobs:
         working-directory: rust/amplihack-memory
         run: cargo test --features python
 
+      # persistent feature compiles the LadybugDB (lbug) C++ engine from source,
+      # which is slow on shared runners — keep it non-blocking for now while it
+      # provides upstream coverage of the persistent GraphStore backend.
+      - name: Run tests (persistent feature)
+        working-directory: rust/amplihack-memory
+        continue-on-error: true
+        run: cargo test --features persistent
+
       - name: Build docs
         working-directory: rust/amplihack-memory
         run: cargo doc --no-deps

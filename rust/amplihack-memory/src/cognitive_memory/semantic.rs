@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use crate::memory_types::SemanticFact;
 use crate::{MemoryError, Result};
 
-use crate::graph::protocol::GraphStore;
 use tracing::warn;
 
 use super::converters::node_to_fact;

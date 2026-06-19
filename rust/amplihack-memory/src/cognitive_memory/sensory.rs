@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use crate::memory_types::SensoryItem;
 use crate::Result;
 
-use crate::graph::protocol::GraphStore;
 use tracing::warn;
 
 use super::converters::node_to_sensory;
