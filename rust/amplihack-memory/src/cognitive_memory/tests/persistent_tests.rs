@@ -90,6 +90,11 @@ fn tokenized_multiword_fact_recall() {
     let hits = cm.search_facts("FOX quick", 10, 0.0);
     assert_eq!(hits.len(), 1, "multi-word tokenized recall should match");
 
+    // OR semantics: a single overlapping token suffices even when another query
+    // token is absent (an AND/whole-string match would return 0 here).
+    let or_hit = cm.search_facts("FOX elephant", 10, 0.0);
+    assert_eq!(or_hit.len(), 1, "one overlapping token should match (OR)");
+
     // A token that does not appear must not match.
     let misses = cm.search_facts("elephant", 10, 0.0);
     assert!(misses.is_empty());
@@ -110,6 +115,13 @@ fn tokenized_multiword_procedure_recall() {
     // Query words match across name + steps, case-insensitively.
     let hits = cm.search_procedures("IMAGE compile", 10);
     assert_eq!(hits.len(), 1, "tokenized procedure recall should match");
+
+    // OR semantics: a single overlapping token suffices.
+    let or_hit = cm.search_procedures("image nonexistent", 10);
+    assert_eq!(or_hit.len(), 1, "one overlapping token should match (OR)");
+
+    // No overlapping token -> no match.
+    assert!(cm.search_procedures("kubernetes helm", 10).is_empty());
 }
 
 #[test]
