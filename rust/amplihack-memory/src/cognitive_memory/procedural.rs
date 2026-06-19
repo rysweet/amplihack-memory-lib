@@ -119,7 +119,7 @@ impl CognitiveMemory {
             .map(|n| node_to_procedural(&n.properties))
             .collect();
 
-        procs.sort_by(|a, b| b.usage_count.cmp(&a.usage_count));
+        procs.sort_by_key(|p| std::cmp::Reverse(p.usage_count));
         procs.truncate(limit);
         procs
     }

@@ -64,7 +64,7 @@ impl CognitiveMemory {
             .collect();
 
         // Sort by priority descending
-        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+        candidates.sort_by_key(|pm| std::cmp::Reverse(pm.priority));
 
         let content_lower = content.to_lowercase();
         let mut triggered = Vec::new();
