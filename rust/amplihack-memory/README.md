@@ -274,7 +274,8 @@ killed mid-write and the write-ahead log (WAL) is left partially written:
   no-op for the in-memory backend.
 - **Bounded loss / auto-checkpoint.** The store auto-checkpoints after every
   `AUTO_CHECKPOINT_WRITES` (128) mutating operations and always on `close` /
-  `Drop`, and lets LadybugDB checkpoint by size as a safety net. An unclean
+  `Drop`, and leaves LadybugDB's own `auto_checkpoint` enabled to bound the WAL
+  as a safety net. An unclean
   shutdown therefore strands at most a small, bounded number of writes in the
   WAL rather than every uncheckpointed record.
 
