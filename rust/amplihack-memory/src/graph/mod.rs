@@ -30,7 +30,7 @@ pub use in_memory_store::InMemoryGraphStore;
 pub use kuzu_store::KuzuGraphStore;
 /// LadybugDB-backed persistent graph store implementation.
 #[cfg(feature = "persistent")]
-pub use lbug_store::LbugGraphStore;
+pub use lbug_store::{LbugGraphStore, WalRecovery, WalRecoveryOutcome};
 /// The common `GraphStore` trait all backends implement.
 pub use protocol::GraphStore;
 /// Core graph primitives re-exported for convenience.

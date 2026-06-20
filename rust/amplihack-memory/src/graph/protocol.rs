@@ -87,6 +87,17 @@ pub trait GraphStore {
         node_filter: Option<&HashMap<String, String>>,
     ) -> TraversalResult;
 
+    /// Flush any write-ahead log into durable storage so a subsequent reopen
+    /// needs no replay. A no-op for volatile backends (the default).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend supports checkpointing but the flush
+    /// fails.
+    fn checkpoint(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
     /// Release resources held by the store.
     fn close(&mut self);
 }

@@ -276,6 +276,7 @@ impl GraphStore for LbugGraphStore {
         let cypher = format!("CREATE (:{node_type} {{{}}})", parts.join(", "));
         self.execute(&cypher)?;
         self.post_write_barrier()?;
+        self.note_write_and_maybe_checkpoint();
 
         self.id_table_cache
             .borrow_mut()
@@ -436,6 +437,7 @@ impl GraphStore for LbugGraphStore {
             if let Err(e) = self.post_write_barrier() {
                 warn!("update_node: durability barrier failed for {node_id}: {e}");
             }
+            self.note_write_and_maybe_checkpoint();
             true
         } else {
             false
@@ -458,6 +460,7 @@ impl GraphStore for LbugGraphStore {
             if let Err(e) = self.post_write_barrier() {
                 warn!("delete_node: durability barrier failed for {node_id}: {e}");
             }
+            self.note_write_and_maybe_checkpoint();
             true
         } else {
             false
@@ -516,6 +519,7 @@ impl GraphStore for LbugGraphStore {
         );
         self.execute(&cypher)?;
         self.post_write_barrier()?;
+        self.note_write_and_maybe_checkpoint();
 
         Ok(GraphEdge {
             edge_id: eid,
@@ -598,6 +602,7 @@ impl GraphStore for LbugGraphStore {
             if let Err(e) = self.post_write_barrier() {
                 warn!("delete_edge: durability barrier failed for {source_id}->{target_id}: {e}");
             }
+            self.note_write_and_maybe_checkpoint();
             true
         } else {
             false
@@ -627,11 +632,16 @@ impl GraphStore for LbugGraphStore {
         )
     }
 
+    fn checkpoint(&self) -> crate::Result<()> {
+        let _guard = self.acquire_lock();
+        self.do_checkpoint()
+    }
+
     fn close(&mut self) {
         let _guard = self.acquire_lock();
         // Best-effort: flush the WAL into the main DB file so a subsequent open
         // (after this handle is dropped) sees all committed writes.
-        if let Err(e) = self.execute("CHECKPOINT") {
+        if let Err(e) = self.do_checkpoint() {
             warn!("close: CHECKPOINT failed; relying on WAL flush at drop: {e}");
         }
         self.id_table_cache.borrow_mut().clear();
