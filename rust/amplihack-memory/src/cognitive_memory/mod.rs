@@ -27,11 +27,13 @@ use std::collections::HashMap;
 
 use crate::graph::in_memory_store::InMemoryGraphStore;
 use crate::graph::protocol::GraphStore;
+use crate::graph::types::Direction;
 use crate::memory_types::MemoryCategory;
 use crate::{MemoryError, Result};
 
 use types::{
-    agent_filter, NT_EPISODIC, NT_PROCEDURAL, NT_PROSPECTIVE, NT_SEMANTIC, NT_SENSORY, NT_WORKING,
+    agent_filter, ts_now, NT_EPISODIC, NT_PROCEDURAL, NT_PROSPECTIVE, NT_SEMANTIC, NT_SENSORY,
+    NT_WORKING,
 };
 
 // ---------------------------------------------------------------------------
@@ -273,6 +275,49 @@ impl CognitiveMemory {
     /// Alias matching the Python method name `get_statistics`.
     pub fn get_statistics(&self) -> HashMap<String, usize> {
         self.get_memory_stats()
+    }
+
+    // ======================================================================
+    // PROVENANCE (shared helpers)
+    // ======================================================================
+
+    /// Return `true` if `id` refers to an existing episodic-memory node.
+    ///
+    /// Used to gate provenance-edge creation: a `DERIVES_FROM` /
+    /// `PROCEDURE_DERIVES_FROM` edge may only target a real
+    /// [`EpisodicMemory`](crate::memory_types::EpisodicMemory) node, and both
+    /// graph backends reject [`add_edge`](crate::graph::GraphStore::add_edge)
+    /// for a missing endpoint, so callers must pre-check.
+    fn is_source_episode(&self, id: &str) -> bool {
+        self.graph
+            .get_node(id)
+            .is_some_and(|n| n.node_type == NT_EPISODIC)
+    }
+
+    /// Create a provenance edge `source_id --edge_type--> episode_id` carrying a
+    /// `derived_at` timestamp. Both endpoints must already exist.
+    fn add_provenance_edge(
+        &mut self,
+        source_id: &str,
+        episode_id: &str,
+        edge_type: &str,
+    ) -> Result<()> {
+        let mut props = HashMap::new();
+        props.insert("derived_at".to_string(), ts_now().to_string());
+        self.graph
+            .add_edge(source_id, episode_id, edge_type, Some(props))
+            .map_err(|e| MemoryError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Return the ids of every node reachable from `node_id` along an outgoing
+    /// `edge_type` edge. Empty for unknown ids or nodes with no such edges.
+    fn provenance_targets(&self, node_id: &str, edge_type: &str) -> Vec<String> {
+        self.graph
+            .query_neighbors(node_id, Some(edge_type), Direction::Outgoing, usize::MAX)
+            .into_iter()
+            .map(|(_, node)| node.node_id)
+            .collect()
     }
 
     // ======================================================================

@@ -140,3 +140,98 @@ fn test_get_memory_stats_all_categories() {
     assert!(stats.contains_key("prospective"));
     assert!(stats.contains_key("total"));
 }
+
+// ===========================================================================
+// Provenance edges (issue #90): plural linking + typed read path
+//
+// File: rust/amplihack-memory/src/cognitive_memory/tests/integration_tests.rs
+//
+// Failing-first TDD tests for the not-yet-implemented `link_fact_to_episodes`,
+// `fact_provenance`, and `procedure_provenance`.
+// ===========================================================================
+
+/// `link_fact_to_episodes` is lenient and returns the count of edges actually
+/// created: 2 valid + 1 missing episode id -> returns 2, two edges present.
+/// (Invariants I2, I3.)
+#[test]
+fn test_link_fact_to_episodes_counts_created_edges() {
+    let mut cm = make_cm();
+    let fact = cm
+        .store_fact("topic", "a general fact", 0.8, "", None, None)
+        .unwrap();
+    let ep1 = cm.store_episode("episode one", "src", None, None).unwrap();
+    let ep2 = cm.store_episode("episode two", "src", None, None).unwrap();
+
+    let created = cm
+        .link_fact_to_episodes(
+            &fact,
+            &[ep1.clone(), ep2.clone(), "epi_missing".to_string()],
+        )
+        .expect("link_fact_to_episodes is lenient and must succeed");
+    assert_eq!(
+        created, 2,
+        "only the two valid episodes should be linked (the missing id is skipped)"
+    );
+
+    use crate::graph::Direction as Dir;
+    let neighbors = cm
+        .graph
+        .query_neighbors(&fact, Some(ET_DERIVES_FROM), Dir::Outgoing, 10);
+    assert_eq!(neighbors.len(), 2);
+    let targets: std::collections::HashSet<String> =
+        neighbors.iter().map(|(_, n)| n.node_id.clone()).collect();
+    assert!(targets.contains(&ep1));
+    assert!(targets.contains(&ep2));
+
+    // Read path agrees.
+    let mut prov = cm.fact_provenance(&fact);
+    prov.sort();
+    let mut want = vec![ep1, ep2];
+    want.sort();
+    assert_eq!(prov, want);
+}
+
+/// The typed read methods return the linked episode ids and `[]` for unknown
+/// ids or nodes with no provenance, for both facts and procedures. They keep
+/// the `graph` field private from external consumers. (Invariant I8.)
+#[test]
+fn test_fact_and_procedure_provenance_read_path() {
+    let mut cm = make_cm();
+
+    // Unknown ids return empty (no panic).
+    assert!(cm.fact_provenance("does-not-exist").is_empty());
+    assert!(cm.procedure_provenance("does-not-exist").is_empty());
+
+    let ep1 = cm.store_episode("ep one", "src", None, None).unwrap();
+    let ep2 = cm.store_episode("ep two", "src", None, None).unwrap();
+
+    // A node with no provenance edges returns [].
+    let plain = cm
+        .store_fact("c", "no provenance", 0.5, "", None, None)
+        .unwrap();
+    assert!(cm.fact_provenance(&plain).is_empty());
+
+    // A fact stored with provenance surfaces all its source episodes.
+    let fact = cm
+        .store_fact_with_provenance(
+            "c",
+            "derived",
+            0.9,
+            "",
+            None,
+            None,
+            &[ep1.clone(), ep2.clone()],
+        )
+        .unwrap();
+    let mut got = cm.fact_provenance(&fact);
+    got.sort();
+    let mut want = vec![ep1.clone(), ep2.clone()];
+    want.sort();
+    assert_eq!(got, want, "fact_provenance must return all linked episodes");
+
+    // Procedure read path mirrors the fact read path.
+    let proc = cm
+        .store_procedure_with_provenance("p", &["s".to_string()], None, std::slice::from_ref(&ep1))
+        .unwrap();
+    assert_eq!(cm.procedure_provenance(&proc), vec![ep1]);
+}

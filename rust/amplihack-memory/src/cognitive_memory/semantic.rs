@@ -16,6 +16,10 @@ impl CognitiveMemory {
     ///
     /// Vector embeddings are not available in the Rust port; keyword search
     /// is used for retrieval.
+    ///
+    /// Backward-compatible: this is exactly
+    /// [`store_fact_with_provenance`](Self::store_fact_with_provenance) with no
+    /// source episodes, so it never creates provenance edges.
     pub fn store_fact(
         &mut self,
         concept: &str,
@@ -25,10 +29,121 @@ impl CognitiveMemory {
         tags: Option<&[String]>,
         metadata: Option<&HashMap<String, serde_json::Value>>,
     ) -> Result<String> {
+        self.store_fact_with_provenance(
+            concept,
+            content,
+            confidence,
+            source_id,
+            tags,
+            metadata,
+            &[],
+        )
+    }
+
+    /// Store a semantic fact and link it to the episodes it was derived from.
+    ///
+    /// Identical to [`store_fact`](Self::store_fact) but additionally creates a
+    /// `DERIVES_FROM` edge from the new fact node to each id in
+    /// `source_episode_ids`, turning the flat fact store into a connected
+    /// provenance graph. `source_id` remains an opaque string property and is
+    /// never auto-converted into an edge.
+    ///
+    /// Lenient: a source-episode id that does not resolve to an existing
+    /// [`EpisodicMemory`](crate::memory_types::EpisodicMemory) node is skipped
+    /// with a warning rather than failing the call. Use
+    /// [`store_fact_with_provenance_strict`](Self::store_fact_with_provenance_strict)
+    /// to reject missing episodes instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError::InvalidInput` if `confidence` is outside
+    /// `0.0..=1.0`, or `MemoryError::Storage` if the node or an edge cannot be
+    /// persisted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_fact_with_provenance(
+        &mut self,
+        concept: &str,
+        content: &str,
+        confidence: f64,
+        source_id: &str,
+        tags: Option<&[String]>,
+        metadata: Option<&HashMap<String, serde_json::Value>>,
+        source_episode_ids: &[String],
+    ) -> Result<String> {
+        self.store_fact_with_provenance_inner(
+            concept,
+            content,
+            confidence,
+            source_id,
+            tags,
+            metadata,
+            source_episode_ids,
+            false,
+        )
+    }
+
+    /// Strict variant of
+    /// [`store_fact_with_provenance`](Self::store_fact_with_provenance): any id
+    /// in `source_episode_ids` that is not an existing episode node makes the
+    /// whole call fail with `MemoryError::InvalidInput` and write zero edges
+    /// (validate-then-emit atomicity).
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError::InvalidInput` if `confidence` is out of range or
+    /// any source episode is missing, or `MemoryError::Storage` on a backend
+    /// failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_fact_with_provenance_strict(
+        &mut self,
+        concept: &str,
+        content: &str,
+        confidence: f64,
+        source_id: &str,
+        tags: Option<&[String]>,
+        metadata: Option<&HashMap<String, serde_json::Value>>,
+        source_episode_ids: &[String],
+    ) -> Result<String> {
+        self.store_fact_with_provenance_inner(
+            concept,
+            content,
+            confidence,
+            source_id,
+            tags,
+            metadata,
+            source_episode_ids,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_fact_with_provenance_inner(
+        &mut self,
+        concept: &str,
+        content: &str,
+        confidence: f64,
+        source_id: &str,
+        tags: Option<&[String]>,
+        metadata: Option<&HashMap<String, serde_json::Value>>,
+        source_episode_ids: &[String],
+        strict: bool,
+    ) -> Result<String> {
         if confidence.is_nan() || !(0.0..=1.0).contains(&confidence) {
             return Err(MemoryError::InvalidInput(
                 "confidence must be between 0.0 and 1.0".into(),
             ));
+        }
+
+        // Validate-then-emit: in strict mode reject before any write so a
+        // failure leaves neither a node nor any provenance edge behind.
+        if strict {
+            for ep in source_episode_ids {
+                if !self.is_source_episode(ep) {
+                    return Err(MemoryError::InvalidInput(format!(
+                        "source episode {ep} not found"
+                    )));
+                }
+            }
         }
 
         let node_id = new_id("sem");
@@ -64,6 +179,17 @@ impl CognitiveMemory {
         self.graph
             .add_node(NT_SEMANTIC, props, Some(&node_id))
             .map_err(|e| MemoryError::Storage(e.to_string()))?;
+
+        for ep in source_episode_ids {
+            if self.is_source_episode(ep) {
+                self.add_provenance_edge(&node_id, ep, ET_DERIVES_FROM)?;
+            } else {
+                warn!(
+                    "store_fact_with_provenance: source episode {ep} not found; \
+                     skipping DERIVES_FROM edge"
+                );
+            }
+        }
 
         Ok(node_id)
     }
@@ -177,5 +303,43 @@ impl CognitiveMemory {
             .add_edge(fact_id, episode_id, ET_DERIVES_FROM, Some(props))
             .map_err(|e| MemoryError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    /// Link a fact to several source episodes at once, returning how many edges
+    /// were actually created.
+    ///
+    /// Lenient, mirroring
+    /// [`store_fact_with_provenance`](Self::store_fact_with_provenance): each id
+    /// in `episode_ids` that resolves to an existing episode node gets a
+    /// `DERIVES_FROM` edge from `fact_id`; ids that do not are skipped with a
+    /// warning. The returned count reflects only the edges created.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError::Storage` if the backend rejects an edge whose
+    /// endpoints both exist (e.g. `fact_id` itself is missing).
+    pub fn link_fact_to_episodes(
+        &mut self,
+        fact_id: &str,
+        episode_ids: &[String],
+    ) -> Result<usize> {
+        let mut created = 0;
+        for ep in episode_ids {
+            if self.is_source_episode(ep) {
+                self.add_provenance_edge(fact_id, ep, ET_DERIVES_FROM)?;
+                created += 1;
+            } else {
+                warn!("link_fact_to_episodes: source episode {ep} not found; skipping");
+            }
+        }
+        Ok(created)
+    }
+
+    /// Return the ids of the episodes a fact was derived from.
+    ///
+    /// Reads the `DERIVES_FROM` provenance edges outgoing from `fact_id`.
+    /// Returns an empty vector for an unknown id or a fact with no provenance.
+    pub fn fact_provenance(&self, fact_id: &str) -> Vec<String> {
+        self.provenance_targets(fact_id, ET_DERIVES_FROM)
     }
 }

@@ -69,4 +69,13 @@ pub(crate) const ET_CONSOLIDATES: &str = "CONSOLIDATES";
 /// Edge-type label for similarity links between nodes.
 pub(crate) const ET_SIMILAR_TO: &str = "SIMILAR_TO";
 /// Edge-type label indicating one node derives from another.
+///
+/// Used for semantic-fact provenance: `SemanticMemory --DERIVES_FROM--> EpisodicMemory`.
 pub(crate) const ET_DERIVES_FROM: &str = "DERIVES_FROM";
+/// Edge-type label indicating a procedure derives from a source episode.
+///
+/// Used for procedural provenance:
+/// `ProceduralMemory --PROCEDURE_DERIVES_FROM--> EpisodicMemory`. A dedicated
+/// edge type (rather than reusing [`ET_DERIVES_FROM`]) keeps fact and procedure
+/// provenance independently queryable.
+pub(crate) const ET_PROCEDURE_DERIVES_FROM: &str = "PROCEDURE_DERIVES_FROM";
