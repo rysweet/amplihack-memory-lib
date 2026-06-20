@@ -152,6 +152,10 @@ pub use cognitive_memory::{
     compute_content_hash, DedupAction, DedupMode, DedupOptions, DuplicateFactGroup, FactInput,
     ProvenanceOptions, PruneReport, RetentionPolicy, StoreFactOutcome,
 };
+/// Ranked-recall scoring types and pure scoring primitives.
+pub use cognitive_memory::{
+    exp_decay, keyword_jaccard, usage_boost, AccessKind, RecallOptions, RecallWeights, Scored,
+};
 /// Automatic `SIMILAR_TO` linking options and report types.
 pub use cognitive_memory::{SimilarityOptions, SimilarityReport, StoreFactOptions};
 /// Backend selector and memory connector entry point.

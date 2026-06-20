@@ -7,6 +7,7 @@ mod integration_tests;
 mod persistent_tests;
 mod procedural_tests;
 mod prospective_tests;
+mod ranked_tests;
 mod semantic_tests;
 mod sensory_tests;
 mod similarity_tests;

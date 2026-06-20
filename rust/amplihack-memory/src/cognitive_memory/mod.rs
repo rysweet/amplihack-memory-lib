@@ -17,6 +17,7 @@ mod dedup;
 mod episodic;
 mod procedural;
 mod prospective;
+mod ranked;
 mod semantic;
 mod sensory;
 mod similarity;
@@ -26,6 +27,9 @@ mod working;
 pub use dedup::{
     compute_content_hash, DedupAction, DedupMode, DedupOptions, DuplicateFactGroup, FactInput,
     ProvenanceOptions, PruneReport, RetentionPolicy, StoreFactOptions, StoreFactOutcome,
+};
+pub use ranked::{
+    exp_decay, keyword_jaccard, usage_boost, AccessKind, RecallOptions, RecallWeights, Scored,
 };
 pub use similarity::{SimilarityOptions, SimilarityReport};
 pub use types::WORKING_MEMORY_CAPACITY;

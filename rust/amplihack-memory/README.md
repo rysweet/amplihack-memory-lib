@@ -356,6 +356,93 @@ See [`docs/similarity_linking.md`](docs/similarity_linking.md) for the full
 reference, threshold-tuning guidance, directionality semantics, and a worked
 tutorial.
 
+### Ranked recall (importance / recency / usage / graph)
+
+Alongside the keyword-only `search_facts` / `search_episodes_by_keyword`,
+`CognitiveMemory` can **rank** recalled memories by a blend of six deterministic
+signals — text relevance, confidence, importance, recency, usage, and graph
+proximity — so a recent, high-importance, frequently-used fact outranks an old
+low-confidence keyword match. Scoring is plain arithmetic over fields the crate
+already stores: Jaccard keyword overlap, a half-life recency decay, a logarithmic
+usage boost, and neighbour overlap over existing `DERIVES_FROM` / `SIMILAR_TO`
+edges. No embeddings, no network calls.
+
+```text
+score(x) = w_text       · keyword_jaccard(q, text(x))
+         + w_confidence  · confidence(x)            // facts only; 0 for episodes
+         + w_importance  · importance(x)            // facts only; 0 for episodes
+         + w_recency     · exp_decay(age(x), half_life)
+         + w_usage       · usage_boost(usage_count(x))
+         + w_graph       · best_edge_score(x, q, max_graph_hops)
+```
+
+Recall is **additive and backward compatible** (the existing keyword search is
+unchanged), **same-agent only**, and **lifecycle-aware** — archived and
+superseded facts and compressed episodes are excluded by default. It is also
+**access-tracking**: ranked recall (and the explicit `record_access`) bump a
+memory's `usage_count` and `last_accessed_at`, persisted across reopen, so
+frequently- and recently-used memories float to the top over time.
+
+`RecallOptions` (build with `..Default::default()`) controls a call:
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `limit` | `10` | Max items returned (`0` ⇒ empty). |
+| `min_confidence` | `0.0` | Drop facts below this confidence (no-op for episodes). |
+| `include_archived` | `false` | Surface archived facts when `true`. |
+| `include_superseded` | `false` | Surface superseded facts when `true`. |
+| `max_graph_hops` | `1` | Neighbour traversal depth (`0` disables; clamped ≤ 3). |
+| `recency_half_life_seconds` | `604_800.0` | Recency half-life (7 days; `≤ 0` disables recency). |
+| `record_access` | `true` | Bump usage for returned items; `false` for a pure read. |
+| `weights` | `RecallWeights::default()` | The six weights (`text 1.0, confidence 0.7, importance 0.5, recency 0.4, usage 0.3, graph 0.6`). |
+
+> Note: a fact's `importance` defaults to its `confidence` on the `store_fact`
+> path, so the default `confidence` + `importance` weights act on the same value
+> (≈ `1.2 · confidence`) unless you set importance independently via `upsert_fact`.
+
+```rust
+use amplihack_memory::{CognitiveMemory, RecallOptions, RecallWeights, Scored, AccessKind};
+
+let mut mem = CognitiveMemory::new("research-agent")?;
+let rust = ["rust".to_string()];
+let _old   = mem.store_fact("rust-async", "early notes on rust async runtimes",
+                            0.2, "s-old", Some(&rust), None)?;
+let fresh  = mem.store_fact("rust-async", "tokio is the de-facto rust async runtime",
+                            0.9, "s-fresh", Some(&rust), None)?;
+for _ in 0..5 { mem.record_access(&fresh, AccessKind::Read)?; }
+
+// Ranked by the combined score: the fresh/important/used fact ranks first.
+let hits = mem.recall_facts_ranked("rust async runtime", RecallOptions::default())?;
+assert_eq!(hits[0].item.content, "tokio is the de-facto rust async runtime");
+for Scored { item, score, reasons } in &hits {
+    println!("{score:.3}  {}  {:?}", item.content, reasons);
+}
+
+// Tune weights and take a side-effect-free read of the top 3.
+let opts = RecallOptions {
+    limit: 3,
+    record_access: false,
+    weights: RecallWeights { recency: 2.0, graph: 0.0, ..RecallWeights::default() },
+    ..RecallOptions::default()
+};
+let _top3 = mem.recall_facts_ranked("rust async", opts)?;
+```
+
+Each result is a `Scored<T> { item, score, reasons }`; `reasons` is a
+numeric/label-only explanation (e.g. `"recency 0.40 (age=120s)"`,
+`"graph 0.30 (SIMILAR_TO hop1)"`) that never leaks content or the query.
+`recall_episodes_ranked` is the episode analogue (episodes carry no
+confidence/importance, so those terms are `0`). The pure scoring primitives
+`keyword_jaccard`, `exp_decay`, and `usage_boost` are public and re-exported for
+independent use. Recall is **same-agent isolated**, **NaN-safe** (sorts with
+`f64::total_cmp`, never panics on hostile floats), and one implementation serves
+both the in-memory and `--features persistent` backends — no schema migration,
+no `GraphStore` change.
+
+See [`docs/ranked_recall.md`](docs/ranked_recall.md) for the full reference —
+the scoring model, the graph term, weight tuning, access tracking, the security
+model, and a worked tutorial.
+
 ### Pattern detection
 
 ```rust
@@ -467,7 +554,7 @@ contradiction = detect_contradiction("sky is blue", "sky is green", "sky", "sky"
 | Module                 | Description                                                      |
 |------------------------|------------------------------------------------------------------|
 | `backends`             | `MemoryBackend` / `ExperienceBackend` traits and implementations (SQLite, Kuzu, LadybugDB) |
-| `cognitive_memory`     | Six-type cognitive memory over a pluggable `GraphStore` (in-memory by default; durable LadybugDB via the `persistent` feature); optional automatic `SIMILAR_TO` linking between related facts |
+| `cognitive_memory`     | Six-type cognitive memory over a pluggable `GraphStore` (in-memory by default; durable LadybugDB via the `persistent` feature); optional automatic `SIMILAR_TO` linking between related facts; ranked recall (importance/recency/usage/graph scoring) with access tracking |
 | `connector`            | `MemoryConnector` — factory for backend lifecycle management     |
 | `contradiction`        | Contradiction detection between semantic facts                   |
 | `entity_extraction`    | Entity-name extraction from free text                            |
