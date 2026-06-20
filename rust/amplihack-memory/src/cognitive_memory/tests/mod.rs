@@ -8,4 +8,5 @@ mod procedural_tests;
 mod prospective_tests;
 mod semantic_tests;
 mod sensory_tests;
+mod similarity_tests;
 mod working_tests;

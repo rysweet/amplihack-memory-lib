@@ -18,9 +18,11 @@ mod procedural;
 mod prospective;
 mod semantic;
 mod sensory;
+mod similarity;
 mod types;
 mod working;
 
+pub use similarity::{SimilarityOptions, SimilarityReport, StoreFactOptions};
 pub use types::WORKING_MEMORY_CAPACITY;
 
 use std::collections::HashMap;

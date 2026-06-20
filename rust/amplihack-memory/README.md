@@ -278,6 +278,84 @@ killed mid-write and the write-ahead log (WAL) is left partially written:
   as a safety net. An unclean shutdown therefore strands at most a small,
   bounded number of writes in the WAL rather than every uncheckpointed record.
 
+### Automatic `SIMILAR_TO` linking between facts
+
+`CognitiveMemory` can automatically connect related semantic facts with
+`SIMILAR_TO` edges, so knowledge about the same topic becomes traversable
+without manual bookkeeping. Similarity is computed with the crate's existing
+deterministic helpers — no embeddings, no network calls: a composite **Jaccard**
+score that blends word overlap (0.5), tag overlap (0.2), and concept overlap
+(0.3). The word and concept components are tokenized first — lower-cased, with
+English stop words and tokens of two characters or fewer removed — so only
+meaningful words drive the score. An edge is created when that score is **at or
+above** a configurable threshold (default `0.60`).
+
+Linking is **opt-in and additive** — `store_fact` and
+`store_fact_with_provenance` are unchanged and never create `SIMILAR_TO` edges
+on their own. You drive it explicitly with `auto_link_similar_facts`, in bulk
+with `rebuild_similarity_links`, or at store time with `store_fact_with_options`.
+Linking is strictly **same-agent** and **idempotent** — existing edges are never
+duplicated.
+
+`SimilarityOptions` controls the behaviour (it is `Copy`; pass
+`&SimilarityOptions::default()` for the defaults):
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `enabled` | `bool` | `true` | Master switch. `false` makes every entry point an inert no-op. |
+| `threshold` | `f64` | `0.60` | Inclusive composite score (`>=`) required to create an edge. |
+| `candidate_limit` | `usize` | `50` | Max other same-agent facts scored per source fact, taken highest-confidence first. |
+| `bidirectional` | `bool` | `true` | Also create the reciprocal `B → A` edge. |
+
+```rust
+use amplihack_memory::{CognitiveMemory, SimilarityOptions, StoreFactOptions};
+
+let mut mem = CognitiveMemory::new("research-agent")?;
+
+let rust_tags = ["rust".to_string()];
+let a = mem.store_fact("rust-safety",
+    "the rust borrow checker guarantees memory safety", 0.9, "s1", Some(&rust_tags), None)?;
+let _b = mem.store_fact("rust-safety",
+    "rust enforces memory safety at compile time via its borrow checker", 0.85, "s2", Some(&rust_tags), None)?;
+let _c = mem.store_fact("cooking",
+    "simmer onions in butter until soft", 0.8, "s3", Some(&["food".to_string()]), None)?;
+
+// Explicit: link `a` to every fact at/above the threshold (here: `b`, not `c`).
+// Returns the number of NEW unordered pairs linked this call.
+let linked = mem.auto_link_similar_facts(&a, &SimilarityOptions::default())?;
+assert_eq!(linked, 1);
+
+// Idempotent: a second call creates nothing new.
+assert_eq!(mem.auto_link_similar_facts(&a, &SimilarityOptions::default())?, 0);
+
+// Backfill / maintenance across the whole agent (additive, non-destructive).
+let report = mem.rebuild_similarity_links(&SimilarityOptions::default())?;
+println!("processed {} facts, {} new links", report.facts_processed, report.links_created);
+
+// Opt-in store-time linking: wire up each new fact as it lands.
+let opts = StoreFactOptions { similarity: Some(SimilarityOptions::default()) };
+let _id = mem.store_fact_with_options("rust-safety",
+    "memory safety in rust comes from ownership and the borrow checker",
+    0.88, "s4", Some(&rust_tags), None, &[], &opts)?;
+```
+
+Each auto-created edge is `SemanticMemory --SIMILAR_TO--> SemanticMemory` between
+two facts of the same agent, carrying a single `similarity_score` property — the
+score as a fixed 4-decimal string (e.g. `"0.7321"`), parseable with
+`parse::<f64>()`. With `StoreFactOptions::default()` (`similarity: None`),
+`store_fact_with_options` is a byte-for-byte drop-in for
+`store_fact_with_provenance` and creates no edges. On the `persistent` backend,
+`SIMILAR_TO` edges and their scores are durable — they survive `checkpoint()`,
+`drop`, and reopen.
+
+This feature is **write-only for now**: it creates `SIMILAR_TO` edges but does
+not yet add a public API to read them back (the graph is a private field; a
+`similar_facts` reader is a deliberate, backward-compatible future addition).
+
+See [`docs/similarity_linking.md`](docs/similarity_linking.md) for the full
+reference, threshold-tuning guidance, directionality semantics, and a worked
+tutorial.
+
 ### Pattern detection
 
 ```rust
@@ -389,7 +467,7 @@ contradiction = detect_contradiction("sky is blue", "sky is green", "sky", "sky"
 | Module                 | Description                                                      |
 |------------------------|------------------------------------------------------------------|
 | `backends`             | `MemoryBackend` / `ExperienceBackend` traits and implementations (SQLite, Kuzu, LadybugDB) |
-| `cognitive_memory`     | Six-type cognitive memory over a pluggable `GraphStore` (in-memory by default; durable LadybugDB via the `persistent` feature) |
+| `cognitive_memory`     | Six-type cognitive memory over a pluggable `GraphStore` (in-memory by default; durable LadybugDB via the `persistent` feature); optional automatic `SIMILAR_TO` linking between related facts |
 | `connector`            | `MemoryConnector` — factory for backend lifecycle management     |
 | `contradiction`        | Contradiction detection between semantic facts                   |
 | `entity_extraction`    | Entity-name extraction from free text                            |

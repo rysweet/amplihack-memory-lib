@@ -147,6 +147,8 @@ pub use backends::LadybugBackend;
 pub use backends::{ExperienceBackend, MemoryBackend, SqliteBackend};
 /// Unified cognitive memory interface over the graph layer.
 pub use cognitive_memory::CognitiveMemory;
+/// Automatic `SIMILAR_TO` linking options and report types.
+pub use cognitive_memory::{SimilarityOptions, SimilarityReport, StoreFactOptions};
 /// Backend selector and memory connector entry point.
 pub use connector::{BackendType, MemoryConnector};
 /// Hierarchical knowledge graph with classification, subgraph queries, and edge types.
