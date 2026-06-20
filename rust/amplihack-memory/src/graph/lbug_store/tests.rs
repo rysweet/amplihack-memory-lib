@@ -278,3 +278,192 @@ fn execute_error_does_not_leak_query_values() {
     );
     assert!(qerr.to_string().contains("Cypher query failed"));
 }
+
+// ---------------------------------------------------------------------------
+// Durability: corrupt-WAL recovery + checkpoint API + auto-checkpoint
+// ---------------------------------------------------------------------------
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use super::{wal_path_for, WalRecoveryOutcome};
+
+/// Insert `n` simple nodes into a fresh "T" table.
+fn add_things(store: &mut LbugGraphStore, start: usize, n: usize) {
+    for i in start..start + n {
+        let id = format!("n{i}");
+        store
+            .add_node(
+                "T",
+                props(&[("node_id", &id), ("agent_id", "a")]),
+                Some(&id),
+            )
+            .unwrap();
+    }
+}
+
+/// Copy every file in `from` into a fresh dir, returning the dir + the copied
+/// db path. Mimics snapshotting the on-disk state of a killed process.
+fn crash_snapshot(from: &Path, db_name: &str) -> (tempfile::TempDir, PathBuf) {
+    let crash = tempfile::tempdir().unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let p = entry.unwrap().path();
+        if p.is_file() {
+            fs::copy(&p, crash.path().join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    let db = crash.path().join(db_name);
+    (crash, db)
+}
+
+/// Truncate `wal` mid-record so a strict open fails to replay it.
+fn corrupt_wal_tail(wal: &Path) {
+    let len = fs::metadata(wal).unwrap().len();
+    assert!(len > 64, "WAL should be non-empty to corrupt: {}", len);
+    let f = fs::OpenOptions::new().write(true).open(wal).unwrap();
+    f.set_len(len - 41).unwrap();
+    f.sync_all().unwrap();
+}
+
+#[test]
+fn checkpoint_makes_clean_reopen_need_no_wal_replay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+    let wal = wal_path_for(&path);
+
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        store.set_checkpoint_interval(0); // keep everything in the WAL until we ask
+        add_things(&mut store, 0, 40);
+        // The WAL holds the writes; checkpoint folds them into the main DB file.
+        store.checkpoint().unwrap();
+        // After a checkpoint there is nothing left to replay.
+        let wal_len = fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            wal_len == 0 || !wal.exists(),
+            "WAL should be empty/absent after checkpoint, was {wal_len} bytes"
+        );
+        assert_eq!(store.pending_writes(), 0, "checkpoint resets write counter");
+        // Forget so Drop/close doesn't run another checkpoint — prove the
+        // explicit checkpoint alone made the data durable.
+        std::mem::forget(store);
+    }
+
+    // A strict reopen (the one that crashes on a bad WAL) succeeds and sees all
+    // records, because the checkpoint left no WAL to replay.
+    let store = LbugGraphStore::open(&path, Some("s")).unwrap();
+    assert_eq!(store.count_all_nodes(), 40);
+}
+
+#[test]
+fn open_with_recovery_survives_corrupt_wal_and_returns_checkpointed_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        store.set_checkpoint_interval(0);
+        // Durable batch: checkpointed into the main DB file.
+        add_things(&mut store, 0, 30);
+        store.checkpoint().unwrap();
+        // Uncheckpointed batch: lives only in the WAL.
+        add_things(&mut store, 30, 30);
+        std::mem::forget(store); // unclean: no close, no final checkpoint
+    }
+
+    // Snapshot the on-disk files and corrupt the WAL tail of the copy.
+    let (crash, crash_db) = crash_snapshot(path.parent().unwrap(), "graph.ladybug");
+    let crash_wal = wal_path_for(&crash_db);
+    assert!(crash_wal.exists(), "snapshot must include the WAL");
+    corrupt_wal_tail(&crash_wal);
+
+    // A strict open of the corrupt copy must fail (this is the incident).
+    assert!(
+        LbugGraphStore::open(&crash_db, Some("s")).is_err(),
+        "strict open of a corrupt WAL should error"
+    );
+
+    // Recovery opens successfully (no crash) and reports the outcome.
+    let (store, report) =
+        LbugGraphStore::open_with_recovery(&crash_db, Some("s")).expect("recovery must open");
+    assert_eq!(report.outcome, WalRecoveryOutcome::RecoveredPrefix);
+    assert!(report.recovered(), "report should flag that recovery ran");
+    assert!(
+        report.recovered_records >= 30,
+        "at least the 30 checkpointed records must survive, got {}",
+        report.recovered_records
+    );
+    assert_eq!(store.count_all_nodes(), report.recovered_records);
+
+    // The corrupt WAL was moved aside (never deleted).
+    let quarantine = report.quarantined_wal.expect("a quarantine path");
+    assert!(
+        quarantine.exists(),
+        "corrupt WAL must be preserved at {quarantine:?}"
+    );
+    assert!(quarantine
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .contains(".corrupt-"));
+
+    drop(store);
+
+    // Recovery checkpointed the survivors, so a subsequent STRICT reopen of the
+    // same path now needs no replay and no longer crashes.
+    let reopened = LbugGraphStore::open(&crash_db, Some("s")).expect("clean reopen after recovery");
+    assert!(reopened.count_all_nodes() >= 30);
+
+    drop(crash);
+}
+
+#[test]
+fn open_with_recovery_is_a_noop_on_a_clean_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        add_things(&mut store, 0, 10);
+        store.close();
+    }
+    let (store, report) = LbugGraphStore::open_with_recovery(&path, Some("s")).unwrap();
+    assert_eq!(report.outcome, WalRecoveryOutcome::Clean);
+    assert!(!report.recovered());
+    assert!(report.quarantined_wal.is_none());
+    assert_eq!(store.count_all_nodes(), 10);
+}
+
+#[test]
+fn auto_checkpoint_bounds_uncheckpointed_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+
+    let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+    store.set_checkpoint_interval(4); // checkpoint every 4 writes
+    add_things(&mut store, 0, 10); // checkpoints fire after writes 4 and 8
+    assert!(
+        store.pending_writes() < 4,
+        "at most interval-1 writes may be uncheckpointed, was {}",
+        store.pending_writes()
+    );
+
+    // Snapshot, drop the WAL entirely (simulate total WAL loss), strict-open:
+    // only the auto-checkpointed records survive — and there must be some,
+    // proving auto-checkpoint persisted data with no explicit checkpoint/close.
+    let (crash, crash_db) = crash_snapshot(path.parent().unwrap(), "graph.ladybug");
+    std::mem::forget(store);
+    let crash_wal = wal_path_for(&crash_db);
+    let _ = fs::remove_file(&crash_wal);
+
+    let recovered = LbugGraphStore::open(&crash_db, Some("s")).unwrap();
+    let n = recovered.count_all_nodes();
+    assert!(
+        n >= 8,
+        "auto-checkpoint should have persisted >= 8 of 10 records, got {n}"
+    );
+    assert!(
+        n < 10,
+        "the last writes should still have been WAL-only, got {n}"
+    );
+    drop(crash);
+}

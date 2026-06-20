@@ -20,12 +20,24 @@
 //! * **Reopen-safe** — on first access the existing catalog is introspected
 //!   (`CALL show_tables` / `CALL table_info`) so data written in a previous
 //!   process is visible after `close` + reopen.
-//! * **Durability** — writes are serialized through a [`Mutex`], every mutating
+//! * **Durability** — writes are serialized through a [`Mutex`](std::sync::Mutex), every mutating
 //!   operation issues a per-write `fsync` barrier (data file + parent
 //!   directory), and `close` issues a `CHECKPOINT` so a subsequent reopen sees
 //!   all committed writes. Without the barrier a crash between two writes could
 //!   lose an acknowledged write, since LadybugDB only flushes its WAL on
 //!   `Database::drop`.
+//! * **Bounded crash loss** — the store auto-checkpoints after every
+//!   [`AUTO_CHECKPOINT_WRITES`](crate::graph::lbug_store::AUTO_CHECKPOINT_WRITES) mutating operations (and always on `close` /
+//!   `Drop`), flushing the write-ahead log into the main database file. An
+//!   unclean shutdown therefore loses at most the handful of writes accumulated
+//!   since the last checkpoint, rather than every uncheckpointed record.
+//! * **Corrupt-WAL recovery** — [`LbugGraphStore::open_with_recovery`] opens a
+//!   store whose WAL was left partially written by an unclean shutdown. A strict
+//!   open is attempted first; if it fails because the WAL replay cannot complete
+//!   (the failure mode that previously made the store permanently unopenable),
+//!   the corrupt WAL is quarantined to `<wal>.corrupt-<ts>`, a resilient open
+//!   replays the good prefix, and a `CHECKPOINT` folds the recovered records into
+//!   the main database file so a subsequent clean reopen needs no replay.
 //! * **Injection-safe** — table/column/edge identifiers are validated against
 //!   `[A-Za-z_][A-Za-z0-9_]*`, all string values are escaped via `escape_cypher`,
 //!   and `LIMIT` is a type-safe `usize`.
@@ -37,13 +49,65 @@ mod tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use lbug::{Connection, Database, SystemConfig, Value};
 use tracing::{debug, warn};
 
 use crate::MemoryError;
+
+/// Number of mutating operations after which the store auto-checkpoints,
+/// folding the write-ahead log into the main database file. This bounds how
+/// much acknowledged-but-uncheckpointed data an unclean shutdown can strand in
+/// the WAL (and therefore put at risk if that WAL is later found corrupt).
+pub const AUTO_CHECKPOINT_WRITES: u64 = 128;
+
+/// How [`LbugGraphStore::open_with_recovery`] opened the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalRecoveryOutcome {
+    /// The write-ahead log replayed cleanly; no recovery was performed and no
+    /// artifact was written.
+    Clean,
+    /// A corrupt WAL tail was quarantined; the good prefix was replayed and
+    /// checkpointed into the main database file.
+    RecoveredPrefix,
+    /// The WAL was unusable even in resilient mode; it was quarantined and the
+    /// store was opened from the last good checkpoint only.
+    CheckpointOnly,
+}
+
+/// Structured report describing a recovery open. Surfaced via a `warn!` log and
+/// returned from [`LbugGraphStore::open_with_recovery`] so callers (and tests)
+/// can see how many records survived and where the corrupt WAL was moved.
+#[derive(Debug, Clone)]
+pub struct WalRecovery {
+    /// How the store was opened.
+    pub outcome: WalRecoveryOutcome,
+    /// Number of records (graph nodes) present after recovery. Only computed on
+    /// a recovery path; `0` for [`WalRecoveryOutcome::Clean`].
+    pub recovered_records: usize,
+    /// Where the corrupt WAL (and any sidecars) were quarantined, if recovery
+    /// ran. The bad WAL is moved aside — never deleted.
+    pub quarantined_wal: Option<PathBuf>,
+}
+
+impl WalRecovery {
+    fn clean() -> Self {
+        Self {
+            outcome: WalRecoveryOutcome::Clean,
+            recovered_records: 0,
+            quarantined_wal: None,
+        }
+    }
+
+    /// `true` if a corrupt WAL was detected and recovery (of any kind) ran.
+    pub fn recovered(&self) -> bool {
+        self.outcome != WalRecoveryOutcome::Clean
+    }
+}
 
 /// LadybugDB-backed persistent [`GraphStore`](crate::graph::protocol::GraphStore).
 pub struct LbugGraphStore {
@@ -60,6 +124,11 @@ pub struct LbugGraphStore {
     pub(crate) known_rel_tables: RefCell<HashSet<(String, String, String)>>,
     /// node_id -> node table, to resolve a node's label without scanning.
     pub(crate) id_table_cache: RefCell<HashMap<String, String>>,
+    /// Mutating operations applied since the last checkpoint.
+    pub(crate) writes_since_checkpoint: Cell<u64>,
+    /// Auto-checkpoint after this many writes (`0` disables count-based
+    /// checkpointing; used by tests that need data to remain in the WAL).
+    pub(crate) checkpoint_interval: Cell<u64>,
 }
 
 // SAFETY: lbug::Database is internally synchronized (it declares Send + Sync).
@@ -70,11 +139,149 @@ unsafe impl Send for LbugGraphStore {}
 impl LbugGraphStore {
     /// Open (or create) a LadybugDB database at `db_path`.
     ///
+    /// This is the strict open: if the on-disk write-ahead log cannot be fully
+    /// replayed (e.g. it was left partially written by an unclean shutdown) this
+    /// returns an error. Use [`open_with_recovery`](Self::open_with_recovery)
+    /// (or [`CognitiveMemory::open_persistent`](crate::cognitive_memory::CognitiveMemory::open_persistent),
+    /// which wraps it) to tolerate a corrupt WAL.
+    ///
     /// # Errors
     ///
     /// Returns [`MemoryError::Storage`] if the parent directory cannot be created
     /// or the database cannot be opened.
     pub fn open(db_path: &Path, store_id: Option<&str>) -> crate::Result<Self> {
+        Self::prepare_parent(db_path)?;
+        let db = open_database(db_path, true).map_err(|e| {
+            MemoryError::Storage(format!(
+                "failed to open LadybugDB at {}: {e}",
+                db_path.display()
+            ))
+        })?;
+        Ok(Self::from_parts(db, db_path, store_id))
+    }
+
+    /// Open (or create) a LadybugDB database at `db_path`, recovering from a
+    /// corrupt / partially-written WAL instead of failing.
+    ///
+    /// A strict [`open`](Self::open) is attempted first. If it succeeds the store
+    /// is returned with [`WalRecoveryOutcome::Clean`] and no artifact is written.
+    /// If the strict open fails *and* a WAL file is present (the signature of an
+    /// unclean shutdown), the WAL — which can no longer be replayed — is
+    /// quarantined to `<wal>.corrupt-<unix_ts>` (moved aside, never deleted), a
+    /// resilient open replays the recoverable prefix, and a `CHECKPOINT` folds
+    /// the recovered records into the main database file so the next clean reopen
+    /// needs no replay. The returned [`WalRecovery`] reports the outcome and how
+    /// many records survived; a `warn!` is also emitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Storage`] if the database cannot be opened even
+    /// after quarantining the WAL (e.g. the parent directory is unwritable or the
+    /// main database file itself is unreadable).
+    pub fn open_with_recovery(
+        db_path: &Path,
+        store_id: Option<&str>,
+    ) -> crate::Result<(Self, WalRecovery)> {
+        Self::prepare_parent(db_path)?;
+
+        // 1. Fast path: strict open. A corrupt WAL surfaces as Err (lbug/cxx
+        //    converts the C++ replay assertion into a Rust error rather than
+        //    aborting); catch_unwind additionally contains any panic.
+        match try_open_database(db_path, true) {
+            Ok(db) => Ok((
+                Self::from_parts(db, db_path, store_id),
+                WalRecovery::clean(),
+            )),
+            Err(strict_err) => {
+                let wal = wal_path_for(db_path);
+                if !wal.exists() {
+                    // No WAL: the failure is not WAL-replay related (bad path,
+                    // quota, permissions, ...). Surface it unchanged.
+                    return Err(MemoryError::Storage(format!(
+                        "failed to open LadybugDB at {}: {strict_err}",
+                        db_path.display()
+                    )));
+                }
+                warn!(
+                    db_path = %db_path.display(),
+                    error = %strict_err,
+                    "lbug_store: WAL replay failed on open; attempting recovery"
+                );
+                Self::recover(db_path, store_id, &wal)
+            }
+        }
+    }
+
+    /// Recovery slow path: quarantine the corrupt WAL, then open resiliently and
+    /// checkpoint, falling back to a checkpoint-only open if even that fails.
+    fn recover(
+        db_path: &Path,
+        store_id: Option<&str>,
+        wal: &Path,
+    ) -> crate::Result<(Self, WalRecovery)> {
+        // Preserve the incident artifact *before* a resilient open (which will
+        // consume/truncate the WAL) gets a chance to mutate it.
+        let quarantine = quarantine_path(wal);
+        let copied = copy_wal_aside(db_path, wal, &quarantine);
+
+        // 2. Resilient open: replay the good prefix, ignore the unreplayable tail.
+        match try_open_database(db_path, false) {
+            Ok(db) => {
+                let store = Self::from_parts(db, db_path, store_id);
+                // Fold the recovered prefix into the main DB so a later clean
+                // reopen needs no replay, then count what survived.
+                if let Err(e) = store.do_checkpoint() {
+                    warn!("lbug_store: checkpoint after recovery failed: {e}");
+                }
+                let recovered = store.count_all_nodes();
+                let report = WalRecovery {
+                    outcome: WalRecoveryOutcome::RecoveredPrefix,
+                    recovered_records: recovered,
+                    quarantined_wal: copied.clone(),
+                };
+                warn!(
+                    db_path = %db_path.display(),
+                    recovered_records = recovered,
+                    quarantined_wal = ?copied,
+                    "lbug_store: recovered from corrupt WAL (good prefix replayed + checkpointed)"
+                );
+                Ok((store, report))
+            }
+            Err(resilient_err) => {
+                // 3. Hard fallback: even resilient replay failed. Move the WAL
+                //    (and any sidecars) fully aside so the engine opens from the
+                //    last good checkpoint with no WAL to replay.
+                warn!(
+                    db_path = %db_path.display(),
+                    error = %resilient_err,
+                    "lbug_store: resilient WAL replay failed; opening from last checkpoint only"
+                );
+                let moved = move_wal_aside(db_path, wal, &quarantine, copied.is_some());
+                let db = open_database(db_path, true).map_err(|e| {
+                    MemoryError::Storage(format!(
+                        "failed to open LadybugDB at {} even after quarantining the WAL: {e}",
+                        db_path.display()
+                    ))
+                })?;
+                let store = Self::from_parts(db, db_path, store_id);
+                let recovered = store.count_all_nodes();
+                let report = WalRecovery {
+                    outcome: WalRecoveryOutcome::CheckpointOnly,
+                    recovered_records: recovered,
+                    quarantined_wal: moved.or(copied),
+                };
+                warn!(
+                    db_path = %db_path.display(),
+                    recovered_records = recovered,
+                    "lbug_store: opened from last checkpoint after unrecoverable WAL"
+                );
+                Ok((store, report))
+            }
+        }
+    }
+
+    /// Create the parent directory of `db_path` if needed.
+    fn prepare_parent(db_path: &Path) -> crate::Result<()> {
         if let Some(parent) = db_path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -85,25 +292,15 @@ impl LbugGraphStore {
                 })?;
             }
         }
+        Ok(())
+    }
 
+    /// Assemble a store around an already-opened [`Database`].
+    fn from_parts(db: Database, db_path: &Path, store_id: Option<&str>) -> Self {
         let id = store_id
             .map(String::from)
             .unwrap_or_else(|| format!("lbug-{}", &uuid::Uuid::new_v4().to_string()[..8]));
-
-        let config = SystemConfig::default()
-            // Cap the mmap reservation so we don't request a huge address space
-            // in constrained environments (mirrors the Kùzu backend).
-            .max_db_size(1 << 30)
-            .buffer_pool_size(128 * 1024 * 1024);
-
-        let db = Database::new(db_path, config).map_err(|e| {
-            MemoryError::Storage(format!(
-                "failed to open LadybugDB at {}: {e}",
-                db_path.display()
-            ))
-        })?;
-
-        Ok(Self {
+        Self {
             store_id: id,
             db_path: db_path.to_path_buf(),
             db,
@@ -113,12 +310,99 @@ impl LbugGraphStore {
             node_table_columns: RefCell::new(HashMap::new()),
             known_rel_tables: RefCell::new(HashSet::new()),
             id_table_cache: RefCell::new(HashMap::new()),
-        })
+            writes_since_checkpoint: Cell::new(0),
+            checkpoint_interval: Cell::new(AUTO_CHECKPOINT_WRITES),
+        }
     }
 
     /// The on-disk database path.
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    /// Override the auto-checkpoint write interval (`0` disables count-based
+    /// checkpointing). Intended for in-crate tests that need writes to remain in
+    /// the WAL so an unclean shutdown can be simulated.
+    #[cfg(test)]
+    pub(crate) fn set_checkpoint_interval(&self, writes: u64) {
+        self.checkpoint_interval.set(writes);
+    }
+
+    /// Mutating operations applied since the last checkpoint (test introspection).
+    #[cfg(test)]
+    pub(crate) fn pending_writes(&self) -> u64 {
+        self.writes_since_checkpoint.get()
+    }
+
+    /// Force a checkpoint: flush the write-ahead log into the main database file
+    /// so a subsequent clean reopen needs no WAL replay.
+    ///
+    /// Acquires the write lock; safe to call concurrently with reads/writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Storage`] if the `CHECKPOINT` statement or the
+    /// durability barrier fails.
+    pub fn checkpoint(&self) -> crate::Result<()> {
+        let _guard = self.acquire_lock();
+        self.do_checkpoint()
+    }
+
+    /// Issue `CHECKPOINT` + durability barrier and reset the write counter.
+    /// Caller is responsible for holding [`acquire_lock`](Self::acquire_lock)
+    /// when used outside single-threaded recovery.
+    pub(crate) fn do_checkpoint(&self) -> crate::Result<()> {
+        self.execute("CHECKPOINT")?;
+        self.writes_since_checkpoint.set(0);
+        self.post_write_barrier()?;
+        Ok(())
+    }
+
+    /// Record a mutating operation and checkpoint once the configured interval is
+    /// reached. Best-effort: a failed checkpoint is logged, not propagated (the
+    /// write itself already succeeded and was fsync'd). Caller must hold the
+    /// write lock.
+    pub(crate) fn note_write_and_maybe_checkpoint(&self) {
+        let interval = self.checkpoint_interval.get();
+        if interval == 0 {
+            return;
+        }
+        let next = self.writes_since_checkpoint.get().saturating_add(1);
+        if next >= interval {
+            if let Err(e) = self.do_checkpoint() {
+                warn!("lbug_store: auto-checkpoint failed: {e}");
+                // do_checkpoint resets the counter only on success; reset here so
+                // we retry on the next write rather than every write.
+                self.writes_since_checkpoint.set(0);
+            }
+        } else {
+            self.writes_since_checkpoint.set(next);
+        }
+    }
+
+    /// Total number of graph nodes across every node table. Used to report how
+    /// many records survived a recovery open.
+    pub(crate) fn count_all_nodes(&self) -> usize {
+        let mut total = 0usize;
+        let rows = match self.query_rows("CALL show_tables() RETURN *") {
+            Ok(r) => r,
+            Err(_) => return 0,
+        };
+        for row in rows {
+            let (name, ttype) = match table_row_name_and_type(&row) {
+                Some(v) => v,
+                None => continue,
+            };
+            if !ttype.to_ascii_uppercase().contains("NODE") || !is_valid_identifier(&name) {
+                continue;
+            }
+            if let Ok(cnt) = self.query_rows(&format!("MATCH (n:{name}) RETURN count(n)")) {
+                if let Some(v) = cnt.first().and_then(|r| r.first()) {
+                    total += value_as_usize(v);
+                }
+            }
+        }
+        total
     }
 
     // -- connection / execution helpers --------------------------------------
@@ -362,9 +646,183 @@ impl LbugGraphStore {
     }
 }
 
+impl Drop for LbugGraphStore {
+    /// Always-on durability: checkpoint the WAL into the main database file when
+    /// the store is dropped, so even a forgotten `close` leaves the data durable
+    /// without an unbounded WAL to replay. Best-effort and silent on error —
+    /// LadybugDB also force-checkpoints on its own drop as a backstop.
+    fn drop(&mut self) {
+        if let Err(e) = self.execute("CHECKPOINT") {
+            debug!("lbug_store: checkpoint on drop failed (engine will retry): {e}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// The system configuration used for every open.
+///
+/// `auto_checkpoint(true)` lets LadybugDB bound the WAL on its own as a safety
+/// net; the store additionally checkpoints every [`AUTO_CHECKPOINT_WRITES`]
+/// writes (see [`LbugGraphStore::note_write_and_maybe_checkpoint`]).
+/// `throw_on_wal_replay_failure` selects strict vs. resilient WAL replay: strict
+/// (`true`) errors on a corrupt WAL, resilient (`false`) replays the good prefix
+/// and ignores the unreplayable tail.
+fn system_config(throw_on_wal_replay_failure: bool) -> SystemConfig {
+    SystemConfig::default()
+        // Cap the mmap reservation so we don't request a huge address space in
+        // constrained environments (mirrors the Kùzu backend).
+        .max_db_size(1 << 30)
+        .buffer_pool_size(128 * 1024 * 1024)
+        .auto_checkpoint(true)
+        .throw_on_wal_replay_failure(throw_on_wal_replay_failure)
+}
+
+/// Open a [`Database`] with the given replay strictness, mapping the engine
+/// error to a `String`.
+fn open_database(db_path: &Path, strict: bool) -> std::result::Result<Database, String> {
+    Database::new(db_path, system_config(strict)).map_err(|e| e.to_string())
+}
+
+/// Open a [`Database`], additionally containing any panic (a corrupt WAL surfaces
+/// as `Err` in practice, but `catch_unwind` guarantees we never crash the
+/// process during a recovery attempt).
+fn try_open_database(db_path: &Path, strict: bool) -> std::result::Result<Database, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        open_database(db_path, strict)
+    })) {
+        Ok(res) => res,
+        Err(panic) => Err(format!("panic during open: {}", panic_message(panic))),
+    }
+}
+
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// The write-ahead-log path for `db_path`.
+///
+/// LadybugDB appends `.wal` to the *full* database filename (extension included),
+/// so `cognitive.ladybug` -> `cognitive.ladybug.wal`. (This is intentionally not
+/// `Path::with_extension`, which would wrongly produce `cognitive.wal`.)
+pub(crate) fn wal_path_for(db_path: &Path) -> PathBuf {
+    let mut name: OsString = db_path.as_os_str().to_os_string();
+    name.push(".wal");
+    PathBuf::from(name)
+}
+
+/// Quarantine target for a corrupt WAL: `<wal>.corrupt-<unix_ts>`.
+fn quarantine_path(wal: &Path) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut name: OsString = wal.as_os_str().to_os_string();
+    name.push(format!(".corrupt-{ts}"));
+    PathBuf::from(name)
+}
+
+/// Sidecar files LadybugDB may write alongside the WAL (shadow pages, temporary
+/// WAL segments). Returns existing siblings whose name starts with the WAL or db
+/// filename and carries a `.shadow` / `.wal.` infix.
+fn wal_sidecars(db_path: &Path, wal: &Path) -> Vec<PathBuf> {
+    let parent = wal.parent().unwrap_or_else(|| Path::new("."));
+    let db_name = db_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let wal_name = wal
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if fname == wal_name {
+                continue; // the WAL itself is handled separately
+            }
+            let is_sidecar = fname.starts_with(&format!("{wal_name}."))
+                || (fname.starts_with(&db_name) && fname.contains(".shadow"));
+            if is_sidecar {
+                out.push(entry.path());
+            }
+        }
+    }
+    out
+}
+
+/// Copy the corrupt WAL (and any sidecars) to `quarantine`, preserving the
+/// incident artifact before a resilient open consumes the live WAL. Returns the
+/// quarantine path on success.
+fn copy_wal_aside(db_path: &Path, wal: &Path, quarantine: &Path) -> Option<PathBuf> {
+    match std::fs::copy(wal, quarantine) {
+        Ok(_) => {
+            for sidecar in wal_sidecars(db_path, wal) {
+                if let Some(name) = sidecar.file_name() {
+                    let mut dst: OsString = quarantine.as_os_str().to_os_string();
+                    dst.push(".");
+                    dst.push(name);
+                    let _ = std::fs::copy(&sidecar, PathBuf::from(dst));
+                }
+            }
+            Some(quarantine.to_path_buf())
+        }
+        Err(e) => {
+            warn!(
+                "lbug_store: failed to quarantine corrupt WAL {}: {e}",
+                wal.display()
+            );
+            None
+        }
+    }
+}
+
+/// Move the WAL (and sidecars) fully aside so the engine opens with no WAL to
+/// replay. If a copy was already quarantined, the live WAL is just removed (the
+/// artifact is already preserved); otherwise it is renamed to `quarantine`.
+fn move_wal_aside(
+    db_path: &Path,
+    wal: &Path,
+    quarantine: &Path,
+    already_copied: bool,
+) -> Option<PathBuf> {
+    let result = if already_copied {
+        let _ = std::fs::remove_file(wal);
+        Some(quarantine.to_path_buf())
+    } else {
+        match std::fs::rename(wal, quarantine) {
+            Ok(_) => Some(quarantine.to_path_buf()),
+            Err(_) => {
+                let _ = std::fs::remove_file(wal);
+                None
+            }
+        }
+    };
+    for sidecar in wal_sidecars(db_path, wal) {
+        let _ = std::fs::remove_file(&sidecar);
+    }
+    result
+}
+
+/// Interpret a scalar [`Value`] as a `usize` count (from `count(n)` results).
+fn value_as_usize(v: &Value) -> usize {
+    match v {
+        Value::Int64(i) => (*i).max(0) as usize,
+        Value::Int32(i) => (*i).max(0) as usize,
+        Value::UInt64(i) => *i as usize,
+        Value::UInt32(i) => *i as usize,
+        other => value_to_string(other).parse::<usize>().unwrap_or(0),
+    }
+}
 
 /// `true` if `name` is a safe Cypher identifier (`[A-Za-z_][A-Za-z0-9_]*`).
 pub(crate) fn is_valid_identifier(name: &str) -> bool {

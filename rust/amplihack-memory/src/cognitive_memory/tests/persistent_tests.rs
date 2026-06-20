@@ -673,3 +673,168 @@ fn special_characters_round_trip_safely() {
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0].content, nasty_content);
 }
+
+// ---------------------------------------------------------------------------
+// Durability: recovery from an unclean shutdown + checkpoint API (issue #88)
+// ---------------------------------------------------------------------------
+
+use std::fs;
+use std::path::Path;
+
+use crate::graph::lbug_store::wal_path_for;
+
+/// Write one record of every memory type, tagged so seeds are distinguishable.
+fn write_all_types(cm: &mut CognitiveMemory, tag: &str) {
+    cm.store_episode(&format!("episode {tag}"), "ops", Some(1), None)
+        .unwrap();
+    cm.store_fact(
+        &format!("concept-{tag}"),
+        &format!("durable knowledge {tag}"),
+        0.9,
+        "book",
+        Some(&steps(&["rust", "memory"])),
+        None,
+    )
+    .unwrap();
+    cm.store_procedure(&format!("proc-{tag}"), &steps(&["a", "b", "c"]), None)
+        .unwrap();
+    cm.store_prospective(&format!("trigger {tag}"), "outage", "page on-call", 5)
+        .unwrap();
+    cm.store_sensory("text", &format!("observation {tag}"), 3600)
+        .unwrap();
+    cm.store_working("note", &format!("scratch {tag}"), "task-1", 0.5)
+        .unwrap();
+}
+
+/// Copy every file in `from` into `to` — a snapshot of a killed process' files.
+fn copy_dir_files(from: &Path, to: &Path) {
+    for entry in fs::read_dir(from).unwrap() {
+        let p = entry.unwrap().path();
+        if p.is_file() {
+            fs::copy(&p, to.join(p.file_name().unwrap())).unwrap();
+        }
+    }
+}
+
+/// Truncate `wal` mid-record so a strict reopen fails to replay it.
+fn corrupt_wal_tail(wal: &Path) {
+    let len = fs::metadata(wal).unwrap().len();
+    assert!(len > 64, "WAL must be non-empty to corrupt (was {len})");
+    let f = fs::OpenOptions::new().write(true).open(wal).unwrap();
+    f.set_len(len - 41).unwrap();
+    f.sync_all().unwrap();
+}
+
+/// Return the first sibling of `wal` that looks like a quarantined corrupt WAL.
+fn find_quarantine(dir: &Path) -> Option<std::path::PathBuf> {
+    fs::read_dir(dir).unwrap().flatten().find_map(|e| {
+        let p = e.path();
+        if p.file_name()?.to_string_lossy().contains(".wal.corrupt-") {
+            Some(p)
+        } else {
+            None
+        }
+    })
+}
+
+#[test]
+fn unclean_shutdown_recovers_without_crash_and_keeps_checkpointed_records() {
+    let live = tempfile::tempdir().unwrap();
+    let live_db = live.path().join("cognitive.ladybug");
+
+    // 1. Open, write across all memory types, and CHECKPOINT so this batch is
+    //    durable in the main DB file (survives even a destroyed WAL).
+    let mut cm = CognitiveMemory::open_persistent(&live_db, "agent").unwrap();
+    write_all_types(&mut cm, "durable");
+    cm.checkpoint().unwrap();
+    let durable = cm.get_memory_stats();
+    let durable_total = *durable.get("total").unwrap();
+    assert!(durable_total >= 6, "expected >= 6 durable records");
+
+    // 2. Write more records that live only in the WAL (uncheckpointed). The
+    //    default auto-checkpoint interval is far higher than this, so nothing is
+    //    flushed implicitly.
+    write_all_types(&mut cm, "wal-only");
+
+    // 3. Simulate an UNCLEAN shutdown: snapshot the on-disk files mid-WAL, then
+    //    abandon the handle without a clean close (no final checkpoint).
+    let crash = tempfile::tempdir().unwrap();
+    copy_dir_files(live.path(), crash.path());
+    std::mem::forget(cm);
+
+    let crash_db = crash.path().join("cognitive.ladybug");
+    let crash_wal = wal_path_for(&crash_db);
+    assert!(crash_wal.exists(), "snapshot must contain the live WAL");
+    corrupt_wal_tail(&crash_wal);
+
+    // 4. A plain strict reopen of the corrupt copy fails — this is the incident.
+    assert!(
+        crate::graph::lbug_store::LbugGraphStore::open(&crash_db, Some("cognitive-agent")).is_err(),
+        "strict open of the corrupt WAL should fail"
+    );
+
+    // 5. The recovery path opens successfully (no crash) and returns at least the
+    //    checkpointed records — no total loss.
+    let cm2 = CognitiveMemory::open_persistent_with_recovery(&crash_db, "agent")
+        .expect("recovery open must succeed");
+    let stats = cm2.get_memory_stats();
+    assert!(
+        *stats.get("total").unwrap() >= durable_total,
+        "recovery must return >= the {durable_total} checkpointed records, got {:?}",
+        stats.get("total")
+    );
+    for ty in [
+        "episodic",
+        "semantic",
+        "procedural",
+        "prospective",
+        "sensory",
+        "working",
+    ] {
+        assert!(
+            stats.get(ty).copied().unwrap_or(0) >= 1,
+            "checkpointed {ty} record must survive recovery: {stats:?}"
+        );
+    }
+
+    // 6. The corrupt WAL was moved aside, never deleted.
+    assert!(
+        find_quarantine(crash.path()).is_some(),
+        "a <wal>.corrupt-<ts> artifact must exist after recovery"
+    );
+
+    // 7. The transparent entry point (`open_persistent`) also recovers, proving
+    //    existing callers gain crash-resilience with no code change.
+    drop(cm2);
+    let cm3 = CognitiveMemory::open_persistent(&crash_db, "agent")
+        .expect("open_persistent must transparently recover");
+    assert!(*cm3.get_memory_stats().get("total").unwrap() >= durable_total);
+}
+
+#[test]
+fn checkpoint_then_reopen_returns_all_records_and_needs_no_replay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("cognitive.ladybug");
+    let wal = wal_path_for(&path);
+
+    let expected_total;
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        write_all_types(&mut cm, "a");
+        write_all_types(&mut cm, "b");
+        cm.checkpoint().unwrap();
+        expected_total = *cm.get_memory_stats().get("total").unwrap();
+
+        // After an explicit checkpoint there is no WAL left to replay.
+        let wal_len = fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            wal_len == 0 || !wal.exists(),
+            "WAL should be empty/absent after checkpoint, was {wal_len} bytes"
+        );
+        std::mem::forget(cm); // no clean close: rely solely on the checkpoint
+    }
+
+    // A reopen sees every record even though the handle was never closed.
+    let cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+    assert_eq!(*cm.get_memory_stats().get("total").unwrap(), expected_total);
+}

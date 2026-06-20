@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Critical durability bug (#88):** the persistent `CognitiveMemory`
+  (`LbugGraphStore`) could no longer be opened after an unclean shutdown left
+  the LadybugDB write-ahead log (WAL) partially written — `open_persistent`
+  crashed on a C++ WAL-replay assertion and the only "recovery" was deleting the
+  WAL, losing every uncheckpointed record. `open_persistent` now transparently
+  recovers: the unreplayable WAL is quarantined to `<wal>.corrupt-<timestamp>`
+  (moved aside, never deleted), the recoverable prefix is replayed, and a
+  checkpoint folds the survivors into the main database file.
+
+### Added
+- `CognitiveMemory::open_persistent_with_recovery` and
+  `LbugGraphStore::open_with_recovery` — explicit corrupt-WAL recovery entry
+  points returning a structured `WalRecovery` report (`WalRecoveryOutcome`,
+  recovered record count, quarantine path). `open_persistent` delegates to the
+  recovery path so existing callers gain crash-resilience with no code change.
+- `CognitiveMemory::checkpoint()` / `GraphStore::checkpoint()` — force-flush the
+  WAL into the durable store so a clean reopen needs no replay (no-op for the
+  in-memory backend).
+- Automatic checkpointing every `AUTO_CHECKPOINT_WRITES` (128) writes and on
+  `close` / `Drop`, bounding how much data an unclean shutdown can strand in the
+  WAL.
+
 ## [0.4.0] - 2026-03-13
 
 ### Added
