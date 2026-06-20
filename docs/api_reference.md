@@ -171,7 +171,19 @@ CognitiveMemory(
 |--------|-----------|---------|
 | `store_fact` | `(concept: str, content: str, confidence: float = 1.0, source_id: str = "", tags: list[str] \| None = None, temporal_metadata: dict \| None = None) -> str` | `node_id` |
 | `search_facts` | `(query: str, limit: int = 10, min_confidence: float = 0.0) -> list[SemanticFact]` | Matching facts |
-| `get_all_facts` | `(limit: int = 50) -> list[SemanticFact]` | All facts by confidence DESC |
+| `get_all_facts` | `(limit: int = 50) -> list[SemanticFact]` | All facts by confidence DESC (archived flagged) |
+
+#### Fact Lifecycle Methods
+
+Deduplication, supersession, and retention for semantic facts. See
+[Fact Lifecycle](fact_lifecycle.md) for full semantics and the Rust API.
+
+| Method | Signature (Rust) | Returns |
+|--------|------------------|---------|
+| `upsert_fact` | `(input: FactInput, options: &StoreFactOptions) -> Result<StoreFactOutcome>` | `StoreFactOutcome { node_id, dedup_action, content_hash, .. }` |
+| `find_duplicate_facts` | `(options: &DedupOptions, limit: usize) -> Vec<DuplicateFactGroup>` | Duplicate groups (≥2 members) |
+| `supersede_fact` | `(old_id: &str, new_id: &str, reason: &str) -> Result<()>` | `()` |
+| `prune_semantic_memory` | `(policy: &RetentionPolicy) -> Result<PruneReport>` | `PruneReport { archived, deleted, would_archive, would_delete }` |
 
 ### Procedural Memory Methods
 
@@ -246,6 +258,96 @@ from amplihack_memory import KnowledgeSubgraph
 **Methods:**
 
 - `to_llm_context(chronological: bool = False) -> str` -- Format as LLM-readable text
+
+### Fact Lifecycle Types
+
+Rust types for semantic-fact deduplication, supersession, and retention. See
+[Fact Lifecycle](fact_lifecycle.md) for behavior and examples.
+
+#### DedupMode
+
+```rust
+enum DedupMode { None, ExactContentHash, CallerKey(String), SameConceptSimilarity }
+```
+
+#### DedupOptions
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | `DedupMode` | `None` | Deduplication strategy |
+| `similarity_threshold` | `f64` | `0.60` | Min composite similarity for `SameConceptSimilarity` |
+| `same_concept_only` | `bool` | `true` | Restrict candidate scan to the same concept |
+
+#### FactInput
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `concept` | `String` | required | Concept / lookup key |
+| `content` | `String` | required | Factual content |
+| `confidence` | `f64` | required | Confidence (0.0-1.0) |
+| `source_id` | `String` | `""` | Opaque provenance string |
+| `tags` | `Vec<String>` | `[]` | Tags |
+| `metadata` | `HashMap<String, Value>` | `{}` | Metadata |
+| `importance` | `Option<f64>` | `None` ⇒ `confidence` | Retention weight |
+| `expires_at` | `Option<DateTime<Utc>>` | `None` | Explicit expiry for retention |
+| `dedup_key` | `Option<String>` | `None` | Identity for `CallerKey` mode |
+
+Convenience: `FactInput::new(concept, content, confidence)`.
+
+#### StoreFactOptions
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `similarity` | `Option<SimilarityOptions>` | `None` | Auto-link `SIMILAR_TO` on store |
+| `provenance` | `ProvenanceOptions` | empty / non-strict | `source_episode_ids` for `DERIVES_FROM` (+ `strict` flag) |
+| `dedup` | `DedupOptions` | default (`None`) | Deduplication strategy |
+
+Derives `Debug, Clone, PartialEq, Default` (no longer `Copy`).
+
+#### StoreFactOutcome / DedupAction
+
+```rust
+struct StoreFactOutcome {
+    node_id: String,
+    dedup_action: DedupAction,
+    content_hash: String,
+    similarity_links_created: usize,
+    provenance_edges_created: usize,
+}
+enum DedupAction {
+    Inserted,
+    Reused { existing_id: String },
+    Superseded { old_id: String, new_id: String },
+}
+```
+
+#### DuplicateFactGroup
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `key` | `String` | Shared group identity (content_hash / dedup_key / representative node id) |
+| `fact_ids` | `Vec<String>` | Members (≥2), oldest first |
+| `representative_id` | `String` | Oldest member; always `fact_ids[0]` |
+
+#### RetentionPolicy
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_facts_per_concept` | `Option<usize>` | `None` | Per-concept cap on active facts |
+| `ttl_seconds_by_concept` | `HashMap<String, i64>` | `{}` | Per-concept max age in seconds |
+| `min_importance_to_keep` | `f64` | `0.0` | Deletion-protection floor |
+| `include_superseded` | `bool` | `false` | Treat archived/superseded facts as candidates |
+| `dry_run` | `bool` | `false` | Report counts without mutating |
+
+#### PruneReport
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `archived` | `usize` | Facts archived (real run) |
+| `deleted` | `usize` | Facts deleted (real run) |
+| `would_archive` | `usize` | Facts that would be archived (dry run) |
+| `would_delete` | `usize` | Facts that would be deleted (dry run) |
+
 
 ### MemoryCategory (HierarchicalMemory)
 

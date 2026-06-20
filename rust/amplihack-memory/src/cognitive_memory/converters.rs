@@ -37,6 +37,29 @@ pub(crate) fn prop_datetime(props: &HashMap<String, String>, key: &str) -> DateT
     ts_to_datetime(prop_i64(props, key))
 }
 
+/// Read an optional string prop: absent or empty maps to `None`.
+pub(crate) fn prop_opt_str(props: &HashMap<String, String>, key: &str) -> Option<String> {
+    props.get(key).filter(|v| !v.is_empty()).cloned()
+}
+
+/// Read an optional unix-timestamp prop as `DateTime<Utc>`: absent, empty, or
+/// unparseable maps to `None`.
+pub(crate) fn prop_opt_datetime(
+    props: &HashMap<String, String>,
+    key: &str,
+) -> Option<DateTime<Utc>> {
+    props
+        .get(key)
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(ts_to_datetime)
+}
+
+/// Read a boolean prop encoded as the string `"true"` (anything else is false).
+pub(crate) fn prop_bool(props: &HashMap<String, String>, key: &str) -> bool {
+    props.get(key).map(|v| v == "true").unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Node-to-struct converters
 // ---------------------------------------------------------------------------
@@ -88,15 +111,43 @@ pub(crate) fn node_to_fact(props: &HashMap<String, String>) -> SemanticFact {
     let metadata: HashMap<String, serde_json::Value> =
         serde_json::from_str(&meta_str).unwrap_or_default();
 
+    let concept = prop_str(props, "concept");
+    let content = prop_str(props, "content");
+    let confidence = prop_f64(props, "confidence");
+
+    // `importance` falls back to `confidence` when the prop is absent/empty so
+    // facts stored before the field existed keep a sensible value (rather than
+    // `prop_f64`'s `0.0`).
+    let importance = props
+        .get("importance")
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(confidence);
+
+    // `content_hash` is recomputed from concept + content when absent/empty so
+    // legacy facts participate in exact-content dedup without a migration.
+    let content_hash = match prop_opt_str(props, "content_hash") {
+        Some(h) => h,
+        None => super::dedup::compute_content_hash(&concept, &content),
+    };
+
     SemanticFact {
         node_id: prop_str(props, "node_id"),
-        concept: prop_str(props, "concept"),
-        content: prop_str(props, "content"),
-        confidence: prop_f64(props, "confidence"),
+        concept,
+        content,
+        confidence,
         source_id: prop_str(props, "source_id"),
         tags,
         metadata,
         created_at: prop_datetime(props, "created_at"),
+        importance,
+        usage_count: prop_i64(props, "usage_count"),
+        last_accessed_at: prop_opt_datetime(props, "last_accessed_at"),
+        expires_at: prop_opt_datetime(props, "expires_at"),
+        archived: prop_bool(props, "archived"),
+        superseded_by: prop_opt_str(props, "superseded_by"),
+        content_hash,
+        dedup_key: prop_opt_str(props, "dedup_key"),
     }
 }
 
@@ -253,6 +304,88 @@ mod tests {
         p.insert("tags".into(), "not json".into());
         let f = node_to_fact(&p);
         assert!(f.tags.is_empty());
+    }
+
+    #[test]
+    fn test_node_to_fact_new_lifecycle_fields() {
+        let mut p = HashMap::new();
+        p.insert("node_id".into(), "n1".into());
+        p.insert("concept".into(), "rust".into());
+        p.insert("content".into(), "safe".into());
+        p.insert("confidence".into(), "0.9".into());
+        p.insert("importance".into(), "0.42".into());
+        p.insert("usage_count".into(), "7".into());
+        p.insert("last_accessed_at".into(), "1700000500".into());
+        p.insert("expires_at".into(), "1800000000".into());
+        p.insert("archived".into(), "true".into());
+        p.insert("superseded_by".into(), "sem_newer".into());
+        p.insert("content_hash".into(), "deadbeef".into());
+        p.insert("dedup_key".into(), "caller-key".into());
+
+        let f = node_to_fact(&p);
+        assert!((f.importance - 0.42).abs() < 1e-9);
+        assert_eq!(f.usage_count, 7);
+        assert!(f.last_accessed_at.is_some());
+        assert!(f.expires_at.is_some());
+        assert!(f.archived);
+        assert_eq!(f.superseded_by.as_deref(), Some("sem_newer"));
+        assert_eq!(f.content_hash, "deadbeef");
+        assert_eq!(f.dedup_key.as_deref(), Some("caller-key"));
+    }
+
+    #[test]
+    fn test_node_to_fact_legacy_defaults() {
+        // A node persisted before the lifecycle fields existed: only the
+        // original props are present. The converter must default-populate the
+        // new fields without panicking and never break on missing data.
+        let mut p = HashMap::new();
+        p.insert("node_id".into(), "n1".into());
+        p.insert("concept".into(), "rust".into());
+        p.insert("content".into(), "memory safe".into());
+        p.insert("confidence".into(), "0.95".into());
+
+        let f = node_to_fact(&p);
+        assert!(
+            (f.importance - 0.95).abs() < 1e-9,
+            "importance falls back to confidence when absent"
+        );
+        assert_eq!(f.usage_count, 0);
+        assert!(f.last_accessed_at.is_none());
+        assert!(f.expires_at.is_none());
+        assert!(!f.archived);
+        assert!(f.superseded_by.is_none());
+        assert!(f.dedup_key.is_none());
+        assert!(
+            !f.content_hash.is_empty(),
+            "content_hash is recomputed when the stored prop is absent"
+        );
+    }
+
+    #[test]
+    fn test_node_to_fact_empty_options_are_none() {
+        // Empty-string props (lbug's DEFAULT '' for ALTER-added columns) map to
+        // None / defaults rather than Some("").
+        let mut p = HashMap::new();
+        p.insert("concept".into(), "c".into());
+        p.insert("content".into(), "x".into());
+        p.insert("confidence".into(), "0.5".into());
+        p.insert("superseded_by".into(), "".into());
+        p.insert("dedup_key".into(), "".into());
+        p.insert("last_accessed_at".into(), "".into());
+        p.insert("expires_at".into(), "".into());
+        p.insert("content_hash".into(), "".into());
+        p.insert("archived".into(), "".into());
+
+        let f = node_to_fact(&p);
+        assert!(f.superseded_by.is_none());
+        assert!(f.dedup_key.is_none());
+        assert!(f.last_accessed_at.is_none());
+        assert!(f.expires_at.is_none());
+        assert!(!f.archived);
+        assert!(
+            !f.content_hash.is_empty(),
+            "empty content_hash prop triggers a recompute"
+        );
     }
 
     #[test]

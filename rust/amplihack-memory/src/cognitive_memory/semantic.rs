@@ -2,12 +2,15 @@
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
+
 use crate::memory_types::SemanticFact;
 use crate::{MemoryError, Result};
 
 use tracing::warn;
 
 use super::converters::node_to_fact;
+use super::dedup::compute_content_hash;
 use super::types::{agent_filter, new_id, ts_now, ET_DERIVES_FROM, ET_SIMILAR_TO, NT_SEMANTIC};
 use super::CognitiveMemory;
 
@@ -79,6 +82,9 @@ impl CognitiveMemory {
             metadata,
             source_episode_ids,
             false,
+            None,
+            None,
+            None,
         )
     }
 
@@ -113,11 +119,14 @@ impl CognitiveMemory {
             metadata,
             source_episode_ids,
             true,
+            None,
+            None,
+            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn store_fact_with_provenance_inner(
+    pub(super) fn store_fact_with_provenance_inner(
         &mut self,
         concept: &str,
         content: &str,
@@ -127,6 +136,9 @@ impl CognitiveMemory {
         metadata: Option<&HashMap<String, serde_json::Value>>,
         source_episode_ids: &[String],
         strict: bool,
+        importance: Option<f64>,
+        expires_at: Option<DateTime<Utc>>,
+        dedup_key: Option<String>,
     ) -> Result<String> {
         if confidence.is_nan() || !(0.0..=1.0).contains(&confidence) {
             return Err(MemoryError::InvalidInput(
@@ -175,6 +187,29 @@ impl CognitiveMemory {
         props.insert("tags".to_string(), tags_json);
         props.insert("metadata".to_string(), meta_json);
         props.insert("created_at".to_string(), now.to_string());
+
+        // Lifecycle / dedup props. Written on every store so the columns exist
+        // from the first write (the persistent backend creates them lazily) and
+        // legacy readers see explicit defaults.
+        props.insert(
+            "importance".to_string(),
+            importance.unwrap_or(confidence).to_string(),
+        );
+        props.insert("usage_count".to_string(), "0".to_string());
+        props.insert("archived".to_string(), "false".to_string());
+        props.insert(
+            "content_hash".to_string(),
+            compute_content_hash(concept, content),
+        );
+        props.insert("last_accessed_at".to_string(), String::new());
+        props.insert(
+            "expires_at".to_string(),
+            expires_at
+                .map(|d| d.timestamp().to_string())
+                .unwrap_or_default(),
+        );
+        props.insert("superseded_by".to_string(), String::new());
+        props.insert("dedup_key".to_string(), dedup_key.unwrap_or_default());
 
         self.graph
             .add_node(NT_SEMANTIC, props, Some(&node_id))

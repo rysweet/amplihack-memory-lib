@@ -78,6 +78,7 @@ cog.store_prospective(
 | [Architecture](architecture.md) | Package structure, core components, design philosophy, data flow |
 | [Hierarchical Memory](hierarchical_memory.md) | Graph-based memory with 5 categories, SUPERSEDES/TRANSITIONED_TO edges, Graph RAG |
 | [Cognitive Memory](cognitive_memory.md) | Six-type cognitive memory system (sensory, working, episodic, semantic, procedural, prospective) |
+| [Fact Lifecycle](fact_lifecycle.md) | Semantic-fact deduplication, SUPERSEDES supersession, and retention/pruning |
 | [Kuzu Backend](kuzu_backend.md) | How the Kuzu graph database works, schema, query patterns |
 | [API Reference](api_reference.md) | Complete API reference for all public classes |
 | [Extending](extending.md) | Custom backends, new edge types, custom classifiers, integration patterns |

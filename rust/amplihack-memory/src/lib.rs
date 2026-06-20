@@ -147,6 +147,11 @@ pub use backends::LadybugBackend;
 pub use backends::{ExperienceBackend, MemoryBackend, SqliteBackend};
 /// Unified cognitive memory interface over the graph layer.
 pub use cognitive_memory::CognitiveMemory;
+/// Fact dedup, supersession, and retention types.
+pub use cognitive_memory::{
+    compute_content_hash, DedupAction, DedupMode, DedupOptions, DuplicateFactGroup, FactInput,
+    ProvenanceOptions, PruneReport, RetentionPolicy, StoreFactOutcome,
+};
 /// Automatic `SIMILAR_TO` linking options and report types.
 pub use cognitive_memory::{SimilarityOptions, SimilarityReport, StoreFactOptions};
 /// Backend selector and memory connector entry point.

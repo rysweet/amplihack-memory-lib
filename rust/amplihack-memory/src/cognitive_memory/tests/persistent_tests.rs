@@ -1047,3 +1047,164 @@ fn similar_to_edge_survives_reopen() {
         "no duplicate SIMILAR_TO edge after reopen + re-link"
     );
 }
+
+// ===========================================================================
+// Fact dedup / SUPERSEDES / retention (issue #90): durability across reopen
+//
+// File: rust/amplihack-memory/src/cognitive_memory/tests/persistent_tests.rs
+//
+// Failing-first TDD tests proving the new SemanticFact lifecycle fields and
+// the SUPERSEDES edge survive a drop + reopen on the LadybugDB persistent
+// backend (which also proves the new STRING columns + rel table are
+// reintrospected on reopen). Gated by the `persistent` feature.
+// ===========================================================================
+
+#[test]
+fn semantic_fact_lifecycle_fields_survive_reopen() {
+    use crate::cognitive_memory::{
+        DedupAction, DedupMode, DedupOptions, FactInput, StoreFactOptions,
+    };
+
+    let (_tmp, path) = temp_db();
+    let id;
+    let expires = chrono::Utc::now() + chrono::Duration::seconds(7200);
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        let opts = StoreFactOptions {
+            dedup: DedupOptions {
+                mode: DedupMode::ExactContentHash,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut fi = FactInput::new("rust", "memory safe", 0.8);
+        fi.importance = Some(0.7);
+        fi.dedup_key = Some("k1".to_string());
+        fi.expires_at = Some(expires);
+        id = cm.upsert_fact(fi, &opts).unwrap().node_id;
+
+        // Reuse the same content to bump usage_count to 1 and confidence to 0.95.
+        let out = cm
+            .upsert_fact(FactInput::new("rust", "memory safe", 0.95), &opts)
+            .unwrap();
+        assert!(matches!(out.dedup_action, DedupAction::Reused { .. }));
+        assert_eq!(out.node_id, id);
+
+        cm.close();
+    } // dropped -> LadybugDB flushed to disk
+
+    let cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+    let f = cm
+        .get_all_facts(10)
+        .into_iter()
+        .find(|f| f.node_id == id)
+        .expect("fact survives reopen");
+
+    assert!((f.importance - 0.7).abs() < 1e-9, "importance persists");
+    assert_eq!(f.dedup_key.as_deref(), Some("k1"), "dedup_key persists");
+    assert_eq!(f.usage_count, 1, "usage_count persists");
+    assert!(
+        (f.confidence - 0.95).abs() < 1e-9,
+        "reused confidence persists"
+    );
+    assert!(f.last_accessed_at.is_some(), "last_accessed_at persists");
+    assert!(f.expires_at.is_some(), "expires_at persists");
+    assert!(!f.content_hash.is_empty(), "content_hash persists");
+    assert!(!f.archived, "archived flag persists (false)");
+    assert!(f.superseded_by.is_none());
+}
+
+#[test]
+fn supersedes_edge_and_archived_flag_survive_reopen() {
+    use crate::cognitive_memory::types::ET_SUPERSEDES;
+    use crate::graph::Direction;
+
+    let (_tmp, path) = temp_db();
+    let a;
+    let b;
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        a = cm.store_fact("c", "v1", 0.9, "", None, None).unwrap();
+        b = cm.store_fact("c", "v2", 0.9, "", None, None).unwrap();
+        cm.supersede_fact(&a, &b, "newer version").unwrap();
+        cm.close();
+    } // dropped -> LadybugDB flushed to disk
+
+    let cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+
+    let fa = cm
+        .get_all_facts(10)
+        .into_iter()
+        .find(|f| f.node_id == a)
+        .expect("superseded fact survives reopen");
+    assert!(fa.archived, "archived flag persists across reopen");
+    assert_eq!(
+        fa.superseded_by.as_deref(),
+        Some(b.as_str()),
+        "superseded_by persists across reopen"
+    );
+
+    let edges = cm
+        .graph
+        .query_neighbors(&b, Some(ET_SUPERSEDES), Direction::Outgoing, 10);
+    assert_eq!(edges.len(), 1, "SUPERSEDES edge persists across reopen");
+    assert_eq!(edges[0].1.node_id, a);
+    assert_eq!(
+        edges[0].0.properties.get("reason").map(String::as_str),
+        Some("newer version")
+    );
+}
+
+#[test]
+fn prune_archive_then_delete_persists_across_reopen() {
+    use crate::cognitive_memory::RetentionPolicy;
+
+    let (_tmp, path) = temp_db();
+    let low;
+    let high;
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        low = cm.store_fact("c", "low", 0.1, "", None, None).unwrap();
+        high = cm.store_fact("c", "high", 0.9, "", None, None).unwrap();
+
+        let policy = RetentionPolicy {
+            min_importance_to_keep: 0.5,
+            ..Default::default()
+        };
+        // Pass 1: archive the low-importance fact.
+        let r1 = cm.prune_semantic_memory(&policy).unwrap();
+        assert_eq!((r1.archived, r1.deleted), (1, 0));
+        cm.close();
+    }
+
+    // The archived flag survived; a second prune pass now deletes it durably.
+    let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+    let fa = cm
+        .get_all_facts(10)
+        .into_iter()
+        .find(|f| f.node_id == low)
+        .expect("archived fact still present after reopen");
+    assert!(fa.archived, "archive survived reopen");
+
+    let policy = RetentionPolicy {
+        min_importance_to_keep: 0.5,
+        ..Default::default()
+    };
+    let r2 = cm.prune_semantic_memory(&policy).unwrap();
+    assert_eq!(
+        r2.deleted, 1,
+        "previously-archived fact deleted after reopen"
+    );
+    cm.close();
+
+    let cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+    assert!(
+        !cm.get_all_facts(10).iter().any(|f| f.node_id == low),
+        "deletion persists across reopen"
+    );
+    assert!(
+        cm.get_all_facts(10).iter().any(|f| f.node_id == high),
+        "retained fact persists across reopen"
+    );
+}
