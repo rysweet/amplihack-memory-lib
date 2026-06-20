@@ -941,3 +941,109 @@ fn procedure_provenance_edge_survives_reopen() {
     assert_eq!(neighbors.len(), 1);
     assert_eq!(neighbors[0].1.node_id, ep_id);
 }
+
+// ===========================================================================
+// SIMILAR_TO auto-linking (issue #90): durability across close + reopen
+//
+// File: rust/amplihack-memory/src/cognitive_memory/tests/persistent_tests.rs
+//
+// Failing-first TDD test proving auto-created SIMILAR_TO edges -- including
+// their `similarity_score` property -- survive a drop + reopen on the
+// LadybugDB persistent backend, and that auto-linking stays idempotent after
+// the edge is reloaded from disk. (Invariants I4, I9.)
+// Gated by the `persistent` feature via the parent `tests` module.
+// ===========================================================================
+
+#[test]
+fn similar_to_edge_survives_reopen() {
+    use crate::cognitive_memory::types::ET_SIMILAR_TO;
+    use crate::cognitive_memory::SimilarityOptions;
+    use crate::graph::Direction;
+
+    let tags: Vec<String> = vec!["rust".to_string(), "systems".to_string()];
+    let (_tmp, path) = temp_db();
+    let a_id;
+    let b_id;
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        a_id = cm
+            .store_fact(
+                "memory-safety",
+                "rust borrow checker prevents memory bugs",
+                0.95,
+                "",
+                Some(&tags),
+                None,
+            )
+            .unwrap();
+        b_id = cm
+            .store_fact(
+                "memory-safety",
+                "rust borrow checker prevents memory leaks",
+                0.90,
+                "",
+                Some(&tags),
+                None,
+            )
+            .unwrap();
+
+        let n = cm
+            .auto_link_similar_facts(&a_id, &SimilarityOptions::default())
+            .unwrap();
+        assert_eq!(n, 1, "the two related facts must be linked before close");
+
+        // similarity_score present and parseable before close.
+        let edges = cm
+            .graph
+            .query_neighbors(&a_id, Some(ET_SIMILAR_TO), Direction::Outgoing, 10);
+        assert_eq!(edges.len(), 1);
+        let score: f64 = edges[0]
+            .0
+            .properties
+            .get("similarity_score")
+            .expect("similarity_score property")
+            .parse()
+            .expect("score parses as f64");
+        assert!(score >= 0.60);
+
+        cm.close();
+    } // dropped -> LadybugDB flushed to disk
+
+    let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+
+    // The SIMILAR_TO edge + its similarity_score survived close + reopen.
+    let edges = cm
+        .graph
+        .query_neighbors(&a_id, Some(ET_SIMILAR_TO), Direction::Outgoing, 10);
+    assert_eq!(
+        edges.len(),
+        1,
+        "SIMILAR_TO edge must persist across close + reopen"
+    );
+    assert_eq!(edges[0].0.target_id, b_id);
+    let score: f64 = edges[0]
+        .0
+        .properties
+        .get("similarity_score")
+        .expect("similarity_score must persist across reopen")
+        .parse()
+        .expect("persisted score parses as f64");
+    assert!(
+        score >= 0.60,
+        "persisted similarity_score must be >= threshold"
+    );
+
+    // Idempotent after reopen: the surviving edge suppresses a duplicate.
+    let n = cm
+        .auto_link_similar_facts(&a_id, &SimilarityOptions::default())
+        .unwrap();
+    assert_eq!(n, 0, "auto-link must stay idempotent across reopen");
+    let after = cm
+        .graph
+        .query_neighbors(&a_id, Some(ET_SIMILAR_TO), Direction::Outgoing, 10);
+    assert_eq!(
+        after.len(),
+        1,
+        "no duplicate SIMILAR_TO edge after reopen + re-link"
+    );
+}
