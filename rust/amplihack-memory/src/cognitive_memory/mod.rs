@@ -13,6 +13,7 @@
 //! graph node.
 
 mod converters;
+mod dedup;
 mod episodic;
 mod procedural;
 mod prospective;
@@ -22,7 +23,11 @@ mod similarity;
 mod types;
 mod working;
 
-pub use similarity::{SimilarityOptions, SimilarityReport, StoreFactOptions};
+pub use dedup::{
+    compute_content_hash, DedupAction, DedupMode, DedupOptions, DuplicateFactGroup, FactInput,
+    ProvenanceOptions, PruneReport, RetentionPolicy, StoreFactOptions, StoreFactOutcome,
+};
+pub use similarity::{SimilarityOptions, SimilarityReport};
 pub use types::WORKING_MEMORY_CAPACITY;
 
 use std::collections::HashMap;

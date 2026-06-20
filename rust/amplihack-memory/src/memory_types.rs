@@ -180,6 +180,36 @@ pub struct SemanticFact {
     pub metadata: HashMap<String, serde_json::Value>,
     /// When this fact was recorded.
     pub created_at: DateTime<Utc>,
+    /// Relative importance in `[0.0, 1.0]` used by retention/pruning to decide
+    /// what to keep. Defaults to the fact's `confidence` when not set explicitly.
+    #[serde(default)]
+    pub importance: f64,
+    /// Number of times this fact has been reused (incremented on a dedup hit).
+    #[serde(default)]
+    pub usage_count: i64,
+    /// When this fact was last accessed via a dedup-reuse. `None` until reused.
+    #[serde(default)]
+    pub last_accessed_at: Option<DateTime<Utc>>,
+    /// Optional expiry instant; once past, the fact becomes a retention
+    /// candidate. `None` means the fact never expires on its own.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Whether this fact has been archived (soft-deleted) by supersession or a
+    /// retention pass. Archived facts are excluded from dedup candidates.
+    #[serde(default)]
+    pub archived: bool,
+    /// Id of the fact that superseded this one, if any. Set together with
+    /// `archived = true` by [`supersede_fact`](crate::CognitiveMemory::supersede_fact).
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    /// Deterministic hash of `concept + content`, used by exact-content dedup.
+    /// Recomputed on read for facts stored before this field existed.
+    #[serde(default)]
+    pub content_hash: String,
+    /// Optional caller-supplied dedup key (e.g. an external record id) used by
+    /// `DedupMode::CallerKey`.
+    #[serde(default)]
+    pub dedup_key: Option<String>,
 }
 
 /// Reusable step-by-step procedure (how-to knowledge).

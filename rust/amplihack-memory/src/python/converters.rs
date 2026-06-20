@@ -60,6 +60,19 @@ pub(crate) fn fact_to_dict(py: Python<'_>, f: &SemanticFact) -> PyResult<PyObjec
     d.set_item("tags", f.tags.to_object(py))?;
     d.set_item("created_at", f.created_at.to_rfc3339())?;
     d.set_item("metadata", hashmap_to_pydict(py, &f.metadata)?)?;
+    // Fact-lifecycle fields (dedup / supersession / retention). Read-only on the
+    // Python surface; additive so existing keys are unaffected.
+    d.set_item("importance", f.importance)?;
+    d.set_item("usage_count", f.usage_count)?;
+    d.set_item(
+        "last_accessed_at",
+        f.last_accessed_at.map(|t| t.to_rfc3339()),
+    )?;
+    d.set_item("expires_at", f.expires_at.map(|t| t.to_rfc3339()))?;
+    d.set_item("archived", f.archived)?;
+    d.set_item("superseded_by", f.superseded_by.as_deref())?;
+    d.set_item("content_hash", &f.content_hash)?;
+    d.set_item("dedup_key", f.dedup_key.as_deref())?;
     Ok(d.to_object(py))
 }
 

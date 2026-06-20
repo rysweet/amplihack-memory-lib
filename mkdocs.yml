@@ -40,6 +40,7 @@ nav:
   - Architecture: architecture.md
   - Hierarchical Memory: hierarchical_memory.md
   - Cognitive Memory: cognitive_memory.md
+  - Fact Lifecycle (Dedup/Supersession/Retention): fact_lifecycle.md
   - Kuzu Backend: kuzu_backend.md
   - API Reference: api_reference.md
   - Extending: extending.md

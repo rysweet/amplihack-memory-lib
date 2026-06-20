@@ -486,7 +486,10 @@ fn store_fact_with_options_none_does_not_link() {
     );
 
     let tg = tags(&["rust", "systems"]);
-    let opts = StoreFactOptions { similarity: None };
+    let opts = StoreFactOptions {
+        similarity: None,
+        ..Default::default()
+    };
     let b = cm
         .store_fact_with_options(
             "memory-safety",
@@ -521,6 +524,7 @@ fn store_fact_with_options_some_auto_links() {
     let tg = tags(&["rust", "systems"]);
     let opts = StoreFactOptions {
         similarity: Some(SimilarityOptions::default()),
+        ..Default::default()
     };
     let b = cm
         .store_fact_with_options(

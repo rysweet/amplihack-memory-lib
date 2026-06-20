@@ -73,17 +73,7 @@ pub struct SimilarityReport {
     pub links_created: usize,
 }
 
-/// Options for [`store_fact_with_options`](CognitiveMemory::store_fact_with_options).
-///
-/// [`Default`] (`similarity: None`) makes the call behave exactly like
-/// [`store_fact`](CognitiveMemory::store_fact): no `SIMILAR_TO` edges are
-/// created, preserving backward compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct StoreFactOptions {
-    /// When `Some(opts)` (and `opts.enabled`), the freshly stored fact is
-    /// auto-linked to its above-threshold neighbours after storage.
-    pub similarity: Option<SimilarityOptions>,
-}
+use super::dedup::StoreFactOptions;
 
 /// Build the property map [`compute_similarity`] expects from a fact.
 fn fact_to_sim_map(fact: &SemanticFact) -> HashMap<String, serde_json::Value> {

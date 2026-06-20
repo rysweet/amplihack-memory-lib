@@ -79,3 +79,9 @@ pub(crate) const ET_DERIVES_FROM: &str = "DERIVES_FROM";
 /// edge type (rather than reusing [`ET_DERIVES_FROM`]) keeps fact and procedure
 /// provenance independently queryable.
 pub(crate) const ET_PROCEDURE_DERIVES_FROM: &str = "PROCEDURE_DERIVES_FROM";
+/// Edge-type label indicating one fact supersedes (replaces) another.
+///
+/// Used for fact lifecycle/versioning: the newer fact points at the one it
+/// replaces — `SemanticMemory(new) --SUPERSEDES--> SemanticMemory(old)`. The
+/// superseded (old) fact is archived and carries a `superseded_by` back-pointer.
+pub(crate) const ET_SUPERSEDES: &str = "SUPERSEDES";

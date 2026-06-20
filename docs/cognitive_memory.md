@@ -182,6 +182,7 @@ cons_id = cog.consolidate_episodes(
 - Confidence scoring
 - Tags and metadata
 - Source provenance tracking
+- Lifecycle management: deduplication, supersession, and retention (see [Fact Lifecycle](fact_lifecycle.md))
 
 ```python
 # Store a fact
@@ -213,6 +214,19 @@ all_facts = cog.get_all_facts(limit=50)
 | `tags` | `list[str]` | Categorisation tags |
 | `metadata` | `dict` | Additional metadata |
 | `created_at` | `datetime` | Creation time |
+| `importance` | `float` | Retention weight (defaults to `confidence`) |
+| `usage_count` | `int` | Times reused via dedup (default `0`) |
+| `last_accessed_at` | `datetime \| None` | Last dedup reuse time (default `None`) |
+| `expires_at` | `datetime \| None` | Optional absolute expiry (default `None`) |
+| `archived` | `bool` | Soft-deleted flag set on supersession or a retention pass; still returned by `get_all_facts` with `archived = true` until a later prune deletes it (default `False`) |
+| `superseded_by` | `str \| None` | `node_id` of the replacing fact (default `None`) |
+| `content_hash` | `str` | Hex SHA-256 of `concept` + `content` |
+| `dedup_key` | `str \| None` | Caller-supplied dedup identity (default `None`) |
+
+The eight fields after `created_at` are additive and backward compatible: facts
+written by earlier versions default-populate them on read. See
+[Fact Lifecycle](fact_lifecycle.md) for deduplication (`upsert_fact`),
+supersession (`supersede_fact`), and pruning (`prune_semantic_memory`).
 
 ---
 
