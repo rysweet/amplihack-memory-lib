@@ -1,4 +1,7 @@
+use super::super::types::ET_PROCEDURE_DERIVES_FROM;
 use super::super::*;
+use crate::graph::Direction;
+use crate::MemoryError;
 
 fn make_cm() -> CognitiveMemory {
     CognitiveMemory::new(&format!("test-agent-{}", uuid::Uuid::new_v4())).unwrap()
@@ -164,4 +167,181 @@ fn test_recall_procedure_increments_and_orders_by_usage() {
     let ranked = cm.search_procedures("shared", 10);
     assert_eq!(ranked[0].usage_count, 4);
     assert_eq!(ranked[1].usage_count, 1);
+}
+
+// ===========================================================================
+// Provenance edges (issue #90):
+//   ProceduralMemory --PROCEDURE_DERIVES_FROM--> EpisodicMemory
+//
+// File: rust/amplihack-memory/src/cognitive_memory/tests/procedural_tests.rs
+//
+// Failing-first TDD tests for the not-yet-implemented
+// `store_procedure_with_provenance`, `store_procedure_with_provenance_strict`,
+// the new `ET_PROCEDURE_DERIVES_FROM` constant, and `procedure_provenance`.
+// ===========================================================================
+
+/// A procedure stored with one source episode gets exactly one outgoing
+/// `PROCEDURE_DERIVES_FROM` edge procedure -> episode. (Invariants I1, I8.)
+#[test]
+fn test_store_procedure_with_provenance_creates_edge() {
+    let mut cm = make_cm();
+    let ep = cm
+        .store_episode("watched a production deploy", "ops", None, None)
+        .unwrap();
+
+    let proc = cm
+        .store_procedure_with_provenance(
+            "deploy",
+            &["build".to_string(), "rollout".to_string()],
+            None,
+            std::slice::from_ref(&ep),
+        )
+        .unwrap();
+    assert!(proc.starts_with("proc_"));
+
+    let neighbors = cm.graph.query_neighbors(
+        &proc,
+        Some(ET_PROCEDURE_DERIVES_FROM),
+        Direction::Outgoing,
+        10,
+    );
+    assert_eq!(
+        neighbors.len(),
+        1,
+        "expected exactly one PROCEDURE_DERIVES_FROM edge"
+    );
+    assert_eq!(neighbors[0].0.edge_type, ET_PROCEDURE_DERIVES_FROM);
+    assert_eq!(neighbors[0].1.node_id, ep);
+
+    // The procedure is otherwise stored normally.
+    let procs = cm.search_procedures("deploy", 10);
+    assert_eq!(procs.len(), 1);
+    assert_eq!(
+        procs[0].steps,
+        vec!["build".to_string(), "rollout".to_string()]
+    );
+
+    // Public typed read path.
+    assert_eq!(cm.procedure_provenance(&proc), vec![ep]);
+}
+
+/// Lenient mode skips a missing source episode and still succeeds.
+/// (Invariant I2.)
+#[test]
+fn test_store_procedure_with_provenance_lenient_skips_missing() {
+    let mut cm = make_cm();
+    let ep = cm.store_episode("real episode", "src", None, None).unwrap();
+
+    let proc = cm
+        .store_procedure_with_provenance(
+            "p",
+            &["s".to_string()],
+            None,
+            &[ep.clone(), "epi_missing".to_string()],
+        )
+        .expect("lenient procedure provenance store must succeed");
+
+    assert_eq!(cm.procedure_provenance(&proc), vec![ep]);
+}
+
+/// Strict mode rejects a missing source episode with `InvalidInput` and writes
+/// zero edges. (Invariant I4.)
+#[test]
+fn test_store_procedure_with_provenance_strict_errors_on_missing() {
+    let mut cm = make_cm();
+    let ep = cm.store_episode("real episode", "src", None, None).unwrap();
+
+    let result = cm.store_procedure_with_provenance_strict(
+        "p",
+        &["s".to_string()],
+        None,
+        &[ep.clone(), "epi_missing".to_string()],
+    );
+    assert!(
+        matches!(result, Err(MemoryError::InvalidInput(_))),
+        "strict mode must reject a missing source episode, got {result:?}"
+    );
+
+    let incoming = cm.graph.query_neighbors(
+        &ep,
+        Some(ET_PROCEDURE_DERIVES_FROM),
+        Direction::Incoming,
+        10,
+    );
+    assert!(
+        incoming.is_empty(),
+        "a strict failure must create zero provenance edges (atomicity)"
+    );
+}
+
+/// Plain `store_procedure` stays backward compatible: no provenance edges.
+/// (Invariant I5.)
+#[test]
+fn test_store_procedure_backward_compatible_no_edges() {
+    let mut cm = make_cm();
+    let _ep = cm.store_episode("unrelated", "src", None, None).unwrap();
+
+    let proc = cm.store_procedure("p", &["s".to_string()], None).unwrap();
+
+    let neighbors = cm.graph.query_neighbors(
+        &proc,
+        Some(ET_PROCEDURE_DERIVES_FROM),
+        Direction::Outgoing,
+        10,
+    );
+    assert!(
+        neighbors.is_empty(),
+        "plain store_procedure must not create provenance edges"
+    );
+    assert!(cm.procedure_provenance(&proc).is_empty());
+}
+
+/// The idempotent upsert-by-name is preserved by the provenance variant:
+/// re-storing the same name reuses the node id (provenance never forks the
+/// node), updates steps in place, and attaches provenance edges to the single
+/// canonical node. (Invariant I6.)
+#[test]
+fn test_store_procedure_with_provenance_upsert_preserves_node_id() {
+    let mut cm = make_cm();
+    let ep1 = cm.store_episode("ep1", "src", None, None).unwrap();
+    let ep2 = cm.store_episode("ep2", "src", None, None).unwrap();
+
+    let id1 = cm
+        .store_procedure_with_provenance(
+            "build",
+            &["a".to_string()],
+            None,
+            std::slice::from_ref(&ep1),
+        )
+        .unwrap();
+    let id2 = cm
+        .store_procedure_with_provenance(
+            "build",
+            &["a".to_string(), "b".to_string()],
+            None,
+            std::slice::from_ref(&ep2),
+        )
+        .unwrap();
+
+    assert_eq!(id1, id2, "re-storing the same name must reuse the node id");
+    assert_eq!(
+        cm.get_memory_stats().get("procedural"),
+        Some(&1),
+        "idempotent upsert must not accumulate duplicate procedure nodes"
+    );
+
+    // Steps were updated in place by the second store.
+    let procs = cm.search_procedures("build", 10);
+    assert_eq!(procs.len(), 1);
+    assert_eq!(procs[0].steps, vec!["a".to_string(), "b".to_string()]);
+
+    // Both provenance edges attach to the single canonical node.
+    let mut prov = cm.procedure_provenance(&id1);
+    prov.sort();
+    let mut want = vec![ep1, ep2];
+    want.sort();
+    assert_eq!(
+        prov, want,
+        "provenance edges from both upsert calls attach to the same node"
+    );
 }

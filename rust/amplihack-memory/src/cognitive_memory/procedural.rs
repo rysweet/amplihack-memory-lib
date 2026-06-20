@@ -8,7 +8,7 @@ use crate::{MemoryError, Result};
 use tracing::warn;
 
 use super::converters::node_to_procedural;
-use super::types::{agent_filter, new_id, ts_now, NT_PROCEDURAL};
+use super::types::{agent_filter, new_id, ts_now, ET_PROCEDURE_DERIVES_FROM, NT_PROCEDURAL};
 use super::CognitiveMemory;
 
 impl CognitiveMemory {
@@ -19,7 +19,119 @@ impl CognitiveMemory {
     /// place and returns its `node_id` rather than creating a duplicate. This
     /// matches the semantics consumers expect when re-registering procedures
     /// (e.g. on agent restart) and avoids unbounded duplicate accumulation.
+    ///
+    /// Backward-compatible: this is exactly
+    /// [`store_procedure_with_provenance`](Self::store_procedure_with_provenance)
+    /// with no source episodes, so it never creates provenance edges.
     pub fn store_procedure(
+        &mut self,
+        name: &str,
+        steps: &[String],
+        prerequisites: Option<&[String]>,
+    ) -> Result<String> {
+        self.store_procedure_with_provenance(name, steps, prerequisites, &[])
+    }
+
+    /// Store a procedure and link it to the episodes it was derived from.
+    ///
+    /// Identical to [`store_procedure`](Self::store_procedure) — including the
+    /// idempotent upsert-by-name — but additionally creates a
+    /// `PROCEDURE_DERIVES_FROM` edge from the (possibly pre-existing) procedure
+    /// node to each id in `source_episode_ids`. Re-storing the same name reuses
+    /// the canonical node, so provenance edges from multiple calls all attach to
+    /// a single node rather than forking it.
+    ///
+    /// Lenient: a source-episode id that does not resolve to an existing
+    /// [`EpisodicMemory`](crate::memory_types::EpisodicMemory) node is skipped
+    /// with a warning. Use
+    /// [`store_procedure_with_provenance_strict`](Self::store_procedure_with_provenance_strict)
+    /// to reject missing episodes instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError::Storage` if the node or an edge cannot be
+    /// persisted.
+    pub fn store_procedure_with_provenance(
+        &mut self,
+        name: &str,
+        steps: &[String],
+        prerequisites: Option<&[String]>,
+        source_episode_ids: &[String],
+    ) -> Result<String> {
+        self.store_procedure_with_provenance_inner(
+            name,
+            steps,
+            prerequisites,
+            source_episode_ids,
+            false,
+        )
+    }
+
+    /// Strict variant of
+    /// [`store_procedure_with_provenance`](Self::store_procedure_with_provenance):
+    /// any id in `source_episode_ids` that is not an existing episode node makes
+    /// the whole call fail with `MemoryError::InvalidInput` and write zero edges
+    /// (and perform no upsert), giving validate-then-emit atomicity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MemoryError::InvalidInput` if any source episode is missing, or
+    /// `MemoryError::Storage` on a backend failure.
+    pub fn store_procedure_with_provenance_strict(
+        &mut self,
+        name: &str,
+        steps: &[String],
+        prerequisites: Option<&[String]>,
+        source_episode_ids: &[String],
+    ) -> Result<String> {
+        self.store_procedure_with_provenance_inner(
+            name,
+            steps,
+            prerequisites,
+            source_episode_ids,
+            true,
+        )
+    }
+
+    fn store_procedure_with_provenance_inner(
+        &mut self,
+        name: &str,
+        steps: &[String],
+        prerequisites: Option<&[String]>,
+        source_episode_ids: &[String],
+        strict: bool,
+    ) -> Result<String> {
+        // Validate-then-emit: in strict mode reject before any write (including
+        // the upsert) so a failure changes nothing.
+        if strict {
+            for ep in source_episode_ids {
+                if !self.is_source_episode(ep) {
+                    return Err(MemoryError::InvalidInput(format!(
+                        "source episode {ep} not found"
+                    )));
+                }
+            }
+        }
+
+        let node_id = self.upsert_procedure(name, steps, prerequisites)?;
+
+        for ep in source_episode_ids {
+            if self.is_source_episode(ep) {
+                self.add_provenance_edge(&node_id, ep, ET_PROCEDURE_DERIVES_FROM)?;
+            } else {
+                warn!(
+                    "store_procedure_with_provenance: source episode {ep} not found; \
+                     skipping PROCEDURE_DERIVES_FROM edge"
+                );
+            }
+        }
+
+        Ok(node_id)
+    }
+
+    /// Idempotent upsert-by-name: update an existing procedure's
+    /// steps/prerequisites in place (returning its id) or insert a new node.
+    fn upsert_procedure(
         &mut self,
         name: &str,
         steps: &[String],
@@ -66,6 +178,15 @@ impl CognitiveMemory {
             .map_err(|e| MemoryError::Storage(e.to_string()))?;
 
         Ok(node_id)
+    }
+
+    /// Return the ids of the episodes a procedure was derived from.
+    ///
+    /// Reads the `PROCEDURE_DERIVES_FROM` provenance edges outgoing from
+    /// `procedure_id`. Returns an empty vector for an unknown id or a procedure
+    /// with no provenance.
+    pub fn procedure_provenance(&self, procedure_id: &str) -> Vec<String> {
+        self.provenance_targets(procedure_id, ET_PROCEDURE_DERIVES_FROM)
     }
 
     /// Return the `node_id` of an existing procedure with `name` for this agent,

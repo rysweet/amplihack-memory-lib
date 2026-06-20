@@ -838,3 +838,106 @@ fn checkpoint_then_reopen_returns_all_records_and_needs_no_replay() {
     let cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
     assert_eq!(*cm.get_memory_stats().get("total").unwrap(), expected_total);
 }
+
+// ===========================================================================
+// Provenance edges (issue #90): durability across close + reopen
+//
+// File: rust/amplihack-memory/src/cognitive_memory/tests/persistent_tests.rs
+//
+// Failing-first TDD tests proving DERIVES_FROM / PROCEDURE_DERIVES_FROM edges
+// survive a drop + reopen on the LadybugDB persistent backend (which also
+// proves the new PROCEDURE_DERIVES_FROM rel table is reintrospected on reopen).
+// Gated by the `persistent` feature via the parent `tests` module.
+// (Invariant I7.)
+// ===========================================================================
+
+#[test]
+fn fact_provenance_edge_survives_reopen() {
+    use crate::cognitive_memory::types::ET_DERIVES_FROM;
+    use crate::graph::Direction;
+
+    let (_tmp, path) = temp_db();
+    let fact_id;
+    let ep_id;
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        ep_id = cm
+            .store_episode("source episode", "src", Some(1), None)
+            .unwrap();
+        fact_id = cm
+            .store_fact_with_provenance(
+                "concept",
+                "derived knowledge",
+                0.9,
+                "",
+                None,
+                None,
+                std::slice::from_ref(&ep_id),
+            )
+            .unwrap();
+
+        // Edge present before close.
+        assert_eq!(cm.fact_provenance(&fact_id), vec![ep_id.clone()]);
+        cm.close();
+    } // dropped -> LadybugDB flushed to disk
+
+    let cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+
+    // The DERIVES_FROM edge survived close + reopen, observable via both the
+    // public read path and a raw neighbor query.
+    assert_eq!(
+        cm.fact_provenance(&fact_id),
+        vec![ep_id.clone()],
+        "fact provenance edge must persist across close + reopen"
+    );
+    let neighbors =
+        cm.graph
+            .query_neighbors(&fact_id, Some(ET_DERIVES_FROM), Direction::Outgoing, 10);
+    assert_eq!(neighbors.len(), 1);
+    assert_eq!(neighbors[0].1.node_id, ep_id);
+}
+
+#[test]
+fn procedure_provenance_edge_survives_reopen() {
+    use crate::cognitive_memory::types::ET_PROCEDURE_DERIVES_FROM;
+    use crate::graph::Direction;
+
+    let (_tmp, path) = temp_db();
+    let proc_id;
+    let ep_id;
+    {
+        let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+        ep_id = cm
+            .store_episode("deploy event", "ops", Some(1), None)
+            .unwrap();
+        proc_id = cm
+            .store_procedure_with_provenance(
+                "deploy",
+                &steps(&["build", "rollout"]),
+                None,
+                std::slice::from_ref(&ep_id),
+            )
+            .unwrap();
+
+        assert_eq!(cm.procedure_provenance(&proc_id), vec![ep_id.clone()]);
+        cm.close();
+    } // dropped -> LadybugDB flushed to disk
+
+    let cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+
+    // The PROCEDURE_DERIVES_FROM edge survived reopen; reaching it also proves
+    // the new rel table was reintrospected.
+    assert_eq!(
+        cm.procedure_provenance(&proc_id),
+        vec![ep_id.clone()],
+        "procedure provenance edge must persist across close + reopen"
+    );
+    let neighbors = cm.graph.query_neighbors(
+        &proc_id,
+        Some(ET_PROCEDURE_DERIVES_FROM),
+        Direction::Outgoing,
+        10,
+    );
+    assert_eq!(neighbors.len(), 1);
+    assert_eq!(neighbors[0].1.node_id, ep_id);
+}
