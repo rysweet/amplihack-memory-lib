@@ -20,14 +20,14 @@
 //! * **Reopen-safe** — on first access the existing catalog is introspected
 //!   (`CALL show_tables` / `CALL table_info`) so data written in a previous
 //!   process is visible after `close` + reopen.
-//! * **Durability** — writes are serialized through a [`Mutex`], every mutating
+//! * **Durability** — writes are serialized through a [`Mutex`](std::sync::Mutex), every mutating
 //!   operation issues a per-write `fsync` barrier (data file + parent
 //!   directory), and `close` issues a `CHECKPOINT` so a subsequent reopen sees
 //!   all committed writes. Without the barrier a crash between two writes could
 //!   lose an acknowledged write, since LadybugDB only flushes its WAL on
 //!   `Database::drop`.
 //! * **Bounded crash loss** — the store auto-checkpoints after every
-//!   [`AUTO_CHECKPOINT_WRITES`] mutating operations (and always on `close` /
+//!   [`AUTO_CHECKPOINT_WRITES`](crate::graph::lbug_store::AUTO_CHECKPOINT_WRITES) mutating operations (and always on `close` /
 //!   `Drop`), flushing the write-ahead log into the main database file. An
 //!   unclean shutdown therefore loses at most the handful of writes accumulated
 //!   since the last checkpoint, rather than every uncheckpointed record.
