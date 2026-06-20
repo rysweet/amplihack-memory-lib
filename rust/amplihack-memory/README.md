@@ -261,10 +261,10 @@ procedure storage). See `src/graph/lbug_store/` for details.
 The persistent backend is hardened against the failure mode where a process is
 killed mid-write and the write-ahead log (WAL) is left partially written:
 
-- **Corrupt-WAL recovery.** `open_persistent` first attempts a strict open; if
-  the WAL cannot be replayed (the failure that previously made the store
-  permanently unopenable and crashed with a C++ assertion), it transparently
-  falls back to `open_persistent_with_recovery`. The unreplayable WAL is **moved
+- **Corrupt-WAL recovery.** `open_persistent` delegates to
+  `open_persistent_with_recovery`, which first attempts a strict open; if the WAL
+  cannot be replayed (the failure that previously made the store permanently
+  unopenable and crashed with a C++ assertion), the unreplayable WAL is **moved
   aside** to `<wal>.corrupt-<timestamp>` (never deleted), the recoverable prefix
   is replayed, and a checkpoint folds it into the main database file. A
   structured `warn!` reports how many records survived. A clean open is
@@ -275,9 +275,8 @@ killed mid-write and the write-ahead log (WAL) is left partially written:
 - **Bounded loss / auto-checkpoint.** The store auto-checkpoints after every
   `AUTO_CHECKPOINT_WRITES` (128) mutating operations and always on `close` /
   `Drop`, and leaves LadybugDB's own `auto_checkpoint` enabled to bound the WAL
-  as a safety net. An unclean
-  shutdown therefore strands at most a small, bounded number of writes in the
-  WAL rather than every uncheckpointed record.
+  as a safety net. An unclean shutdown therefore strands at most a small,
+  bounded number of writes in the WAL rather than every uncheckpointed record.
 
 ### Pattern detection
 
