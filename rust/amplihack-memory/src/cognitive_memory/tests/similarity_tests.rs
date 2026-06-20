@@ -4,8 +4,8 @@
 //! (issue #90). These bind to the not-yet-implemented public contract:
 //!   - types  `SimilarityOptions`, `SimilarityReport`, `StoreFactOptions`
 //!   - methods `CognitiveMemory::auto_link_similar_facts`,
-//!             `CognitiveMemory::rebuild_similarity_links`,
-//!             `CognitiveMemory::store_fact_with_options`
+//!     `CognitiveMemory::rebuild_similarity_links`,
+//!     `CognitiveMemory::store_fact_with_options`
 //!
 //! They are backend-agnostic (default in-memory gate); the same behavior is
 //! re-proven for durability under `--features persistent` in
