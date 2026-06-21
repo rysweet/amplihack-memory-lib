@@ -269,6 +269,25 @@ killed mid-write and the write-ahead log (WAL) is left partially written:
   is replayed, and a checkpoint folds it into the main database file. A
   structured `warn!` reports how many records survived. A clean open is
   unaffected: no artifact is written and no warning emitted.
+- **Catalog / main-DB corruption recovery (#95).** If the main database itself is
+  corrupt — it will not open even with the WAL fully quarantined, or with no WAL
+  present at all (the catalog corruption a failed `CHECKPOINT` could leave, which
+  previously crash-looped the consumer forever) — the **entire database** is
+  moved aside to `<db_path>.corrupt-<timestamp>` (never deleted) and a fresh,
+  empty database is opened in its place, reported as
+  `WalRecoveryOutcome::RebuiltAfterCorruption`. The store self-heals instead of
+  failing on every restart. The strict `open()` stays strict and still errors.
+- **Configurable, larger limits (#95).** The LadybugDB buffer-pool cap and
+  maximum database size are read from `AMPLIHACK_MEMORY_BUFFER_POOL_BYTES` and
+  `AMPLIHACK_MEMORY_MAX_DB_BYTES` (bytes), defaulting to **1 GiB** (buffer pool,
+  raised from 128 MiB) and **16 GiB** (max DB size, raised from 1 GiB). The old
+  128 MiB pool let an auto-`CHECKPOINT` exhaust the buffer pool on a busy host
+  and corrupt the catalog; the pool is allocated lazily and `max_db_size` is only
+  an mmap reservation, so the larger defaults cost nothing until data needs them.
+  Overrides are clamped to sane minimums (64 MiB / 1 GiB), `buffer_pool` is kept
+  `<= max_db_size`, and the effective values are logged once at open. Inspect
+  them via `LbugGraphStore::buffer_pool_bytes()` / `max_db_bytes()`; a failed
+  checkpoint (e.g. buffer-pool exhaustion) is recorded in `last_checkpoint_error()`.
 - **Checkpoint API.** `CognitiveMemory::checkpoint()` forces the WAL into the
   main database file, so a subsequent clean reopen needs no replay. It is a
   no-op for the in-memory backend.
