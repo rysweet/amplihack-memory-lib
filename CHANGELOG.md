@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Critical durability bug (#95):** a failed auto-`CHECKPOINT` could
+  permanently brick the persistent store and crash-loop the consumer. The
+  buffer-pool cap was hardcoded at **128 MiB**, so on a busy host a checkpoint
+  exhausted it (`"Buffer manager exception: ... buffer pool is full"`); the
+  failed checkpoint corrupted the catalog, and every subsequent open failed with
+  `"Load table failed: table 0 doesn't exist in catalog"`. Recovery only handled
+  a corrupt WAL, not a corrupt catalog, so the error propagated and the daemon
+  `exit(1)`'d forever. Two complementary fixes:
+  - **Larger, configurable limits** remove the trigger: the buffer-pool cap and
+    max database size are now read from `AMPLIHACK_MEMORY_BUFFER_POOL_BYTES` /
+    `AMPLIHACK_MEMORY_MAX_DB_BYTES` and default to **1 GiB** (buffer pool, up
+    from 128 MiB) and **16 GiB** (max DB size, up from 1 GiB). lbug allocates the
+    buffer pool lazily and `max_db_size` is only an mmap reservation, so the
+    larger caps cost nothing until data needs them. Overrides are clamped to sane
+    minimums (64 MiB / 1 GiB), `buffer_pool <= max_db_size` is enforced, and the
+    effective values are logged once at open.
+  - **Catalog / main-DB corruption recovery** removes the crash loop:
+    `open_with_recovery` (and therefore `open_persistent`) now self-heals a
+    corrupt catalog. When the main database cannot be opened even with the WAL
+    fully quarantined — or with no WAL present at all — the entire database is
+    quarantined to `<db_path>.corrupt-<timestamp>` (moved aside, never deleted)
+    and a fresh, empty database is opened, surfaced as the new
+    `WalRecoveryOutcome::RebuiltAfterCorruption`. The strict `open()` stays
+    strict and still errors.
 - **Critical durability bug (#88):** the persistent `CognitiveMemory`
   (`LbugGraphStore`) could no longer be opened after an unclean shutdown left
   the LadybugDB write-ahead log (WAL) partially written — `open_persistent`
@@ -18,6 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpoint folds the survivors into the main database file.
 
 ### Added
+- `AMPLIHACK_MEMORY_BUFFER_POOL_BYTES` / `AMPLIHACK_MEMORY_MAX_DB_BYTES`
+  environment overrides for the LadybugDB buffer-pool cap and max database size,
+  plus `LbugGraphStore::buffer_pool_bytes()` / `max_db_bytes()` getters for the
+  effective values.
+- `WalRecoveryOutcome::RebuiltAfterCorruption` — reported when a corrupt
+  catalog / main database file is quarantined and a fresh empty database is
+  rebuilt in its place (`recovered_records = 0`, quarantine path recorded).
+- `LbugGraphStore::last_checkpoint_error()` — exposes the most recent
+  checkpoint failure (e.g. buffer-pool exhaustion), cleared on the next
+  successful checkpoint, so consumers can surface store health.
 - `CognitiveMemory::open_persistent_with_recovery` and
   `LbugGraphStore::open_with_recovery` — explicit corrupt-WAL recovery entry
   points returning a structured `WalRecovery` report (`WalRecoveryOutcome`,

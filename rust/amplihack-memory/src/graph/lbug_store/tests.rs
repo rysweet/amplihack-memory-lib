@@ -286,7 +286,11 @@ fn execute_error_does_not_leak_query_values() {
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{wal_path_for, WalRecoveryOutcome};
+use super::{
+    effective_limits, resolve_buffer_pool_bytes, resolve_max_db_bytes, wal_path_for,
+    WalRecoveryOutcome, DEFAULT_BUFFER_POOL_BYTES, DEFAULT_MAX_DB_BYTES, MIN_BUFFER_POOL_BYTES,
+    MIN_MAX_DB_BYTES,
+};
 
 /// Insert `n` simple nodes into a fresh "T" table.
 fn add_things(store: &mut LbugGraphStore, start: usize, n: usize) {
@@ -465,5 +469,224 @@ fn auto_checkpoint_bounds_uncheckpointed_writes() {
         n < 10,
         "the last writes should still have been WAL-only, got {n}"
     );
+    drop(crash);
+}
+
+// ---------------------------------------------------------------------------
+// Configurable buffer-pool / max-db-size resolution (pure functions)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resolves_larger_defaults_when_unset() {
+    assert_eq!(resolve_buffer_pool_bytes(None), DEFAULT_BUFFER_POOL_BYTES);
+    assert_eq!(resolve_max_db_bytes(None), DEFAULT_MAX_DB_BYTES);
+    // The new defaults must be larger than the old hardcoded 128 MiB / 1 GiB
+    // that allowed the buffer pool to exhaust and corrupt the catalog (#95).
+    assert_eq!(
+        DEFAULT_BUFFER_POOL_BYTES,
+        1 << 30,
+        "buffer pool default = 1 GiB"
+    );
+    assert_eq!(DEFAULT_MAX_DB_BYTES, 16u64 << 30, "max db default = 16 GiB");
+}
+
+#[test]
+fn resolves_valid_env_overrides() {
+    // 2 GiB pool / 32 GiB max — both above their minimums, used verbatim.
+    assert_eq!(resolve_buffer_pool_bytes(Some("2147483648")), 2_147_483_648);
+    assert_eq!(resolve_max_db_bytes(Some("34359738368")), 34_359_738_368);
+}
+
+#[test]
+fn clamps_overrides_below_minimum() {
+    assert_eq!(
+        resolve_buffer_pool_bytes(Some("1024")),
+        MIN_BUFFER_POOL_BYTES
+    );
+    assert_eq!(resolve_max_db_bytes(Some("1024")), MIN_MAX_DB_BYTES);
+}
+
+#[test]
+fn invalid_overrides_fall_back_to_default() {
+    for bad in [
+        "",
+        "   ",
+        "abc",
+        "-5",
+        "0",
+        "12.5",
+        "1_000",
+        "9999999999999999999999",
+    ] {
+        assert_eq!(
+            resolve_buffer_pool_bytes(Some(bad)),
+            DEFAULT_BUFFER_POOL_BYTES,
+            "buffer pool should default for invalid override {bad:?}"
+        );
+        assert_eq!(
+            resolve_max_db_bytes(Some(bad)),
+            DEFAULT_MAX_DB_BYTES,
+            "max db should default for invalid override {bad:?}"
+        );
+    }
+}
+
+#[test]
+fn effective_limits_keeps_buffer_pool_at_or_below_max_db() {
+    // A buffer pool larger than the whole database is clamped down to max_db.
+    let (buf, max) = effective_limits(Some("9999999999999"), Some("1073741824"));
+    assert_eq!(max, 1 << 30, "1 GiB max honored");
+    assert_eq!(buf, 1 << 30, "buffer pool clamped to max_db");
+    assert!(buf <= max);
+
+    // Defaults already satisfy the invariant (1 GiB pool <= 16 GiB max).
+    let (dbuf, dmax) = effective_limits(None, None);
+    assert!(dbuf <= dmax);
+    assert_eq!(
+        (dbuf, dmax),
+        (DEFAULT_BUFFER_POOL_BYTES, DEFAULT_MAX_DB_BYTES)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Catalog / main-DB corruption recovery (no more crash loop, #95)
+// ---------------------------------------------------------------------------
+
+/// Overwrite the main database file with garbage so the catalog/header is
+/// unreadable — the on-disk shape of the #95 incident ("table 0 doesn't exist
+/// in catalog") where a failed CHECKPOINT corrupted the main file.
+fn corrupt_db_file(db: &Path) {
+    let len = fs::metadata(db).unwrap().len();
+    assert!(len > 0, "db file should be non-empty to corrupt: {len}");
+    fs::write(db, vec![0xABu8; len as usize]).unwrap();
+    let f = fs::OpenOptions::new().write(true).open(db).unwrap();
+    f.sync_all().unwrap();
+}
+
+/// Assert a recovery report describes a fresh rebuild: empty, quarantined to a
+/// `*.corrupt-*` sibling that still exists on disk, and the returned store is
+/// empty and writable.
+fn assert_rebuilt(store: &mut LbugGraphStore, report: &super::WalRecovery) {
+    assert_eq!(
+        report.outcome,
+        WalRecoveryOutcome::RebuiltAfterCorruption,
+        "a corrupt catalog must trigger a rebuild"
+    );
+    assert!(report.recovered(), "rebuild counts as recovery");
+    assert_eq!(
+        report.recovered_records, 0,
+        "a fresh database has no records"
+    );
+
+    let quarantine = report
+        .quarantined_wal
+        .as_ref()
+        .expect("the corrupt database must be quarantined, never deleted");
+    assert!(
+        quarantine.exists(),
+        "corrupt database must be preserved at {quarantine:?}"
+    );
+    assert!(
+        quarantine
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(".corrupt-"),
+        "quarantine path must be a *.corrupt-* sibling, was {quarantine:?}"
+    );
+
+    assert_eq!(store.count_all_nodes(), 0, "rebuilt store starts empty");
+
+    // The rebuilt store must be writable.
+    store
+        .add_node(
+            "T",
+            props(&[("node_id", "fresh1"), ("agent_id", "a")]),
+            Some("fresh1"),
+        )
+        .unwrap();
+    assert_eq!(
+        store.count_all_nodes(),
+        1,
+        "rebuilt store must accept writes"
+    );
+    assert_eq!(store.get_node("fresh1").unwrap().node_id, "fresh1");
+}
+
+#[test]
+fn open_with_recovery_rebuilds_after_corrupt_catalog_no_wal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        add_things(&mut store, 0, 20);
+        store.checkpoint().unwrap(); // fold everything into the main DB file
+        store.close();
+    } // drop -> final checkpoint; the WAL is now empty/absent.
+
+    // Snapshot the on-disk files, drop any WAL (this is the no-WAL case), and
+    // corrupt the main database file of the copy.
+    let (crash, crash_db) = crash_snapshot(path.parent().unwrap(), "graph.ladybug");
+    let crash_wal = wal_path_for(&crash_db);
+    let _ = fs::remove_file(&crash_wal);
+    assert!(!crash_wal.exists(), "no-WAL case: WAL must be absent");
+    corrupt_db_file(&crash_db);
+
+    // A strict open of a corrupt catalog must fail (this is the incident).
+    assert!(
+        LbugGraphStore::open(&crash_db, Some("s")).is_err(),
+        "strict open of a corrupt catalog should error"
+    );
+
+    // Resilient open self-heals: quarantine + fresh empty DB, no crash loop.
+    let (mut store, report) =
+        LbugGraphStore::open_with_recovery(&crash_db, Some("s")).expect("recovery must open");
+    assert_rebuilt(&mut store, &report);
+
+    drop(store);
+    // A subsequent strict reopen now succeeds (fresh DB, nothing to replay).
+    let reopened = LbugGraphStore::open(&crash_db, Some("s")).expect("clean reopen after rebuild");
+    assert_eq!(reopened.count_all_nodes(), 1);
+
+    drop(reopened);
+    drop(crash);
+}
+
+#[test]
+fn open_with_recovery_rebuilds_after_corrupt_catalog_with_wal_present() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        store.set_checkpoint_interval(0); // keep writes in the WAL until we ask
+        add_things(&mut store, 0, 20);
+        store.checkpoint().unwrap(); // some records folded into the main DB file
+        add_things(&mut store, 20, 20); // these stay in the WAL
+        std::mem::forget(store); // unclean: no close, no final checkpoint
+    }
+
+    // Snapshot: both a main DB file AND a non-empty WAL are present.
+    let (crash, crash_db) = crash_snapshot(path.parent().unwrap(), "graph.ladybug");
+    let crash_wal = wal_path_for(&crash_db);
+    assert!(
+        crash_wal.exists(),
+        "WAL-present case: snapshot must include a WAL"
+    );
+    // Corrupt the main DB file; the WAL stays in place so recovery goes through
+    // the WAL path first, then discovers the main file itself is unopenable.
+    corrupt_db_file(&crash_db);
+
+    assert!(
+        LbugGraphStore::open(&crash_db, Some("s")).is_err(),
+        "strict open of a corrupt catalog should error even with a WAL present"
+    );
+
+    let (mut store, report) =
+        LbugGraphStore::open_with_recovery(&crash_db, Some("s")).expect("recovery must open");
+    assert_rebuilt(&mut store, &report);
+
+    drop(store);
     drop(crash);
 }

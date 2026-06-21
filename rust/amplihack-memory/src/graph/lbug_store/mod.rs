@@ -38,6 +38,18 @@
 //!   the corrupt WAL is quarantined to `<wal>.corrupt-<ts>`, a resilient open
 //!   replays the good prefix, and a `CHECKPOINT` folds the recovered records into
 //!   the main database file so a subsequent clean reopen needs no replay.
+//! * **Catalog / main-DB corruption recovery** — if the engine cannot open the
+//!   main database even with the WAL fully quarantined (a corrupt catalog / main
+//!   file, e.g. left by a failed CHECKPOINT — the cause of the #95 crash loop),
+//!   [`open_with_recovery`](LbugGraphStore::open_with_recovery) quarantines the
+//!   entire database to `<db_path>.corrupt-<ts>` (moved aside, never deleted) and
+//!   opens a fresh, empty database so the store self-heals instead of failing
+//!   forever. The strict [`open`](LbugGraphStore::open) stays strict and errors.
+//! * **Configurable limits** — the LadybugDB buffer-pool cap and maximum
+//!   database size are read from `AMPLIHACK_MEMORY_BUFFER_POOL_BYTES` /
+//!   `AMPLIHACK_MEMORY_MAX_DB_BYTES` (with larger, safer defaults than the old
+//!   hardcoded 128 MiB / 1 GiB) so a busy host can raise the pool and avoid the
+//!   checkpoint-time buffer-pool exhaustion that corrupted the catalog (#95).
 //! * **Injection-safe** — table/column/edge identifiers are validated against
 //!   `[A-Za-z_][A-Za-z0-9_]*`, all string values are escaped via `escape_cypher`,
 //!   and `LIMIT` is a type-safe `usize`.
@@ -55,7 +67,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lbug::{Connection, Database, SystemConfig, Value};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::MemoryError;
 
@@ -64,6 +76,35 @@ use crate::MemoryError;
 /// much acknowledged-but-uncheckpointed data an unclean shutdown can strand in
 /// the WAL (and therefore put at risk if that WAL is later found corrupt).
 pub const AUTO_CHECKPOINT_WRITES: u64 = 128;
+
+/// Environment variable overriding the LadybugDB buffer-pool size cap, in bytes.
+///
+/// The pool is allocated *lazily* by lbug, so this is a ceiling — not an upfront
+/// allocation. Raising it is therefore cheap and prevents the checkpoint-time
+/// "buffer pool is full" exhaustion that previously corrupted the catalog (#95).
+pub const ENV_BUFFER_POOL_BYTES: &str = "AMPLIHACK_MEMORY_BUFFER_POOL_BYTES";
+
+/// Environment variable overriding the LadybugDB maximum database size, in bytes.
+///
+/// `max_db_size` is only an mmap address-space *reservation*, not eager
+/// allocation, so a large value costs nothing until data actually grows.
+pub const ENV_MAX_DB_BYTES: &str = "AMPLIHACK_MEMORY_MAX_DB_BYTES";
+
+/// Default buffer-pool cap (1 GiB), raised from the previous 128 MiB that caused
+/// auto-CHECKPOINT to exhaust the pool on a busy host. lbug allocates the pool
+/// lazily, so this larger cap is safe.
+pub(crate) const DEFAULT_BUFFER_POOL_BYTES: u64 = 1 << 30;
+
+/// Floor for the buffer-pool cap (64 MiB): an absurdly small override is clamped
+/// up to this so the engine can't be starved.
+pub(crate) const MIN_BUFFER_POOL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default maximum database size (16 GiB), raised from the previous 1 GiB. This
+/// is only an mmap reservation, so a large default does not allocate memory.
+pub(crate) const DEFAULT_MAX_DB_BYTES: u64 = 16 << 30;
+
+/// Floor for the maximum database size (1 GiB).
+pub(crate) const MIN_MAX_DB_BYTES: u64 = 1 << 30;
 
 /// How [`LbugGraphStore::open_with_recovery`] opened the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +118,13 @@ pub enum WalRecoveryOutcome {
     /// The WAL was unusable even in resilient mode; it was quarantined and the
     /// store was opened from the last good checkpoint only.
     CheckpointOnly,
+    /// The main database / catalog itself was corrupt and unopenable even with
+    /// the WAL fully out of the way (the failure mode that previously
+    /// crash-looped consumers, #95). The corrupt database was quarantined to
+    /// `<db_path>.corrupt-<ts>` (moved aside, never deleted) and a fresh, empty
+    /// database was opened at `db_path` so the store self-heals instead of
+    /// failing forever. `recovered_records` is `0`.
+    RebuiltAfterCorruption,
 }
 
 /// Structured report describing a recovery open. Surfaced via a `warn!` log and
@@ -89,8 +137,11 @@ pub struct WalRecovery {
     /// Number of records (graph nodes) present after recovery. Only computed on
     /// a recovery path; `0` for [`WalRecoveryOutcome::Clean`].
     pub recovered_records: usize,
-    /// Where the corrupt WAL (and any sidecars) were quarantined, if recovery
-    /// ran. The bad WAL is moved aside — never deleted.
+    /// Where the corrupt artifact was quarantined, if recovery ran. For a WAL
+    /// recovery this is the moved-aside WAL (`<wal>.corrupt-<ts>`); for
+    /// [`WalRecoveryOutcome::RebuiltAfterCorruption`] it is the moved-aside
+    /// database (`<db_path>.corrupt-<ts>`). The artifact is always moved aside —
+    /// never deleted.
     pub quarantined_wal: Option<PathBuf>,
 }
 
@@ -129,6 +180,16 @@ pub struct LbugGraphStore {
     /// Auto-checkpoint after this many writes (`0` disables count-based
     /// checkpointing; used by tests that need data to remain in the WAL).
     pub(crate) checkpoint_interval: Cell<u64>,
+    /// The most recent checkpoint error (e.g. buffer-pool exhaustion), or `None`
+    /// after a successful checkpoint. Surfaced via [`last_checkpoint_error`] so
+    /// consumers can report store health.
+    ///
+    /// [`last_checkpoint_error`]: LbugGraphStore::last_checkpoint_error
+    pub(crate) last_checkpoint_error: RefCell<Option<String>>,
+    /// Effective buffer-pool cap (bytes) this store was opened with.
+    pub(crate) buffer_pool_bytes: u64,
+    /// Effective max database size (bytes) this store was opened with.
+    pub(crate) max_db_bytes: u64,
 }
 
 // SAFETY: lbug::Database is internally synchronized (it declares Send + Sync).
@@ -173,11 +234,22 @@ impl LbugGraphStore {
     /// needs no replay. The returned [`WalRecovery`] reports the outcome and how
     /// many records survived; a `warn!` is also emitted.
     ///
+    /// If the main database itself is corrupt — it will not open even with the
+    /// WAL fully quarantined, or no WAL is present at all (a corrupt catalog /
+    /// main file, e.g. left by a failed CHECKPOINT, the cause of the #95 crash
+    /// loop) — the entire database is quarantined to `<db_path>.corrupt-<unix_ts>`
+    /// (moved aside, never deleted) and a fresh, empty database is opened so the
+    /// store self-heals instead of failing forever
+    /// ([`WalRecoveryOutcome::RebuiltAfterCorruption`], `recovered_records = 0`).
+    /// This rebuild-on-corruption behaviour is intentional for this resilient
+    /// entry point; the strict [`open`](Self::open) never rebuilds and still
+    /// errors.
+    ///
     /// # Errors
     ///
-    /// Returns [`MemoryError::Storage`] if the database cannot be opened even
-    /// after quarantining the WAL (e.g. the parent directory is unwritable or the
-    /// main database file itself is unreadable).
+    /// Returns [`MemoryError::Storage`] only if even a fresh database cannot be
+    /// opened after quarantining the corrupt one (e.g. the parent directory is
+    /// unwritable).
     pub fn open_with_recovery(
         db_path: &Path,
         store_id: Option<&str>,
@@ -195,12 +267,19 @@ impl LbugGraphStore {
             Err(strict_err) => {
                 let wal = wal_path_for(db_path);
                 if !wal.exists() {
-                    // No WAL: the failure is not WAL-replay related (bad path,
-                    // quota, permissions, ...). Surface it unchanged.
-                    return Err(MemoryError::Storage(format!(
-                        "failed to open LadybugDB at {}: {strict_err}",
-                        db_path.display()
-                    )));
+                    // No WAL: the strict open did not fail on WAL replay. On the
+                    // resilient entry point a persistent main-DB open failure is
+                    // treated as catalog / main-file corruption and self-healed
+                    // by quarantining the corrupt database and rebuilding a fresh
+                    // one, rather than erroring (which previously crash-looped the
+                    // consumer forever, #95).
+                    warn!(
+                        db_path = %db_path.display(),
+                        error = %strict_err,
+                        "lbug_store: main database failed to open and no WAL is present; \
+                         treating as catalog corruption and rebuilding from empty"
+                    );
+                    return Self::rebuild_after_corruption(db_path, store_id, None);
                 }
                 warn!(
                     db_path = %db_path.display(),
@@ -257,27 +336,81 @@ impl LbugGraphStore {
                     "lbug_store: resilient WAL replay failed; opening from last checkpoint only"
                 );
                 let moved = move_wal_aside(db_path, wal, &quarantine, copied.is_some());
-                let db = open_database(db_path, true).map_err(|e| {
-                    MemoryError::Storage(format!(
-                        "failed to open LadybugDB at {} even after quarantining the WAL: {e}",
-                        db_path.display()
-                    ))
-                })?;
-                let store = Self::from_parts(db, db_path, store_id);
-                let recovered = store.count_all_nodes();
-                let report = WalRecovery {
-                    outcome: WalRecoveryOutcome::CheckpointOnly,
-                    recovered_records: recovered,
-                    quarantined_wal: moved.or(copied),
-                };
-                warn!(
-                    db_path = %db_path.display(),
-                    recovered_records = recovered,
-                    "lbug_store: opened from last checkpoint after unrecoverable WAL"
-                );
-                Ok((store, report))
+                match try_open_database(db_path, true) {
+                    Ok(db) => {
+                        let store = Self::from_parts(db, db_path, store_id);
+                        let recovered = store.count_all_nodes();
+                        let report = WalRecovery {
+                            outcome: WalRecoveryOutcome::CheckpointOnly,
+                            recovered_records: recovered,
+                            quarantined_wal: moved.or(copied),
+                        };
+                        warn!(
+                            db_path = %db_path.display(),
+                            recovered_records = recovered,
+                            "lbug_store: opened from last checkpoint after unrecoverable WAL"
+                        );
+                        Ok((store, report))
+                    }
+                    Err(checkpoint_err) => {
+                        // 4. The main database won't open even with the WAL gone:
+                        //    the catalog / main file itself is corrupt. Quarantine
+                        //    the whole database and rebuild fresh so the store
+                        //    self-heals instead of crash-looping (#95).
+                        warn!(
+                            db_path = %db_path.display(),
+                            error = %checkpoint_err,
+                            "lbug_store: main database still unopenable after quarantining the \
+                             WAL; treating as catalog corruption and rebuilding from empty"
+                        );
+                        Self::rebuild_after_corruption(db_path, store_id, moved.or(copied))
+                    }
+                }
             }
         }
+    }
+
+    /// Catalog / main-database corruption recovery.
+    ///
+    /// Reached when the engine cannot open the main database even with the WAL
+    /// fully out of the way — the on-disk catalog / main file is corrupt beyond
+    /// WAL replay (e.g. a failed CHECKPOINT left it in the state that surfaced as
+    /// "table 0 doesn't exist in catalog", #95). The entire corrupt database is
+    /// quarantined to `<db_path>.corrupt-<unix_ts>` (moved aside, never deleted;
+    /// preserved via copy if a rename is risky) and a fresh, empty database is
+    /// opened at `db_path` so the consumer keeps running instead of
+    /// crash-looping. `prior_quarantine` is any WAL quarantine recorded earlier
+    /// in the same recovery, used only as a fallback if the database itself was
+    /// absent.
+    fn rebuild_after_corruption(
+        db_path: &Path,
+        store_id: Option<&str>,
+        prior_quarantine: Option<PathBuf>,
+    ) -> crate::Result<(Self, WalRecovery)> {
+        let quarantine = quarantine_path(db_path);
+        let moved = quarantine_db_artifacts(db_path, &quarantine)?;
+
+        // db_path is now clear: a strict open creates a fresh, empty database.
+        let db = open_database(db_path, true).map_err(|e| {
+            MemoryError::Storage(format!(
+                "failed to open a fresh LadybugDB at {} after quarantining a corrupt catalog: {e}",
+                db_path.display()
+            ))
+        })?;
+        let store = Self::from_parts(db, db_path, store_id);
+        let quarantined = moved.or(prior_quarantine);
+        let report = WalRecovery {
+            outcome: WalRecoveryOutcome::RebuiltAfterCorruption,
+            recovered_records: 0,
+            quarantined_wal: quarantined.clone(),
+        };
+        warn!(
+            db_path = %db_path.display(),
+            quarantined_db = ?quarantined,
+            "lbug_store: main database/catalog was corrupt and unopenable; quarantined it and \
+             rebuilt a fresh empty database so the store self-heals instead of crash-looping"
+        );
+        Ok((store, report))
     }
 
     /// Create the parent directory of `db_path` if needed.
@@ -300,6 +433,10 @@ impl LbugGraphStore {
         let id = store_id
             .map(String::from)
             .unwrap_or_else(|| format!("lbug-{}", &uuid::Uuid::new_v4().to_string()[..8]));
+        let buffer_env = std::env::var(ENV_BUFFER_POOL_BYTES).ok();
+        let max_db_env = std::env::var(ENV_MAX_DB_BYTES).ok();
+        let (buffer_pool_bytes, max_db_bytes) =
+            effective_limits(buffer_env.as_deref(), max_db_env.as_deref());
         Self {
             store_id: id,
             db_path: db_path.to_path_buf(),
@@ -312,7 +449,30 @@ impl LbugGraphStore {
             id_table_cache: RefCell::new(HashMap::new()),
             writes_since_checkpoint: Cell::new(0),
             checkpoint_interval: Cell::new(AUTO_CHECKPOINT_WRITES),
+            last_checkpoint_error: RefCell::new(None),
+            buffer_pool_bytes,
+            max_db_bytes,
         }
+    }
+
+    /// Effective buffer-pool cap (bytes) this store was opened with. Reflects
+    /// any [`ENV_BUFFER_POOL_BYTES`] override and the clamped default.
+    pub fn buffer_pool_bytes(&self) -> u64 {
+        self.buffer_pool_bytes
+    }
+
+    /// Effective maximum database size (bytes) this store was opened with.
+    /// Reflects any [`ENV_MAX_DB_BYTES`] override and the clamped default.
+    pub fn max_db_bytes(&self) -> u64 {
+        self.max_db_bytes
+    }
+
+    /// The most recent checkpoint error, or `None` if the last checkpoint
+    /// succeeded. A failed auto-checkpoint (commonly buffer-pool exhaustion) is
+    /// recorded here and cleared on the next successful checkpoint, so consumers
+    /// can surface store health without parsing logs.
+    pub fn last_checkpoint_error(&self) -> Option<String> {
+        self.last_checkpoint_error.borrow().clone()
     }
 
     /// The on-disk database path.
@@ -351,10 +511,18 @@ impl LbugGraphStore {
     /// Issue `CHECKPOINT` + durability barrier and reset the write counter.
     /// Caller is responsible for holding [`acquire_lock`](Self::acquire_lock)
     /// when used outside single-threaded recovery.
+    ///
+    /// On a failed `CHECKPOINT` the error is recorded in
+    /// [`last_checkpoint_error`](Self::last_checkpoint_error) (store-health
+    /// signal); a subsequent successful checkpoint clears it.
     pub(crate) fn do_checkpoint(&self) -> crate::Result<()> {
-        self.execute("CHECKPOINT")?;
+        if let Err(e) = self.execute("CHECKPOINT") {
+            *self.last_checkpoint_error.borrow_mut() = Some(e.to_string());
+            return Err(e);
+        }
         self.writes_since_checkpoint.set(0);
         self.post_write_barrier()?;
+        *self.last_checkpoint_error.borrow_mut() = None;
         Ok(())
     }
 
@@ -370,7 +538,13 @@ impl LbugGraphStore {
         let next = self.writes_since_checkpoint.get().saturating_add(1);
         if next >= interval {
             if let Err(e) = self.do_checkpoint() {
-                warn!("lbug_store: auto-checkpoint failed: {e}");
+                warn!(
+                    error = %e,
+                    "lbug_store: auto-checkpoint failed — this can indicate buffer-pool \
+                     exhaustion (raise the cap via {}); recorded as last_checkpoint_error, \
+                     will retry on the next write",
+                    ENV_BUFFER_POOL_BYTES
+                );
                 // do_checkpoint resets the counter only on success; reset here so
                 // we retry on the next write rather than every write.
                 self.writes_since_checkpoint.set(0);
@@ -664,6 +838,14 @@ impl Drop for LbugGraphStore {
 
 /// The system configuration used for every open.
 ///
+/// Buffer-pool and max-database-size limits are resolved from the environment
+/// (`AMPLIHACK_MEMORY_BUFFER_POOL_BYTES` / `AMPLIHACK_MEMORY_MAX_DB_BYTES`) via
+/// [`effective_limits`], falling back to larger, safer defaults than the old
+/// hardcoded 128 MiB pool / 1 GiB cap that let an auto-CHECKPOINT exhaust the
+/// buffer pool and corrupt the catalog (#95). lbug allocates the pool lazily and
+/// `max_db_size` is only an mmap reservation, so the larger caps cost nothing
+/// until data actually needs them.
+///
 /// `auto_checkpoint(true)` lets LadybugDB bound the WAL on its own as a safety
 /// net; the store additionally checkpoints every [`AUTO_CHECKPOINT_WRITES`]
 /// writes (see [`LbugGraphStore::note_write_and_maybe_checkpoint`]).
@@ -671,13 +853,71 @@ impl Drop for LbugGraphStore {
 /// (`true`) errors on a corrupt WAL, resilient (`false`) replays the good prefix
 /// and ignores the unreplayable tail.
 fn system_config(throw_on_wal_replay_failure: bool) -> SystemConfig {
+    let buffer_env = std::env::var(ENV_BUFFER_POOL_BYTES).ok();
+    let max_db_env = std::env::var(ENV_MAX_DB_BYTES).ok();
+    let (buffer_pool, max_db) = effective_limits(buffer_env.as_deref(), max_db_env.as_deref());
+    log_effective_limits_once(buffer_pool, max_db);
     SystemConfig::default()
-        // Cap the mmap reservation so we don't request a huge address space in
-        // constrained environments (mirrors the Kùzu backend).
-        .max_db_size(1 << 30)
-        .buffer_pool_size(128 * 1024 * 1024)
+        .max_db_size(max_db)
+        .buffer_pool_size(buffer_pool)
         .auto_checkpoint(true)
         .throw_on_wal_replay_failure(throw_on_wal_replay_failure)
+}
+
+/// Parse a byte count from an override string: a strictly-positive integer, or
+/// `None` for anything missing / unparseable / zero.
+fn parse_positive_bytes(s: &str) -> Option<u64> {
+    match s.trim().parse::<u64>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => None,
+    }
+}
+
+/// Resolve the effective buffer-pool cap (bytes) from the optional
+/// [`ENV_BUFFER_POOL_BYTES`] override. A valid positive value is clamped up to
+/// [`MIN_BUFFER_POOL_BYTES`]; anything missing or invalid falls back to
+/// [`DEFAULT_BUFFER_POOL_BYTES`]. Pure (takes the value, not the env) so it is
+/// unit-testable without mutating process state.
+pub(crate) fn resolve_buffer_pool_bytes(env: Option<&str>) -> u64 {
+    match env.and_then(parse_positive_bytes) {
+        Some(n) => n.max(MIN_BUFFER_POOL_BYTES),
+        None => DEFAULT_BUFFER_POOL_BYTES,
+    }
+}
+
+/// Resolve the effective maximum database size (bytes) from the optional
+/// [`ENV_MAX_DB_BYTES`] override. A valid positive value is clamped up to
+/// [`MIN_MAX_DB_BYTES`]; anything missing or invalid falls back to
+/// [`DEFAULT_MAX_DB_BYTES`]. Pure and unit-testable.
+pub(crate) fn resolve_max_db_bytes(env: Option<&str>) -> u64 {
+    match env.and_then(parse_positive_bytes) {
+        Some(n) => n.max(MIN_MAX_DB_BYTES),
+        None => DEFAULT_MAX_DB_BYTES,
+    }
+}
+
+/// Resolve both limits and enforce the invariant `buffer_pool <= max_db_size`
+/// (a buffer pool larger than the whole database is meaningless). Returns
+/// `(buffer_pool_bytes, max_db_bytes)`.
+pub(crate) fn effective_limits(buffer_env: Option<&str>, max_db_env: Option<&str>) -> (u64, u64) {
+    let max_db = resolve_max_db_bytes(max_db_env);
+    let buffer_pool = resolve_buffer_pool_bytes(buffer_env).min(max_db);
+    (buffer_pool, max_db)
+}
+
+/// Emit the effective limits exactly once per process (recovery re-opens call
+/// [`system_config`] repeatedly; we don't want to spam the log).
+fn log_effective_limits_once(buffer_pool: u64, max_db: u64) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        info!(
+            buffer_pool_bytes = buffer_pool,
+            max_db_bytes = max_db,
+            "lbug_store: effective LadybugDB limits (override via {} / {})",
+            ENV_BUFFER_POOL_BYTES,
+            ENV_MAX_DB_BYTES
+        );
+    });
 }
 
 /// Open a [`Database`] with the given replay strictness, mapping the engine
@@ -811,6 +1051,65 @@ fn move_wal_aside(
         let _ = std::fs::remove_file(&sidecar);
     }
     result
+}
+
+/// Quarantine a corrupt main database (and any leftover WAL / sidecars) to
+/// `quarantine`, preserving everything before clearing `db_path` so a fresh
+/// database can be created there.
+///
+/// The main file is moved with [`move_path_aside`] (atomic rename, falling back
+/// to copy-then-remove so the artifact is never lost); on a hard failure to
+/// preserve it the original is left intact and an error is returned (we never
+/// destroy the corrupt database we can't first copy). Leftover WAL / sidecars
+/// are best-effort moved next to the quarantined main file. Returns the
+/// quarantine path of the main file if it existed.
+fn quarantine_db_artifacts(db_path: &Path, quarantine: &Path) -> crate::Result<Option<PathBuf>> {
+    let moved = if db_path.exists() {
+        let dst = move_path_aside(db_path, quarantine).map_err(|e| {
+            MemoryError::Storage(format!(
+                "failed to quarantine corrupt database {}: {e}",
+                db_path.display()
+            ))
+        })?;
+        Some(dst)
+    } else {
+        None
+    };
+
+    // Best-effort: move any leftover WAL + sidecars aside too so the fresh open
+    // starts from a clean directory. They are preserved next to the main file's
+    // quarantine path, never silently deleted.
+    let wal = wal_path_for(db_path);
+    if wal.exists() {
+        let mut wal_q: OsString = quarantine.as_os_str().to_os_string();
+        wal_q.push(".wal");
+        let _ = move_path_aside(&wal, &PathBuf::from(wal_q));
+    }
+    for sidecar in wal_sidecars(db_path, &wal) {
+        if let Some(name) = sidecar.file_name() {
+            let mut dst: OsString = quarantine.as_os_str().to_os_string();
+            dst.push(".");
+            dst.push(name);
+            let _ = move_path_aside(&sidecar, &PathBuf::from(dst));
+        }
+    }
+
+    Ok(moved)
+}
+
+/// Move `src` to `dst`, preserving the data: prefer an atomic rename, and on
+/// failure (e.g. a cross-device `EXDEV`) fall back to copy-then-remove so the
+/// artifact is preserved at `dst` before the original is cleared. Errors only if
+/// the artifact could not be preserved at all, in which case `src` is left
+/// intact.
+fn move_path_aside(src: &Path, dst: &Path) -> std::io::Result<PathBuf> {
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(dst.to_path_buf());
+    }
+    // Rename failed: preserve a copy first, then clear the original.
+    std::fs::copy(src, dst)?;
+    let _ = std::fs::remove_file(src);
+    Ok(dst.to_path_buf())
 }
 
 /// Interpret a scalar [`Value`] as a `usize` count (from `count(n)` results).
