@@ -690,3 +690,74 @@ fn open_with_recovery_rebuilds_after_corrupt_catalog_with_wal_present() {
     drop(store);
     drop(crash);
 }
+
+// ---------------------------------------------------------------------------
+// Checkpoint-failure signal + effective-config readback (store health, #95)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn effective_config_getters_report_resolved_limits() {
+    let (_tmp, store) = open_temp();
+
+    // The getters must report exactly the limits `from_parts` resolved from the
+    // environment (the larger defaults when unset) — i.e. the store's *actual*
+    // open-time config — so a consumer can read it back for health/telemetry
+    // without re-deriving it or parsing logs.
+    let buffer_env = std::env::var(super::ENV_BUFFER_POOL_BYTES).ok();
+    let max_db_env = std::env::var(super::ENV_MAX_DB_BYTES).ok();
+    let (expected_buf, expected_max) =
+        effective_limits(buffer_env.as_deref(), max_db_env.as_deref());
+
+    assert_eq!(
+        store.buffer_pool_bytes(),
+        expected_buf,
+        "buffer_pool_bytes() must report the resolved effective buffer-pool cap"
+    );
+    assert_eq!(
+        store.max_db_bytes(),
+        expected_max,
+        "max_db_bytes() must report the resolved effective max database size"
+    );
+
+    // Invariants that must hold regardless of any environment override.
+    assert!(
+        store.buffer_pool_bytes() >= MIN_BUFFER_POOL_BYTES,
+        "effective buffer pool must never fall below the floor"
+    );
+    assert!(
+        store.max_db_bytes() >= MIN_MAX_DB_BYTES,
+        "effective max db size must never fall below the floor"
+    );
+    assert!(
+        store.buffer_pool_bytes() <= store.max_db_bytes(),
+        "effective buffer pool must never exceed effective max db size"
+    );
+}
+
+#[test]
+fn last_checkpoint_error_is_none_on_a_healthy_store() {
+    let (_tmp, mut store) = open_temp();
+
+    // A brand-new store has never failed a checkpoint.
+    assert!(
+        store.last_checkpoint_error().is_none(),
+        "fresh store must report no checkpoint error"
+    );
+
+    // A successful explicit checkpoint must leave/keep store health clear.
+    add_things(&mut store, 0, 5);
+    store.checkpoint().expect("checkpoint should succeed");
+    assert!(
+        store.last_checkpoint_error().is_none(),
+        "a successful checkpoint must report healthy (no recorded error)"
+    );
+
+    // Successful AUTO-checkpoints (the path that records buffer-pool exhaustion
+    // on failure) must NOT record a spurious error on a healthy store.
+    store.set_checkpoint_interval(4);
+    add_things(&mut store, 5, 12); // crosses the interval -> auto-checkpoints fire
+    assert!(
+        store.last_checkpoint_error().is_none(),
+        "healthy auto-checkpoints must not record a checkpoint error"
+    );
+}
