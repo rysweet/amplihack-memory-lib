@@ -297,6 +297,11 @@ killed mid-write and the write-ahead log (WAL) is left partially written:
   as a safety net. An unclean shutdown therefore strands at most a small,
   bounded number of writes in the WAL rather than every uncheckpointed record.
 
+See [`docs/durability_and_recovery.md`](docs/durability_and_recovery.md) for the
+full reference — the configuration model, the recovery state machine, quarantine
+semantics, the checkpoint-health signal, the public API, and an operational
+runbook.
+
 ### Automatic `SIMILAR_TO` linking between facts
 
 `CognitiveMemory` can automatically connect related semantic facts with
