@@ -6,7 +6,8 @@ use lbug::Value;
 use tracing::warn;
 
 use super::{
-    escape_cypher, is_valid_identifier, validate_identifier, value_to_string, LbugGraphStore,
+    escape_cypher, is_valid_identifier, not_deleted, validate_identifier, value_to_string,
+    LbugGraphStore, DELETED_COL, DELETED_MARK,
 };
 use crate::graph::protocol::GraphStore;
 use crate::graph::traversal::bfs_traverse;
@@ -136,19 +137,18 @@ impl LbugGraphStore {
             .collect()
     }
 
-    /// Run `MATCH (n:node_type) [WHERE ...] RETURN n [LIMIT k]` and collect the
+    /// Run `MATCH (n:node_type) WHERE ... RETURN n [LIMIT k]` and collect the
     /// nodes. A missing table (fresh/never-created type) simply yields no rows.
+    /// Soft-deleted (tombstoned, #100) nodes are always filtered out.
     fn match_return_nodes(
         &self,
         node_type: &str,
         where_parts: &[String],
         limit: usize,
     ) -> Vec<GraphNode> {
-        let where_clause = if where_parts.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", where_parts.join(" AND "))
-        };
+        let mut parts = where_parts.to_vec();
+        parts.push(not_deleted("n"));
+        let where_clause = format!(" WHERE {}", parts.join(" AND "));
         let cypher = format!(
             "MATCH (n:{node_type}){where_clause} RETURN n{}",
             limit_clause(limit)
@@ -164,11 +164,26 @@ impl LbugGraphStore {
             return None;
         }
         let cypher = format!(
-            "MATCH (n:{table}) WHERE n.node_id = '{}' RETURN n LIMIT 1",
-            escape_cypher(node_id)
+            "MATCH (n:{table}) WHERE n.node_id = '{}' AND {} RETURN n LIMIT 1",
+            escape_cypher(node_id),
+            not_deleted("n")
         );
         let rows = self.query_rows(&cypher).ok()?;
         self.collect_nodes(rows, table).into_iter().next()
+    }
+
+    /// Does a row with `node_id` physically exist in `table`, *including*
+    /// soft-deleted (tombstoned, #100) rows? Used by [`add_node`] to revive a
+    /// tombstoned id rather than `CREATE` a duplicate primary key.
+    fn physical_node_exists(&self, table: &str, node_id: &str) -> bool {
+        if !is_valid_identifier(table) {
+            return false;
+        }
+        let cypher = format!(
+            "MATCH (n:{table}) WHERE n.node_id = '{}' RETURN n LIMIT 1",
+            escape_cypher(node_id)
+        );
+        matches!(self.query_rows(&cypher), Ok(rows) if !rows.is_empty())
     }
 
     /// Resolve the node table for `node_id` via the id cache, falling back to a
@@ -217,9 +232,17 @@ impl LbugGraphStore {
         let lc = limit_clause(limit);
         let escaped = escape_cypher(node_id);
         let cypher = if direction == "outgoing" {
-            format!("MATCH (a)-[r:{rel_type}]->(b) WHERE a.node_id = '{escaped}' RETURN r, b{lc}")
+            format!(
+                "MATCH (a)-[r:{rel_type}]->(b) WHERE a.node_id = '{escaped}' AND {} AND {} RETURN r, b{lc}",
+                not_deleted("r"),
+                not_deleted("b")
+            )
         } else {
-            format!("MATCH (a)-[r:{rel_type}]->(b) WHERE b.node_id = '{escaped}' RETURN r, a{lc}")
+            format!(
+                "MATCH (a)-[r:{rel_type}]->(b) WHERE b.node_id = '{escaped}' AND {} AND {} RETURN r, a{lc}",
+                not_deleted("r"),
+                not_deleted("a")
+            )
         };
 
         let rows = match self.query_rows(&cypher) {
@@ -335,17 +358,41 @@ impl GraphStore for LbugGraphStore {
         let _guard = self.acquire_lock();
         self.ensure_node_table(node_type, &extra)?;
 
-        let mut parts = vec![
-            format!("node_id: '{}'", escape_cypher(&nid)),
-            format!("graph_origin: '{}'", escape_cypher(&self.store_id)),
-        ];
-        for (k, v) in &properties {
-            if k == "node_id" || k == "graph_origin" {
-                continue;
+        // If a row with this id physically exists in the table — including a
+        // soft-deleted (tombstoned, #100) one left behind by `delete_node` —
+        // a `CREATE` would violate `PRIMARY KEY(node_id)`. Revive/overwrite it
+        // instead: clear the tombstone and refresh `graph_origin` + properties.
+        // This is what makes the consolidation "delete then re-add the same id"
+        // churn work once deletes no longer physically remove the row.
+        let cypher = if self.physical_node_exists(node_type, &nid) {
+            let mut sets = vec![
+                format!("n.graph_origin = '{}'", escape_cypher(&self.store_id)),
+                format!("n.{DELETED_COL} = ''"),
+            ];
+            for (k, v) in &properties {
+                if k == "node_id" || k == "graph_origin" {
+                    continue;
+                }
+                sets.push(format!("n.{k} = '{}'", escape_cypher(v)));
             }
-            parts.push(format!("{k}: '{}'", escape_cypher(v)));
-        }
-        let cypher = format!("CREATE (:{node_type} {{{}}})", parts.join(", "));
+            format!(
+                "MATCH (n:{node_type}) WHERE n.node_id = '{}' SET {}",
+                escape_cypher(&nid),
+                sets.join(", ")
+            )
+        } else {
+            let mut parts = vec![
+                format!("node_id: '{}'", escape_cypher(&nid)),
+                format!("graph_origin: '{}'", escape_cypher(&self.store_id)),
+            ];
+            for (k, v) in &properties {
+                if k == "node_id" || k == "graph_origin" {
+                    continue;
+                }
+                parts.push(format!("{k}: '{}'", escape_cypher(v)));
+            }
+            format!("CREATE (:{node_type} {{{}}})", parts.join(", "))
+        };
         self.execute(&cypher)?;
         self.post_write_barrier()?;
         self.note_write_and_maybe_checkpoint();
@@ -386,8 +433,9 @@ impl GraphStore for LbugGraphStore {
         // per-table scan below.
         if !self.known_node_tables.borrow().is_empty() {
             let cypher = format!(
-                "MATCH (n) WHERE n.node_id = '{}' RETURN n LIMIT 1",
-                escape_cypher(node_id)
+                "MATCH (n) WHERE n.node_id = '{}' AND {} RETURN n LIMIT 1",
+                escape_cypher(node_id),
+                not_deleted("n")
             );
             if let Ok(rows) = self.query_rows(&cypher) {
                 let found = self.collect_nodes(rows, "").into_iter().next();
@@ -535,20 +583,21 @@ impl GraphStore for LbugGraphStore {
         let _guard = self.acquire_lock();
         let escaped = escape_cypher(node_id);
 
-        // Phase A — strip every incident relationship first, so the node delete
-        // never needs `DETACH` and never enters lbug 0.15.3's crashing
-        // `detachDeleteForCSRRels` path (getGroup(UINT32_MAX) null deref, #98).
+        // Phase A — soft-delete (tombstone) every incident relationship.
         //
-        // Each rel type is deleted with its own *typed* directed passes
-        // (`MATCH (a)-[r:TYPE]->(b) ... DELETE r`) rather than a single
-        // label-less `MATCH (a)-[r]->(b)` across all rel tables: a label-less
-        // multi-rel-table scan is exactly what drives lbug's
-        // `ScanMultiRelTable` / `CSRNodeGroup::scanCommittedInMemRandom` into
-        // the `getGroup(UINT32_MAX)` SEGV (#100). Two directed passes per type
-        // remove outbound, inbound, self-loop, and parallel edges. The passes
-        // are keyed on the globally unique `node_id`. With no rel tables the
-        // distinct-name list is empty, nothing is deleted, and we fall through
-        // to the plain `DELETE` below.
+        // The relationships are *not* physically removed. Issuing `DELETE r`
+        // against a relationship that lives in a committed CSR rel group drives
+        // lbug's CSR node-group index to the `UINT32_MAX` sentinel; the next
+        // scan to touch that table then dereferences a null group and SEGVs the
+        // process (`getGroup(UINT32_MAX)`, #100 — version-independent across
+        // lbug 0.15.3/0.15.4/0.17.1). Instead each incident edge is marked
+        // deleted with `SET r._deleted = '1'` (a property write that never
+        // mutates the CSR adjacency structure), and every read filters
+        // tombstoned rows out (`not_deleted`). One typed `SET` pass per known
+        // rel type, both directions, covers outbound, inbound, self-loop, and
+        // parallel edges; typed (not label-less) scans also avoid lbug's
+        // `ScanMultiRelTable` path. With no rel tables the list is empty and we
+        // fall through to tombstoning the node below.
         for rel in self.distinct_rel_names() {
             // The rel label is interpolated bare; catalog names are always
             // valid identifiers. Fail-closed (leave the node and its edges
@@ -557,10 +606,12 @@ impl GraphStore for LbugGraphStore {
                 warn!("delete_node: refusing non-identifier rel type {rel:?} for {node_id}");
                 return false;
             }
-            let outgoing =
-                format!("MATCH (a)-[r:{rel}]->(b) WHERE a.node_id = '{escaped}' DELETE r");
-            let incoming =
-                format!("MATCH (a)-[r:{rel}]->(b) WHERE b.node_id = '{escaped}' DELETE r");
+            let outgoing = format!(
+                "MATCH (a)-[r:{rel}]->(b) WHERE a.node_id = '{escaped}' SET r.{DELETED_COL} = '{DELETED_MARK}'"
+            );
+            let incoming = format!(
+                "MATCH (a)-[r:{rel}]->(b) WHERE b.node_id = '{escaped}' SET r.{DELETED_COL} = '{DELETED_MARK}'"
+            );
             for cypher in [&outgoing, &incoming] {
                 if let Err(e) = self.execute(cypher) {
                     // Fail-closed: leave the node fully intact (and its routing
@@ -571,8 +622,15 @@ impl GraphStore for LbugGraphStore {
             }
         }
 
-        // Phase B — delete the now-isolated node with a plain DELETE (no DETACH).
-        let cypher = format!("MATCH (n:{table}) WHERE n.node_id = '{escaped}' DELETE n");
+        // Phase B — soft-delete the node itself. A plain `DELETE n` is safe for
+        // an edgeless node, but the node still physically owns its (now
+        // tombstoned) relationships, so a physical delete would either fail or
+        // need `DETACH` (which re-enters the crashing CSR path). Tombstoning the
+        // node keeps it out of every read while leaving the CSR groups
+        // untouched. `add_node` revives the row if the id is recreated.
+        let cypher = format!(
+            "MATCH (n:{table}) WHERE n.node_id = '{escaped}' SET n.{DELETED_COL} = '{DELETED_MARK}'"
+        );
         if self.execute(&cypher).is_ok() {
             self.id_table_cache.borrow_mut().remove(node_id);
             if let Err(e) = self.post_write_barrier() {
@@ -711,13 +769,20 @@ impl GraphStore for LbugGraphStore {
         };
 
         let _guard = self.acquire_lock();
+        // Soft-delete (tombstone) the matching edge(s) rather than `DELETE r`:
+        // a physical relationship delete against a committed CSR group corrupts
+        // lbug's CSR node-group index and SEGVs the next scan
+        // (`getGroup(UINT32_MAX)`, #100). Setting `r._deleted` is a property
+        // write that leaves the CSR adjacency intact; reads filter it out.
         let cypher = format!(
             "MATCH (a:{})-[r:{edge_type}]->(b:{}) \
-             WHERE a.node_id = '{}' AND b.node_id = '{}' DELETE r",
+             WHERE a.node_id = '{}' AND b.node_id = '{}' AND {} \
+             SET r.{DELETED_COL} = '{DELETED_MARK}'",
             src.node_type,
             tgt.node_type,
             escape_cypher(source_id),
-            escape_cypher(target_id)
+            escape_cypher(target_id),
+            not_deleted("r")
         );
         if self.execute(&cypher).is_ok() {
             if let Err(e) = self.post_write_barrier() {

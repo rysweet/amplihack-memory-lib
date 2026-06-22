@@ -10,6 +10,25 @@ whenever a node with relationships stored in a CSR rel table was detach-deleted.
 This page is the authoritative description of the fix for issue **#98** ("CRITICAL
 native crash — daemon SEGV-crashes every ~45–90 minutes during a `DETACH DELETE`").
 
+> **Update (#100) — deletion is now a soft delete (tombstone).** The edge-first,
+> physical-`DELETE` approach described below removed the `DETACH DELETE` trigger
+> (#98) but a *physical relationship delete out of a committed CSR rel group*
+> (`DELETE r`) was independently shown to corrupt lbug's CSR node-group index
+> (its index is set to the `UINT32_MAX` sentinel), so the next scan to touch that
+> table still SEGV'd (`getGroup(UINT32_MAX)`, version-independent across lbug
+> 0.15.3/0.15.4/0.17.1). To eliminate the corruption, `delete_node` and
+> `delete_edge` **no longer issue any physical `DELETE`**. They mark rows deleted
+> with a reserved `_deleted` tombstone column (`SET …._deleted = '1'`) — a
+> property write that never mutates the CSR adjacency structure — and every read
+> filters tombstoned rows out. `add_node` revives a tombstoned id (clearing the
+> tombstone) so the "delete then re-add the same id" consolidation pattern still
+> works. The `_deleted` column is added to every node and rel table at creation
+> and back-filled on older stores via `ALTER TABLE … ADD` on reopen. Net effect:
+> the observable delete/recall contract is unchanged, but the CSR corruption can
+> no longer occur. (Trade-off: tombstoned rows remain physically resident until a
+> future compaction/rebuild pass; the crash fix is the priority.) The sections
+> below document the prior `DETACH`-avoidance design that this builds on.
+
 - **No more native crashes.** A node that carries relationships — which, after the
   graph-enhancement work, is *most* fact and procedure nodes — can now be deleted
   without tripping the engine's buggy `detachDeleteForCSRRels` code path. The

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use super::LbugGraphStore;
+use super::{escape_cypher, DELETED_COL};
 use crate::graph::protocol::GraphStore;
 use crate::graph::types::Direction;
 
@@ -1295,31 +1296,33 @@ fn label_less_reads_survive_close_and_reopen_with_committed_csr() {
 }
 
 // ---------------------------------------------------------------------------
-// ROOT-CAUSE REPRODUCTION (#100) — currently UNRESOLVED, hence #[ignore]d.
+// ROOT-CAUSE REGRESSION (#100) — FIXED via soft-delete (tombstone).
 //
 // Bisection (writes-only OK, writes+label-less-reads OK, writes+DELETES corrupt;
-// and `delete_edge` alone is sufficient) pins the driver of the
+// and `delete_edge` alone is sufficient) pinned the driver of the
 // getGroup(UINT32_MAX) crash to *deleting relationships out of a committed CSR
 // rel group* — `delete_edge` and `delete_node`'s Phase-A edge strip — when
-// interleaved with checkpoints. The CSR node group's index is set to the
-// UINT32_MAX sentinel; the next scan to touch that table dereferences it:
-//   - a CHECKPOINT flush (what this reproduction trips, in a debug build),
+// interleaved with checkpoints. The CSR node group's index was set to the
+// UINT32_MAX sentinel; the next scan to touch that table dereferenced it:
+//   - a CHECKPOINT flush (what this churn trips, in a debug build),
 //   - a label-less multi-rel read (issue backtrace 2), or
 //   - DETACH-DELETE's CSR walk (issue backtrace 1).
-// This is version-independent (0.15.3 / 0.15.4 / 0.17.1), i.e. an lbug engine
-// bug in CSR relationship deletion + checkpoint, not something the Rust-side
-// typed-scan rewrite (which only changes *which* scans are issued) can fix.
 //
-// In this DEBUG build lbug surfaces the bad group as an assertion that the
-// bindings return as a recoverable `Storage` error containing
+// The fix: `delete_node` / `delete_edge` no longer emit a physical `DELETE`
+// against committed CSR rel groups. They soft-delete instead — `SET
+// r._deleted = '1'` / `SET n._deleted = '1'` — a property write that leaves the
+// CSR adjacency structure untouched, and every read filters tombstoned rows out
+// (`not_deleted`). `add_node` revives a tombstoned id so the "delete then
+// re-add" consolidation pattern still works. No `DELETE r`/`DELETE n` is ever
+// issued, so the CSR group index is never driven to UINT32_MAX.
+//
+// In a DEBUG build lbug surfaced the bad group as an assertion the bindings
+// returned as a recoverable `Storage` error containing
 // "group_collection.h ... groupIdx < groups.size()"; in a RELEASE/NDEBUG build
-// the same condition is the raw null-pointer-deref SIGSEGV that kills the
-// consumer daemon. This test therefore asserts the DESIRED post-fix behavior —
-// the delete+checkpoint churn completes with no CSR-corruption error — and
-// currently FAILS, reproducing the bug. It is #[ignore]d so CI stays green;
-// un-ignore it once the root cause (an lbug fix, or a Rust-side soft-delete /
-// rel-table-rebuild workaround) lands. Do NOT run under `--release`: there it
-// aborts the test binary via SIGSEGV instead of returning an error.
+// the same condition was the raw null-pointer-deref SIGSEGV that killed the
+// consumer daemon. This test now asserts the post-fix behavior: the
+// delete + checkpoint churn (400 rounds — far past the round-10 corruption that
+// the pre-fix code hit) completes with no CSR-corruption error.
 // ---------------------------------------------------------------------------
 
 /// True if `e` is the #100 CSR `getGroup(UINT32_MAX)` corruption surfaced as a
@@ -1328,9 +1331,10 @@ fn is_csr_group_corruption(e: &str) -> bool {
     e.contains("group_collection.h") && e.contains("groupIdx < groups.size()")
 }
 
-/// Drive the consolidation-style delete + checkpoint churn that corrupts a
-/// committed CSR rel group. Returns `Err(detail)` on the first CSR-corruption
-/// (or other) error, `Ok(())` if the whole sequence stays consistent.
+/// Drive the consolidation-style delete + checkpoint churn that *used to*
+/// corrupt a committed CSR rel group. Returns `Err(detail)` on the first
+/// CSR-corruption (or other) error, `Ok(())` if the whole sequence stays
+/// consistent. After the soft-delete fix this completes cleanly.
 fn run_csr_delete_churn(rounds: usize) -> Result<(), String> {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("graph.ladybug");
@@ -1362,12 +1366,17 @@ fn run_csr_delete_churn(rounds: usize) -> Result<(), String> {
         }
 
         // Retention/dedup: delete an edge-bearing fact, then re-create its id —
-        // the exact per-cycle pattern that drives the committed-CSR corruption.
+        // the exact per-cycle pattern that drove the committed-CSR corruption.
         if round % 7 == 0 {
             let victim = format!("f{}", (round % 5) + 1);
             let _ = store.delete_node(&victim);
             add(&mut store, "Fact", &victim);
         }
+
+        // Read the churned graph mid-flight: a label-less neighbor scan is one
+        // of the scans that dereferenced the corrupt group pre-fix, so a clean
+        // read here also proves durable recall survives the churn.
+        let _ = store.query_neighbors("f1", None, Direction::Both, 100);
 
         if round % 5 == 0 {
             store
@@ -1382,21 +1391,208 @@ fn run_csr_delete_churn(rounds: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// REPRODUCTION (#100, UNRESOLVED): the delete + checkpoint consolidation churn
-/// must complete without corrupting a committed CSR rel group. It currently
-/// does not — the run returns the `getGroup(UINT32_MAX)` corruption error
-/// (debug) / SIGSEGVs (release). #[ignore]d until the root cause is fixed.
+/// REGRESSION (#100, FIXED): the delete + checkpoint consolidation churn must
+/// complete without corrupting a committed CSR rel group. Pre-fix it returned
+/// the `getGroup(UINT32_MAX)` corruption error (debug) / SIGSEGV'd (release) by
+/// round ~10; the soft-delete fix keeps it clean across 400 rounds.
 #[test]
-#[ignore = "reproduces unresolved lbug #100 CSR rel-delete corruption; un-ignore when fixed"]
 fn reproduces_issue_100_csr_delete_corruption() {
-    match run_csr_delete_churn(120) {
-        Ok(()) => { /* desired post-fix outcome */ }
+    match run_csr_delete_churn(400) {
+        Ok(()) => { /* post-fix outcome: no CSR corruption */ }
         Err(e) if is_csr_group_corruption(&e) => {
             panic!(
-                "REPRODUCED #100: committed CSR rel group corrupted by \
+                "REGRESSED #100: committed CSR rel group corrupted by \
                  relationship deletes + checkpoints (getGroup(UINT32_MAX)): {e}"
             );
         }
         Err(e) => panic!("unexpected error during CSR-delete churn: {e}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Soft-delete (tombstone) behavior (#100 fix).
+// ---------------------------------------------------------------------------
+
+/// ISOLATION PROBE (#100): a *property write* (`SET r._deleted = '1'`) against a
+/// relationship that lives in a committed CSR rel group — the operation the
+/// soft-delete fix substitutes for `DELETE r` — must NOT corrupt the CSR group,
+/// even under the same 400-round add/SET/checkpoint churn that `DELETE r` fell
+/// over in by round ~10. This pins the root-cause hypothesis (structural rel
+/// delete corrupts; property update does not) independently of the production
+/// `delete_*` code paths. The SET is issued as raw Cypher so the probe is not
+/// coupled to how `delete_node`/`delete_edge` build their queries.
+#[test]
+fn set_property_on_committed_csr_rel_survives_churn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+    let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+
+    for id in ["f1", "f2", "f3", "f4", "f5"] {
+        add(&mut store, "Fact", id);
+    }
+    add(&mut store, "Episode", "ep1");
+
+    let types = ["DERIVES_FROM", "SIMILAR_TO", "SUPERSEDES"];
+    // Seed one committed edge of every type so all three rel tables exist before
+    // the loop issues a typed `SET` against them (a `SET` on a non-existent rel
+    // table is a binder error, unrelated to CSR corruption).
+    store.add_edge("f1", "ep1", "DERIVES_FROM", None).unwrap();
+    store.add_edge("f1", "f2", "SIMILAR_TO", None).unwrap();
+    store.add_edge("f1", "f3", "SUPERSEDES", None).unwrap();
+    store.checkpoint().unwrap();
+
+    for round in 0..400 {
+        let a = format!("f{}", (round % 5) + 1);
+        let b = format!("f{}", ((round + 2) % 5) + 1);
+        let t = types[round % 3];
+        let _ = if t == "DERIVES_FROM" {
+            store.add_edge(&a, "ep1", t, None)
+        } else {
+            store.add_edge(&a, &b, t, None)
+        };
+
+        if round % 3 == 0 {
+            store.checkpoint().unwrap();
+        }
+
+        // SET the tombstone column on a victim's committed incident edges,
+        // instead of deleting them. This is the operation that replaces the
+        // crashing `DELETE r`.
+        if round % 7 == 0 {
+            let victim = format!("f{}", (round % 5) + 1);
+            let esc = escape_cypher(&victim);
+            for t in types {
+                let out = format!(
+                    "MATCH (a)-[r:{t}]->(b) WHERE a.node_id = '{esc}' SET r.{DELETED_COL} = '1'"
+                );
+                let inc = format!(
+                    "MATCH (a)-[r:{t}]->(b) WHERE b.node_id = '{esc}' SET r.{DELETED_COL} = '1'"
+                );
+                store
+                    .execute(&out)
+                    .unwrap_or_else(|e| panic!("SET outgoing tombstone at round {round}: {e}"));
+                store
+                    .execute(&inc)
+                    .unwrap_or_else(|e| panic!("SET incoming tombstone at round {round}: {e}"));
+            }
+        }
+
+        if round % 5 == 0 {
+            store.checkpoint().unwrap();
+        }
+    }
+    store.checkpoint().unwrap();
+}
+
+/// The "delete then re-create the same id" consolidation pattern must work once
+/// `delete_node` only tombstones: `add_node` revives the tombstoned row (clears
+/// the tombstone, refreshes properties) rather than failing on the primary key.
+#[test]
+fn re_add_after_soft_delete_revives_node() {
+    let (_tmp, mut store) = open_temp();
+    add(&mut store, "Fact", "f1");
+    add(&mut store, "Fact", "f2");
+    store.add_edge("f1", "f2", "SIMILAR_TO", None).unwrap();
+    store.checkpoint().unwrap();
+
+    assert!(store.delete_node("f1"), "soft-delete must report success");
+    assert!(
+        store.get_node("f1").is_none(),
+        "a soft-deleted node must be hidden from reads"
+    );
+
+    // Re-create the same id with refreshed properties — must succeed (revive),
+    // not error on PRIMARY KEY(node_id).
+    store
+        .add_node(
+            "Fact",
+            props(&[("node_id", "f1"), ("agent_id", "x"), ("name", "revived")]),
+            Some("f1"),
+        )
+        .expect("re-adding a soft-deleted id must revive it, not fail");
+
+    let n = store.get_node("f1").expect("revived node must be visible");
+    assert_eq!(
+        n.properties.get("name").map(String::as_str),
+        Some("revived")
+    );
+
+    // The old incident edge stayed tombstoned (it was deleted with the node).
+    let out = store.query_neighbors("f1", None, Direction::Outgoing, 100);
+    assert!(
+        out.is_empty(),
+        "edges tombstoned by the original delete must not reappear after revive"
+    );
+
+    // A freshly added edge on the revived node is live and recallable.
+    store.add_edge("f1", "f2", "DERIVES_FROM", None).unwrap();
+    store.checkpoint().unwrap();
+    let out = store.query_neighbors("f1", None, Direction::Outgoing, 100);
+    assert_eq!(neighbor_ids(&out), vec!["f2".to_string()]);
+    assert_eq!(edge_types(&out), vec!["DERIVES_FROM".to_string()]);
+}
+
+/// Tombstoned nodes and edges must be hidden from every read path and stay
+/// hidden across a close/reopen (durable recall is consistent with the deletes),
+/// while unrelated data survives untouched.
+#[test]
+fn soft_deleted_node_and_edges_hidden_and_survive_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        build_committed_multi_rel_hub(&mut store);
+
+        // Delete one edge (tombstone) and one edge-bearing node (tombstone node
+        // + its incident edges).
+        assert!(store.delete_edge("f1", "f2", "SIMILAR_TO"));
+        assert!(store.delete_node("ep1"));
+        store.checkpoint().unwrap();
+
+        // f1's SIMILAR_TO->f2 edge is gone; DERIVES_FROM->ep1 is gone (ep1
+        // deleted); SUPERSEDES->f3 remains.
+        let out = store.query_neighbors("f1", None, Direction::Outgoing, 100);
+        assert_eq!(neighbor_ids(&out), vec!["f3".to_string()]);
+        assert_eq!(edge_types(&out), vec!["SUPERSEDES".to_string()]);
+        assert!(store.get_node("ep1").is_none(), "deleted node hidden");
+        store.close();
+    }
+
+    // Reopen: the same view must hold for committed-on-disk CSR groups.
+    let store = LbugGraphStore::open(&path, Some("s")).unwrap();
+    let out = store.query_neighbors("f1", None, Direction::Outgoing, 100);
+    assert_eq!(
+        neighbor_ids(&out),
+        vec!["f3".to_string()],
+        "tombstones must persist across reopen"
+    );
+    assert!(store.get_node("ep1").is_none(), "deleted node still hidden");
+    assert!(store.get_node("f1").is_some(), "live node survives");
+    assert!(store.get_node("f3").is_some(), "live node survives");
+}
+
+/// `delete_edge` must tombstone only the matching edge, leaving the node's other
+/// edges (and the endpoints themselves) fully recallable.
+#[test]
+fn delete_edge_tombstones_only_that_edge() {
+    let (_tmp, mut store) = open_temp();
+    build_committed_multi_rel_hub(&mut store);
+
+    assert!(store.delete_edge("f1", "f3", "SUPERSEDES"));
+    store.checkpoint().unwrap();
+
+    let out = store.query_neighbors("f1", None, Direction::Outgoing, 100);
+    assert_eq!(
+        edge_types(&out),
+        vec!["DERIVES_FROM".to_string(), "SIMILAR_TO".to_string()],
+        "only the SUPERSEDES edge must be tombstoned"
+    );
+    assert_eq!(
+        neighbor_ids(&out),
+        vec!["ep1".to_string(), "f2".to_string()]
+    );
+    // Endpoints remain live and recallable.
+    assert!(store.get_node("f1").is_some());
+    assert!(store.get_node("f3").is_some());
 }
