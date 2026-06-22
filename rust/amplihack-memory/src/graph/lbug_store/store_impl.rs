@@ -536,38 +536,40 @@ impl GraphStore for LbugGraphStore {
         let escaped = escape_cypher(node_id);
 
         // Phase A — strip every incident relationship first, so the node delete
-        // never needs `DETACH` and never enters lbug 0.15.3's crashing
+        // never needs `DETACH` and never enters lbug's crashing
         // `detachDeleteForCSRRels` path (getGroup(UINT32_MAX) null deref, #98).
         //
-        // Each rel type is deleted with its own *typed* directed passes
-        // (`MATCH (a)-[r:TYPE]->(b) ... DELETE r`) rather than a single
-        // label-less `MATCH (a)-[r]->(b)` across all rel tables: a label-less
-        // multi-rel-table scan is exactly what drives lbug's
-        // `ScanMultiRelTable` / `CSRNodeGroup::scanCommittedInMemRandom` into
-        // the `getGroup(UINT32_MAX)` SEGV (#100). Two directed passes per type
-        // remove outbound, inbound, self-loop, and parallel edges. The passes
-        // are keyed on the globally unique `node_id`. With no rel tables the
-        // distinct-name list is empty, nothing is deleted, and we fall through
-        // to the plain `DELETE` below.
+        // Each incident rel table is stripped by *rebuilding* it (copy the
+        // surviving edges into a scratch table, swap it in) rather than issuing
+        // an in-place `MATCH (a)-[r:TYPE]->(b) ... DELETE r`. An in-place rel
+        // delete out of a *committed* CSR group is exactly what sets the group
+        // index to the UINT32_MAX sentinel and SIGSEGVs the next scan/checkpoint
+        // (#100) — version-independent across lbug 0.15.3/0.15.4/0.17.1. See
+        // [`rebuild_rel_table_keeping`](LbugGraphStore::rebuild_rel_table_keeping).
+        //
+        // Only rel tables the node actually has an edge in are rebuilt; an
+        // edgeless node (the common working-/sensory-memory eviction case)
+        // rebuilds nothing and falls straight through to the plain `DELETE`
+        // below, which is safe (bisection: deleting an edgeless node never
+        // corrupts a CSR group). Fail-closed (leave the node and all its edges
+        // intact) on any rebuild error rather than half-delete its edges.
+        let keep = format!("a.node_id <> '{escaped}' AND b.node_id <> '{escaped}'");
         for rel in self.distinct_rel_names() {
             // The rel label is interpolated bare; catalog names are always
-            // valid identifiers. Fail-closed (leave the node and its edges
-            // fully intact) rather than risk injecting an unsafe label.
+            // valid identifiers. Fail-closed rather than risk an unsafe label.
             if !is_valid_identifier(&rel) {
                 warn!("delete_node: refusing non-identifier rel type {rel:?} for {node_id}");
                 return false;
             }
-            let outgoing =
-                format!("MATCH (a)-[r:{rel}]->(b) WHERE a.node_id = '{escaped}' DELETE r");
-            let incoming =
-                format!("MATCH (a)-[r:{rel}]->(b) WHERE b.node_id = '{escaped}' DELETE r");
-            for cypher in [&outgoing, &incoming] {
-                if let Err(e) = self.execute(cypher) {
-                    // Fail-closed: leave the node fully intact (and its routing
-                    // cache entry) rather than half-delete its edges.
-                    warn!("delete_node: incident-edge cleanup failed for {node_id} on {rel}: {e}");
-                    return false;
-                }
+            let Some((from, to)) = self.rel_endpoints_cached(&rel) else {
+                continue;
+            };
+            if !self.rel_has_incident_node(&rel, &from, &to, node_id) {
+                continue;
+            }
+            if let Err(e) = self.rebuild_rel_table_keeping(&rel, &from, &to, &keep) {
+                warn!("delete_node: incident-edge rebuild failed for {node_id} on {rel}: {e}");
+                return false;
             }
         }
 
@@ -701,33 +703,50 @@ impl GraphStore for LbugGraphStore {
             return false;
         }
 
-        let src = match self.get_node(source_id) {
-            Some(n) => n,
-            None => return false,
-        };
-        let tgt = match self.get_node(target_id) {
-            Some(n) => n,
-            None => return false,
+        if self.get_node(source_id).is_none() || self.get_node(target_id).is_none() {
+            return false;
+        }
+
+        self.ensure_schema_loaded();
+        let _guard = self.acquire_lock();
+
+        // Unknown rel type → no such edge (matches the prior binder-error path,
+        // which returned false). `rel_endpoints_cached` also yields the FROM/TO
+        // tables to bind the typed scans below.
+        let Some((from, to)) = self.rel_endpoints_cached(edge_type) else {
+            return false;
         };
 
-        let _guard = self.acquire_lock();
-        let cypher = format!(
-            "MATCH (a:{})-[r:{edge_type}]->(b:{}) \
-             WHERE a.node_id = '{}' AND b.node_id = '{}' DELETE r",
-            src.node_type,
-            tgt.node_type,
-            escape_cypher(source_id),
-            escape_cypher(target_id)
+        let es = escape_cypher(source_id);
+        let et = escape_cypher(target_id);
+
+        // Nothing to delete → idempotent success without touching the table (so
+        // we never rebuild for a no-op). A typed single-rel-table scan, never
+        // the label-less multi-rel scanner.
+        let exists_q = format!(
+            "MATCH (a:{from})-[r:{edge_type}]->(b:{to}) \
+             WHERE a.node_id = '{es}' AND b.node_id = '{et}' RETURN r LIMIT 1"
         );
-        if self.execute(&cypher).is_ok() {
-            if let Err(e) = self.post_write_barrier() {
-                warn!("delete_edge: durability barrier failed for {source_id}->{target_id}: {e}");
+        match self.query_rows(&exists_q) {
+            Ok(rows) if rows.is_empty() => return true,
+            Ok(_) => {}
+            Err(e) => {
+                warn!("delete_edge: existence probe failed for {source_id}->{target_id}: {e}");
+                return false;
             }
-            self.note_write_and_maybe_checkpoint();
-            true
-        } else {
-            false
         }
+
+        // Remove the (source)->(target) edges of this type by rebuilding the rel
+        // table (keep everything else), never an in-place `DELETE r` against a
+        // committed CSR group — the #100 corruption driver. See
+        // [`rebuild_rel_table_keeping`](LbugGraphStore::rebuild_rel_table_keeping).
+        let keep = format!("NOT (a.node_id = '{es}' AND b.node_id = '{et}')");
+        if let Err(e) = self.rebuild_rel_table_keeping(edge_type, &from, &to, &keep) {
+            warn!("delete_edge: rebuild failed for {source_id}->{target_id} on {edge_type}: {e}");
+            return false;
+        }
+        self.note_write_and_maybe_checkpoint();
+        true
     }
 
     fn traverse(

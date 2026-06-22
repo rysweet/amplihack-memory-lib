@@ -1035,20 +1035,22 @@ fn delete_node_with_edges_survives_close_and_reopen() {
 // ..)` / `traverse(.., None, ..)` therefore now issue one *typed* scan per known
 // rel type and union the results, never a single label-less scan.
 //
-// IMPORTANT (see `reproduces_issue_100_csr_delete_corruption` below): the
-// typed-scan rewrite is a hardening, NOT a fix for #100. Bisection shows the
-// CSR group is corrupted (its index set to the UINT32_MAX sentinel) by *deleting
-// relationships out of a committed CSR group* (`delete_edge` / `delete_node`
-// Phase A) interleaved with checkpoints; the `getGroup(UINT32_MAX)` deref then
-// fires on whatever scan next touches that table — a checkpoint flush, a typed
-// read, OR the label-less read above. A label-less read is one possible
-// messenger, not the cause, so removing it does not remove the crash.
+// IMPORTANT (see `csr_delete_checkpoint_churn_stays_consistent` below): the
+// typed-scan rewrite is hardening for the READ backtrace, but #100's root cause
+// is the DELETE side. Bisection showed the CSR group is corrupted (its index set
+// to the UINT32_MAX sentinel) by *deleting relationships out of a committed CSR
+// group* (`delete_edge` / `delete_node` Phase A) interleaved with checkpoints;
+// the `getGroup(UINT32_MAX)` deref then fires on whatever scan next touches that
+// table — a checkpoint flush, a typed read, OR the label-less read above. The
+// fix is therefore on the delete side: `delete_edge` / `delete_node` never issue
+// an in-place `DELETE r` against a committed group, but *rebuild* the rel table
+// (copy survivors into a scratch table and swap it in). See
+// `rebuild_rel_table_keeping`.
 //
-// These tests therefore pin the *behavioral contract* of the typed per-rel-type
-// neighbor read across multiple committed rel tables — every edge of every type
-// returned exactly once, directions correct, unrelated data untouched — and
-// guard against a regression back to a label-less scan. On a small, fresh store
-// the delete-driven corruption does not reproduce, so they also pass cleanly.
+// These tests pin the *behavioral contract* of the typed per-rel-type neighbor
+// read across multiple committed rel tables — every edge of every type returned
+// exactly once, directions correct, unrelated data untouched — and guard against
+// a regression back to a label-less scan.
 // ---------------------------------------------------------------------------
 
 /// Add a node of `node_type` with the given id (reused across the #100 tests).
@@ -1295,31 +1297,30 @@ fn label_less_reads_survive_close_and_reopen_with_committed_csr() {
 }
 
 // ---------------------------------------------------------------------------
-// ROOT-CAUSE REPRODUCTION (#100) — currently UNRESOLVED, hence #[ignore]d.
+// ROOT-CAUSE REGRESSION (#100) — was the #[ignore]d reproduction, now a guard.
 //
 // Bisection (writes-only OK, writes+label-less-reads OK, writes+DELETES corrupt;
-// and `delete_edge` alone is sufficient) pins the driver of the
+// and `delete_edge` alone is sufficient) pinned the driver of the
 // getGroup(UINT32_MAX) crash to *deleting relationships out of a committed CSR
 // rel group* — `delete_edge` and `delete_node`'s Phase-A edge strip — when
-// interleaved with checkpoints. The CSR node group's index is set to the
-// UINT32_MAX sentinel; the next scan to touch that table dereferences it:
-//   - a CHECKPOINT flush (what this reproduction trips, in a debug build),
+// interleaved with checkpoints. The CSR node group's index was set to the
+// UINT32_MAX sentinel; the next scan to touch that table dereferenced it:
+//   - a CHECKPOINT flush (what this churn trips, in a debug build),
 //   - a label-less multi-rel read (issue backtrace 2), or
 //   - DETACH-DELETE's CSR walk (issue backtrace 1).
-// This is version-independent (0.15.3 / 0.15.4 / 0.17.1), i.e. an lbug engine
-// bug in CSR relationship deletion + checkpoint, not something the Rust-side
-// typed-scan rewrite (which only changes *which* scans are issued) can fix.
+// This was version-independent (0.15.3 / 0.15.4 / 0.17.1), i.e. an lbug engine
+// bug in in-place CSR relationship deletion + checkpoint.
 //
-// In this DEBUG build lbug surfaces the bad group as an assertion that the
-// bindings return as a recoverable `Storage` error containing
-// "group_collection.h ... groupIdx < groups.size()"; in a RELEASE/NDEBUG build
-// the same condition is the raw null-pointer-deref SIGSEGV that kills the
-// consumer daemon. This test therefore asserts the DESIRED post-fix behavior —
-// the delete+checkpoint churn completes with no CSR-corruption error — and
-// currently FAILS, reproducing the bug. It is #[ignore]d so CI stays green;
-// un-ignore it once the root cause (an lbug fix, or a Rust-side soft-delete /
-// rel-table-rebuild workaround) lands. Do NOT run under `--release`: there it
-// aborts the test binary via SIGSEGV instead of returning an error.
+// FIX: `delete_edge` / `delete_node` no longer delete relationship rows in
+// place. They rebuild the affected rel table — copy the surviving edges into a
+// `<rel>__rebuild_tmp` scratch table and swap it in — so a committed CSR group
+// is never the target of an in-place `DELETE r`. With that change the
+// consolidation-style delete+checkpoint churn below, which previously corrupted
+// a committed group within ~10 rounds (debug: recoverable `Storage` error
+// "group_collection.h ... groupIdx < groups.size()"; release: SIGSEGV), now
+// completes cleanly. The test asserts that consistent outcome; if a regression
+// reintroduces an in-place rel delete it FAILS (debug error) or aborts the test
+// binary (release SIGSEGV).
 // ---------------------------------------------------------------------------
 
 /// True if `e` is the #100 CSR `getGroup(UINT32_MAX)` corruption surfaced as a
@@ -1328,8 +1329,8 @@ fn is_csr_group_corruption(e: &str) -> bool {
     e.contains("group_collection.h") && e.contains("groupIdx < groups.size()")
 }
 
-/// Drive the consolidation-style delete + checkpoint churn that corrupts a
-/// committed CSR rel group. Returns `Err(detail)` on the first CSR-corruption
+/// Drive the consolidation-style delete + checkpoint churn that USED to corrupt
+/// a committed CSR rel group. Returns `Err(detail)` on the first CSR-corruption
 /// (or other) error, `Ok(())` if the whole sequence stays consistent.
 fn run_csr_delete_churn(rounds: usize) -> Result<(), String> {
     let tmp = tempfile::tempdir().unwrap();
@@ -1362,7 +1363,9 @@ fn run_csr_delete_churn(rounds: usize) -> Result<(), String> {
         }
 
         // Retention/dedup: delete an edge-bearing fact, then re-create its id —
-        // the exact per-cycle pattern that drives the committed-CSR corruption.
+        // the exact per-cycle pattern that used to drive the committed-CSR
+        // corruption. `delete_node` now strips the fact's edges by rebuilding
+        // each incident rel table rather than deleting rows in place.
         if round % 7 == 0 {
             let victim = format!("f{}", (round % 5) + 1);
             let _ = store.delete_node(&victim);
@@ -1382,21 +1385,237 @@ fn run_csr_delete_churn(rounds: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// REPRODUCTION (#100, UNRESOLVED): the delete + checkpoint consolidation churn
-/// must complete without corrupting a committed CSR rel group. It currently
-/// does not — the run returns the `getGroup(UINT32_MAX)` corruption error
-/// (debug) / SIGSEGVs (release). #[ignore]d until the root cause is fixed.
+/// REGRESSION (#100): the delete + checkpoint consolidation churn must complete
+/// without corrupting a committed CSR rel group. Pre-fix this corrupted within
+/// ~10 rounds; the rebuild-on-delete fix keeps it consistent. 40 rounds is 4x
+/// the historical corruption point — a comfortable regression margin.
 #[test]
-#[ignore = "reproduces unresolved lbug #100 CSR rel-delete corruption; un-ignore when fixed"]
-fn reproduces_issue_100_csr_delete_corruption() {
-    match run_csr_delete_churn(120) {
-        Ok(()) => { /* desired post-fix outcome */ }
+fn csr_delete_checkpoint_churn_stays_consistent() {
+    match run_csr_delete_churn(40) {
+        Ok(()) => { /* fixed: committed CSR groups stay intact across deletes */ }
         Err(e) if is_csr_group_corruption(&e) => {
             panic!(
-                "REPRODUCED #100: committed CSR rel group corrupted by \
-                 relationship deletes + checkpoints (getGroup(UINT32_MAX)): {e}"
+                "REGRESSION #100: a committed CSR rel group was corrupted by \
+                 relationship deletes + checkpoints (getGroup(UINT32_MAX)) — an \
+                 in-place rel DELETE crept back into delete_edge/delete_node: {e}"
             );
         }
         Err(e) => panic!("unexpected error during CSR-delete churn: {e}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rebuild-on-delete correctness (#100 fix). delete_edge / delete_node strip
+// relationships by rebuilding the rel table (copy survivors into a scratch
+// table and swap it in) instead of an in-place `DELETE r`. These pin that the
+// rebuild preserves every surviving edge, its properties, and unrelated data —
+// and that an interrupted rebuild's `__rebuild_tmp` scratch table is recovered
+// on reopen.
+// ---------------------------------------------------------------------------
+
+/// REGRESSION (#100): `delete_edge` rebuilds the rel table; it must drop only
+/// the targeted edge and leave every other edge — with its properties — intact,
+/// across a checkpoint (committed CSR group) and a reopen.
+#[test]
+fn delete_edge_rebuild_preserves_other_edges_and_props() {
+    let (_tmp, mut store) = open_temp();
+    for id in ["a1", "b1", "c1"] {
+        add(&mut store, "Thing", id);
+    }
+    store
+        .add_edge("a1", "b1", "LINKS", Some(props(&[("weight", "5")])))
+        .unwrap();
+    store
+        .add_edge("a1", "c1", "LINKS", Some(props(&[("weight", "9")])))
+        .unwrap();
+    store
+        .checkpoint()
+        .expect("checkpoint must commit the CSR group");
+
+    assert!(store.delete_edge("a1", "b1", "LINKS"));
+
+    let out = store.query_neighbors("a1", Some("LINKS"), Direction::Outgoing, 10);
+    assert_eq!(
+        neighbor_ids(&out),
+        vec!["c1".to_string()],
+        "only the survivor remains"
+    );
+    assert_eq!(
+        out[0].0.properties.get("weight").map(String::as_str),
+        Some("9"),
+        "survivor edge keeps its property through the rebuild"
+    );
+
+    store.close();
+    drop(store);
+    let store2 =
+        LbugGraphStore::open(&_tmp.path().join("graph.ladybug"), Some("test-store")).unwrap();
+    let out2 = store2.query_neighbors("a1", Some("LINKS"), Direction::Outgoing, 10);
+    assert_eq!(
+        neighbor_ids(&out2),
+        vec!["c1".to_string()],
+        "survivor persists across reopen"
+    );
+    assert_eq!(
+        out2[0].0.properties.get("weight").map(String::as_str),
+        Some("9")
+    );
+}
+
+/// REGRESSION (#100): deleting an edge that does not exist is an idempotent
+/// success and must not disturb the rel table's other edges.
+#[test]
+fn delete_missing_edge_is_noop_success() {
+    let (_tmp, mut store) = open_temp();
+    for id in ["a1", "b1"] {
+        add(&mut store, "Thing", id);
+    }
+    store.add_edge("a1", "b1", "LINKS", None).unwrap();
+    store.checkpoint().unwrap();
+
+    // No b1->a1 LINKS edge exists; deleting it is a no-op success.
+    assert!(store.delete_edge("b1", "a1", "LINKS"));
+    let out = store.query_neighbors("a1", Some("LINKS"), Direction::Outgoing, 10);
+    assert_eq!(
+        neighbor_ids(&out),
+        vec!["b1".to_string()],
+        "the real edge is untouched"
+    );
+}
+
+/// REGRESSION (#100): `delete_node` rebuilds only the rel tables the node has
+/// edges in and must leave unrelated edges (in the same and other rel tables)
+/// fully intact while removing the node and all its incident edges.
+#[test]
+fn delete_node_rebuild_preserves_unrelated_edges() {
+    let (_tmp, mut store) = open_temp();
+    for id in ["hub", "x1", "x2", "y1"] {
+        add(&mut store, "Fact", id);
+    }
+    add(&mut store, "Episode", "ep1");
+
+    // hub's incident edges span two rel tables, in both directions.
+    store.add_edge("hub", "ep1", "DERIVES_FROM", None).unwrap();
+    store.add_edge("x2", "hub", "SIMILAR_TO", None).unwrap();
+    // Unrelated edges that must survive: one in the SAME table hub uses
+    // (SIMILAR_TO) and one in a table hub never touches.
+    store.add_edge("x1", "x2", "SIMILAR_TO", None).unwrap();
+    store.add_edge("y1", "ep1", "DERIVES_FROM", None).unwrap();
+    store
+        .checkpoint()
+        .expect("checkpoint must commit the CSR groups");
+
+    assert!(store.delete_node("hub"));
+
+    assert!(store.get_node("hub").is_none(), "the node is gone");
+    // Unrelated SIMILAR_TO survivor intact.
+    let x1 = store.query_neighbors("x1", Some("SIMILAR_TO"), Direction::Outgoing, 10);
+    assert_eq!(neighbor_ids(&x1), vec!["x2".to_string()]);
+    // Unrelated DERIVES_FROM survivor intact.
+    let y1 = store.query_neighbors("y1", Some("DERIVES_FROM"), Direction::Outgoing, 10);
+    assert_eq!(neighbor_ids(&y1), vec!["ep1".to_string()]);
+    // hub's incident edges are gone (x2 no longer reaches hub).
+    let x2 = store.query_neighbors("x2", Some("SIMILAR_TO"), Direction::Outgoing, 10);
+    assert!(x2.is_empty(), "hub's incident edge was stripped");
+}
+
+/// REGRESSION (#100): `delete_node` on an edgeless node takes the plain-DELETE
+/// fast path (no rebuild) and still removes the node — even with rel tables
+/// present in the catalog.
+#[test]
+fn delete_edgeless_node_fast_path_after_fix() {
+    let (_tmp, mut store) = open_temp();
+    for id in ["a1", "b1", "lonely"] {
+        add(&mut store, "Fact", id);
+    }
+    store.add_edge("a1", "b1", "SIMILAR_TO", None).unwrap();
+    store.checkpoint().unwrap();
+
+    assert!(store.delete_node("lonely"));
+    assert!(store.get_node("lonely").is_none());
+    // The unrelated edge is untouched.
+    let out = store.query_neighbors("a1", Some("SIMILAR_TO"), Direction::Outgoing, 10);
+    assert_eq!(neighbor_ids(&out), vec!["b1".to_string()]);
+}
+
+/// REGRESSION (#100): a `<rel>__rebuild_tmp` scratch table left by a rebuild
+/// interrupted BEFORE the swap (canonical table still present) is a straggler
+/// and must be dropped on the next open, leaving the canonical table intact.
+#[test]
+fn stale_rebuild_tmp_is_dropped_on_open() {
+    let (_tmp, mut store) = open_temp();
+    for id in ["a1", "b1"] {
+        add(&mut store, "Fact", id);
+    }
+    store.add_edge("a1", "b1", "SIMILAR_TO", None).unwrap();
+    store.checkpoint().unwrap();
+    // Simulate the pre-swap straggler.
+    store
+        .execute("CREATE REL TABLE SIMILAR_TO__rebuild_tmp(FROM Fact TO Fact, edge_id STRING, graph_origin STRING)")
+        .unwrap();
+    store.checkpoint().unwrap();
+    store.close();
+    drop(store);
+
+    let store2 =
+        LbugGraphStore::open(&_tmp.path().join("graph.ladybug"), Some("test-store")).unwrap();
+    // Trigger schema load + recovery.
+    let out = store2.query_neighbors("a1", Some("SIMILAR_TO"), Direction::Outgoing, 10);
+    assert_eq!(
+        neighbor_ids(&out),
+        vec!["b1".to_string()],
+        "canonical edge intact"
+    );
+    let tables = store2.query_rows("CALL show_tables() RETURN *").unwrap();
+    let has_tmp = tables.iter().any(|row| {
+        row.iter()
+            .filter_map(super::value_as_str)
+            .any(|s| s.ends_with("__rebuild_tmp"))
+    });
+    assert!(!has_tmp, "stale rebuild tmp table must be dropped on open");
+}
+
+/// REGRESSION (#100): a `<rel>__rebuild_tmp` left by a rebuild interrupted IN
+/// the swap window (canonical dropped, survivors only in the tmp) must be
+/// promoted — renamed back to the canonical name — on the next open so its
+/// edges are not lost.
+#[test]
+fn interrupted_rebuild_tmp_is_promoted_on_open() {
+    let (_tmp, mut store) = open_temp();
+    for id in ["a1", "b1", "c1"] {
+        add(&mut store, "Fact", id);
+    }
+    store.add_edge("a1", "b1", "SIMILAR_TO", None).unwrap();
+    store.add_edge("a1", "c1", "SIMILAR_TO", None).unwrap();
+    store.checkpoint().unwrap();
+
+    // Simulate a crash mid-swap: survivors copied into the tmp, canonical dropped
+    // before the rename. The survivor here is a1->c1 only.
+    store
+        .execute("CREATE REL TABLE SIMILAR_TO__rebuild_tmp(FROM Fact TO Fact, edge_id STRING, graph_origin STRING)")
+        .unwrap();
+    store
+        .execute("MATCH (a:Fact),(b:Fact) WHERE a.node_id='a1' AND b.node_id='c1' CREATE (a)-[:SIMILAR_TO__rebuild_tmp {edge_id:'e', graph_origin:'test-store'}]->(b)")
+        .unwrap();
+    store.execute("DROP TABLE SIMILAR_TO").unwrap();
+    store.checkpoint().unwrap();
+    store.close();
+    drop(store);
+
+    let store2 =
+        LbugGraphStore::open(&_tmp.path().join("graph.ladybug"), Some("test-store")).unwrap();
+    // Trigger schema load + recovery (promotion of the tmp).
+    let out = store2.query_neighbors("a1", Some("SIMILAR_TO"), Direction::Outgoing, 10);
+    assert_eq!(
+        neighbor_ids(&out),
+        vec!["c1".to_string()],
+        "promoted rebuild tmp must restore the survivor under the canonical name"
+    );
+    let tables = store2.query_rows("CALL show_tables() RETURN *").unwrap();
+    let has_tmp = tables.iter().any(|row| {
+        row.iter()
+            .filter_map(super::value_as_str)
+            .any(|s| s.ends_with("__rebuild_tmp"))
+    });
+    assert!(!has_tmp, "tmp must be renamed away after promotion");
 }

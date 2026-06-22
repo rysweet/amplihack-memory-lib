@@ -106,6 +106,19 @@ pub(crate) const DEFAULT_MAX_DB_BYTES: u64 = 16 << 30;
 /// Floor for the maximum database size (1 GiB).
 pub(crate) const MIN_MAX_DB_BYTES: u64 = 1 << 30;
 
+/// Suffix for the scratch rel table used by the #100 rebuild-delete swap.
+///
+/// Deleting relationship rows in place from a *committed* CSR rel group is what
+/// corrupts the group (its index is set to the `UINT32_MAX` sentinel) and
+/// SIGSEGVs the next scan/checkpoint — version-independent across lbug
+/// 0.15.3/0.15.4/0.17.1. `delete_edge` / `delete_node` therefore never issue an
+/// in-place `DELETE r`; they rebuild the affected rel table by copying the
+/// surviving edges into `<rel><suffix>` and swapping it in (see
+/// [`LbugGraphStore::rebuild_rel_table_keeping`]). A crash in the one-statement
+/// rename window leaves a `<rel><suffix>` table that
+/// [`ensure_schema_loaded`](LbugGraphStore::ensure_schema_loaded) recovers.
+pub(crate) const REBUILD_TMP_SUFFIX: &str = "__rebuild_tmp";
+
 /// How [`LbugGraphStore::open_with_recovery`] opened the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalRecoveryOutcome {
@@ -661,13 +674,26 @@ impl LbugGraphStore {
         }
         self.schema_loaded.set(true);
 
-        let rows = match self.query_rows("CALL show_tables() RETURN *") {
+        let mut rows = match self.query_rows("CALL show_tables() RETURN *") {
             Ok(r) => r,
             Err(e) => {
                 warn!("lbug_store: show_tables introspection failed: {e}");
                 return;
             }
         };
+
+        // Recover a #100 rebuild-delete that was interrupted in its one-statement
+        // rename window: a leftover `<rel>__rebuild_tmp` holds the rebuilt
+        // survivors. If the catalog changed, re-read it before populating caches.
+        if self.recover_rebuild_tmp_tables(&rows) {
+            rows = match self.query_rows("CALL show_tables() RETURN *") {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("lbug_store: show_tables re-introspection after rebuild recovery failed: {e}");
+                    return;
+                }
+            };
+        }
 
         for row in rows {
             let (name, ttype) = match table_row_name_and_type(&row) {
@@ -685,6 +711,51 @@ impl LbugGraphStore {
                 self.node_table_columns.borrow_mut().insert(name, cols);
             }
         }
+    }
+
+    /// Resolve any leftover `<rel>__rebuild_tmp` rel tables from a #100
+    /// rebuild-delete (see [`rebuild_rel_table_keeping`](Self::rebuild_rel_table_keeping))
+    /// that was interrupted in its drop→rename swap. Returns `true` if the
+    /// catalog was changed. Best-effort: failures are logged, not fatal.
+    ///
+    /// * If the canonical `<rel>` still exists, the tmp is a *pre-swap*
+    ///   straggler (the original is intact, the delete never took effect): drop
+    ///   the tmp.
+    /// * If `<rel>` is missing, the crash landed between the `DROP` and the
+    ///   `RENAME`, so the rebuilt survivors live only in the tmp: promote it by
+    ///   renaming it back to `<rel>`.
+    fn recover_rebuild_tmp_tables(&self, rows: &[Vec<Value>]) -> bool {
+        let names: HashSet<String> = rows
+            .iter()
+            .filter_map(|row| table_row_name_and_type(row).map(|(name, _)| name))
+            .collect();
+        let tmps: Vec<String> = names
+            .iter()
+            .filter(|n| n.ends_with(REBUILD_TMP_SUFFIX))
+            .cloned()
+            .collect();
+
+        let mut changed = false;
+        for tmp in tmps {
+            let canonical = &tmp[..tmp.len() - REBUILD_TMP_SUFFIX.len()];
+            if !is_valid_identifier(canonical) || !is_valid_identifier(&tmp) {
+                continue;
+            }
+            if names.contains(canonical) {
+                if let Err(e) = self.execute(&format!("DROP TABLE {tmp}")) {
+                    warn!("lbug_store: failed to drop stale rebuild tmp {tmp}: {e}");
+                } else {
+                    changed = true;
+                }
+            } else if let Err(e) = self.execute(&format!("ALTER TABLE {tmp} RENAME TO {canonical}"))
+            {
+                warn!("lbug_store: failed to promote interrupted rebuild tmp {tmp}: {e}");
+            } else {
+                warn!("lbug_store: promoted interrupted #100 rebuild tmp {tmp} -> {canonical}");
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Return the user-defined column names of `table` from the catalog.
@@ -718,6 +789,148 @@ impl LbugGraphStore {
             [from, to, ..] => Some((from.clone(), to.clone())),
             _ => None,
         }
+    }
+
+    /// Endpoint node tables for `rel` from the schema cache, or `None` if the
+    /// rel table is unknown. Avoids a `show_connection` round-trip on the hot
+    /// delete path; the cache is authoritative because rebuild swaps preserve
+    /// the rel name and its `FROM`/`TO`.
+    fn rel_endpoints_cached(&self, rel: &str) -> Option<(String, String)> {
+        self.known_rel_tables
+            .borrow()
+            .iter()
+            .find(|(name, _, _)| name == rel)
+            .map(|(_, from, to)| (from.clone(), to.clone()))
+    }
+
+    /// User-defined column names of rel table `rel`, in catalog order
+    /// (`edge_id`, `graph_origin`, then any extra property columns). Every rel
+    /// column in this store is `STRING`, so the rebuild can copy values as
+    /// escaped string literals without tracking types.
+    fn introspect_rel_columns(&self, rel: &str) -> Vec<String> {
+        let cypher = format!("CALL table_info('{}') RETURN *", escape_cypher(rel));
+        let mut cols = Vec::new();
+        if let Ok(rows) = self.query_rows(&cypher) {
+            for row in rows {
+                // `table_info` rows are [property_id, name, type, default,
+                // storage]; the column name is the first String value (the
+                // numeric id is not a String).
+                if let Some(name) = row.iter().find_map(value_as_str) {
+                    cols.push(name.to_string());
+                }
+            }
+        }
+        cols
+    }
+
+    /// `true` if `node_id` is an endpoint of at least one edge in rel table
+    /// `rel`. A typed single-rel-table `LIMIT 1` scan (never the label-less
+    /// multi-rel scanner). Lets [`delete_node`](crate::graph::protocol::GraphStore::delete_node)
+    /// skip rebuilding tables the node has no edges in — and skip rebuilding
+    /// entirely for an edgeless node (the common eviction case), which deletes
+    /// safely with a plain `DELETE`.
+    pub(crate) fn rel_has_incident_node(
+        &self,
+        rel: &str,
+        from: &str,
+        to: &str,
+        node_id: &str,
+    ) -> bool {
+        let esc = escape_cypher(node_id);
+        let q = format!(
+            "MATCH (a:{from})-[r:{rel}]->(b:{to}) WHERE a.node_id = '{esc}' OR b.node_id = '{esc}' RETURN r LIMIT 1"
+        );
+        matches!(self.query_rows(&q), Ok(rows) if !rows.is_empty())
+    }
+
+    /// Rebuild rel table `rel` (`FROM from TO to`) keeping only the edges that
+    /// satisfy `keep_where` — a Cypher predicate over the bound `a` (the `FROM`
+    /// endpoint) and `b` (the `TO` endpoint).
+    ///
+    /// This is the #100 fix: it deletes relationships **without** an in-place
+    /// `DELETE r`, which corrupts a committed CSR rel group (see
+    /// [`REBUILD_TMP_SUFFIX`]). Survivors are copied into a scratch table and
+    /// the scratch table is swapped in.
+    ///
+    /// Survivor-safe ordering (lbug DDL auto-commits, so the whole rebuild
+    /// cannot be wrapped in one transaction): the original table is left fully
+    /// intact until the scratch table is built **and fsync'd**; only then is the
+    /// original dropped and the scratch renamed over it. The single crash window
+    /// is between that `DROP` and `RENAME`; a leftover scratch table is recovered
+    /// by [`recover_rebuild_tmp_tables`](Self::recover_rebuild_tmp_tables) on the
+    /// next open. The caller must hold the write lock.
+    pub(crate) fn rebuild_rel_table_keeping(
+        &self,
+        rel: &str,
+        from: &str,
+        to: &str,
+        keep_where: &str,
+    ) -> crate::Result<()> {
+        // All three names come from the catalog/cache and are always valid;
+        // they are interpolated bare, so refuse rather than risk injection.
+        if !is_valid_identifier(rel) || !is_valid_identifier(from) || !is_valid_identifier(to) {
+            return Err(MemoryError::Storage(format!(
+                "refusing to rebuild rel table with non-identifier names ({rel}, {from}, {to})"
+            )));
+        }
+        let cols = self.introspect_rel_columns(rel);
+        for c in &cols {
+            if !is_valid_identifier(c) {
+                return Err(MemoryError::Storage(format!(
+                    "refusing to rebuild rel table {rel}: non-identifier column {c:?}"
+                )));
+            }
+        }
+
+        // Snapshot the survivors: endpoint ids + every (STRING) column.
+        let ret_cols: String = cols.iter().map(|c| format!(", r.{c}")).collect();
+        let snapshot_q = format!(
+            "MATCH (a:{from})-[r:{rel}]->(b:{to}) WHERE {keep_where} \
+             RETURN a.node_id, b.node_id{ret_cols}"
+        );
+        let survivors = self.query_rows(&snapshot_q)?;
+
+        let tmp = format!("{rel}{REBUILD_TMP_SUFFIX}");
+        // Drop a straggler from an earlier interrupted rebuild (best-effort).
+        let _ = self.execute(&format!("DROP TABLE {tmp}"));
+        let col_defs: String = cols
+            .iter()
+            .map(|c| format!(", {c} STRING DEFAULT ''"))
+            .collect();
+        self.execute(&format!(
+            "CREATE REL TABLE {tmp}(FROM {from} TO {to}{col_defs})"
+        ))?;
+
+        for row in &survivors {
+            let a = value_to_string(&row[0]);
+            let b = value_to_string(&row[1]);
+            let props: Vec<String> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{c}: '{}'", escape_cypher(&value_to_string(&row[2 + i]))))
+                .collect();
+            let prop_clause = if props.is_empty() {
+                String::new()
+            } else {
+                format!(" {{{}}}", props.join(", "))
+            };
+            self.execute(&format!(
+                "MATCH (a:{from}), (b:{to}) WHERE a.node_id = '{}' AND b.node_id = '{}' \
+                 CREATE (a)-[:{tmp}{prop_clause}]->(b)",
+                escape_cypher(&a),
+                escape_cypher(&b),
+            ))?;
+        }
+
+        // Survivors are now durable in `tmp`; the original is still intact, so a
+        // crash here loses nothing (the delete simply did not happen yet).
+        self.post_write_barrier()?;
+
+        // Swap. The only crash-loss window is between these two statements.
+        self.execute(&format!("DROP TABLE {rel}"))?;
+        self.execute(&format!("ALTER TABLE {tmp} RENAME TO {rel}"))?;
+        self.post_write_barrier()?;
+        Ok(())
     }
 
     /// Ensure a node table exists with (at least) the reserved columns plus the

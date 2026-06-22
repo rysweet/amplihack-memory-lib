@@ -10,12 +10,16 @@ whenever a node with relationships stored in a CSR rel table was detach-deleted.
 This page is the authoritative description of the fix for issue **#98** ("CRITICAL
 native crash — daemon SEGV-crashes every ~45–90 minutes during a `DETACH DELETE`").
 
-> **Related work (#100).** Phase A's incident-edge strip later moved from a
-> single *label-less* pass to **typed, per-rel-type passes** as a follow-up
-> hardening for issue **#100** (a second `getGroup(UINT32_MAX)` backtrace that
-> originates in a label-less multi-rel-table *read* scan). This page reflects the
-> current typed-delete implementation. #100's read-side hardening **and the
-> still-unresolved CSR rel-delete root cause** are covered in
+> **Related work (#100).** Phase A's incident-edge strip evolved twice as
+> follow-up work for issue **#100** (a `getGroup(UINT32_MAX)` corruption driven by
+> deleting relationships out of a *committed* CSR rel group). It first moved from a
+> single *label-less* `DELETE r` pass to **typed, per-rel-type** passes (read-side
+> hardening), and then — because an in-place `DELETE r` against a committed group
+> is itself the corruption trigger — to **rebuilding** each incident rel table
+> (copy the survivors into a scratch table and swap it in) instead of deleting
+> edges in place. This page reflects the current **rebuild-on-delete**
+> implementation. The full #100 analysis, the rebuild design, and the read-side
+> typed-scan hardening are in
 > [`docs/csr_rel_delete_corruption.md`](csr_rel_delete_corruption.md); the
 > edge-first/no-`DETACH` contract described here is unchanged by that work.
 
@@ -117,30 +121,35 @@ critical section so no intermediate state is ever externally observable:
 
 1. **Phase A — remove every incident relationship.** For each relationship type
    the store knows about (`distinct_rel_names()`, derived from the
-   `known_rel_tables` catalog cache), two directed, *typed* Cypher passes delete
-   all edges of that type touching the node, in both directions:
+   `known_rel_tables` catalog cache) that the node actually has an edge in, the
+   incident edges are removed by **rebuilding** that rel table — not by an
+   in-place `DELETE r`:
 
-   ```cypher
-   -- for each known rel type TYPE:
-   -- outgoing edges (node is the source)
-   MATCH (a)-[r:TYPE]->(b) WHERE a.node_id = '<escaped id>' DELETE r
-   -- incoming edges (node is the target)
-   MATCH (a)-[r:TYPE]->(b) WHERE b.node_id = '<escaped id>' DELETE r
+   ```text
+   -- for each known rel type TYPE the node is incident to:
+   --   keep := edges NOT touching the node
+   --     a.node_id <> '<escaped id>' AND b.node_id <> '<escaped id>'
+   --   1. snapshot the survivors (endpoint ids + every STRING column)
+   --   2. CREATE REL TABLE TYPE__rebuild_tmp(FROM .. TO .., ..); reinsert survivors
+   --   3. fsync  (original TYPE still intact ⇒ a crash here loses nothing)
+   --   4. DROP TABLE TYPE;  ALTER TABLE TYPE__rebuild_tmp RENAME TO TYPE;  fsync
    ```
 
-   Two directed passes per type together remove outbound, inbound, self-loop, and
-   parallel edges; iterating over every known rel type covers all of them. The
-   passes are matched on the globally unique `node_id`.
+   The deleted edges are simply absent from the rebuilt table, so lbug never runs
+   an in-place rel delete against a **committed** CSR rel group — the operation
+   that sets the group index to the `UINT32_MAX` sentinel and `SIGSEGV`s the next
+   scan/checkpoint (**#100**). The survivor-safe ordering and the
+   `TYPE__rebuild_tmp` crash-recovery (promote or drop on the next open) are
+   detailed in [`docs/csr_rel_delete_corruption.md`](csr_rel_delete_corruption.md)
+   (`LbugGraphStore::rebuild_rel_table_keeping`).
 
-   Each pass is **typed** (`-[r:TYPE]->`) rather than label-less
-   (`-[r]->`): a single label-less rel `MATCH` fans across *every* rel table at
-   once through lbug's multi-rel-table scanner, which is the second
-   `getGroup(UINT32_MAX)` SIGSEGV backtrace in **#100**. A typed pass only ever
-   touches one rel table's CSR storage and never enters that scanner. See
-   [`docs/csr_rel_delete_corruption.md`](csr_rel_delete_corruption.md). Rel-type
-   names come straight from the catalog and are always safe identifiers; a
-   non-identifier name (a corrupt cache) is refused fail-closed (the node and its
-   edges are left fully intact) rather than interpolated as a bare rel label.
+   Only rel tables the node is **incident to** are rebuilt (`rel_has_incident_node`
+   gates each one), so an edgeless node rebuilds nothing and falls straight through
+   to the plain Phase-B `DELETE` — which is safe (bisection: deleting an edgeless
+   node never corrupts a CSR group). Rel-type and endpoint-table names come straight
+   from the catalog and are always safe identifiers; a non-identifier name (a
+   corrupt cache) is refused fail-closed (the node and its edges are left fully
+   intact) rather than interpolated as a bare label.
 
 2. **Phase B — delete the now-isolated node with a plain `DELETE` (no `DETACH`).**
 
@@ -159,14 +168,16 @@ critical section so no intermediate state is ever externally observable:
   returns `false` immediately.
 - **Edge-pass guard.** After the schema cache is ensured loaded from the on-disk
   catalog (`ensure_schema_loaded`, which populates `known_rel_tables`), Phase A
-  iterates over the distinct known rel-type names. When the store knows of no rel
-  tables, that list is empty, so no edge passes run and control falls straight
-  through to the plain Phase-B `DELETE` — keeping the edgeless-node path green
-  (and there is nothing to delete anyway).
-- **Fail-closed.** If any Phase A pass returns an error — or a known rel-type name
-  is not a safe identifier — `delete_node` logs a warning and returns `false`
+  iterates over the distinct known rel-type names and rebuilds only those the node
+  is incident to. When the store knows of no rel tables, or the node has no
+  incident edges, nothing is rebuilt and control falls straight through to the
+  plain Phase-B `DELETE` — keeping the edgeless-node path green and fast.
+- **Fail-closed.** If any Phase A rebuild returns an error — or a known rel-type
+  name is not a safe identifier — `delete_node` logs a warning and returns `false`
   **without** running Phase B and **without** evicting the routing cache, so the
-  node is left fully intact rather than half-deleted.
+  node is left fully intact rather than half-deleted. The rebuild keeps the
+  original rel table intact until its replacement is built and fsync'd, so a
+  mid-rebuild failure or crash never loses surviving edges.
 - **Atomic.** Phase A, Phase B, the cache eviction, the durability barrier, and the
   auto-checkpoint bookkeeping all run under one non-reentrant lock, so a concurrent
   reader never observes a node with some-but-not-all of its edges removed.
@@ -187,13 +198,14 @@ sequenceDiagram
     S->>S: ensure_schema_loaded → populate known_rel_tables
     S->>S: acquire write lock
     S->>S: rel_types = distinct_rel_names() (from known_rel_tables)
-    loop for each known rel TYPE
-        S->>E: MATCH (a)-[r:TYPE]->(b) WHERE a.node_id='fact-123' DELETE r
-        S->>E: MATCH (a)-[r:TYPE]->(b) WHERE b.node_id='fact-123' DELETE r
-        Note over S,E: typed scan — never lbug's multi-rel-table scanner (#100)
+    loop for each known rel TYPE the node is incident to
+        S->>E: snapshot survivors (edges NOT touching fact-123)
+        S->>E: CREATE TYPE__rebuild_tmp; reinsert survivors; fsync
+        S->>E: DROP TABLE TYPE; RENAME TYPE__rebuild_tmp TO TYPE; fsync
+        Note over S,E: rebuild — no in-place DELETE r on a committed CSR group (#100)
         Note over S,E: on error / unsafe name → warn + return false (no node delete)
     end
-    Note over S,E: empty rel_types ⇒ no passes ⇒ fall through to plain DELETE
+    Note over S,E: edgeless node ⇒ no rebuilds ⇒ fall through to plain DELETE
     S->>E: MATCH (n:Fact) WHERE n.node_id='fact-123' DELETE n
     Note over S,E: plain DELETE — never DETACH, never detachDeleteForCSRRels
     S->>S: evict id→table cache · durability barrier · maybe checkpoint
@@ -273,8 +285,8 @@ use amplihack_memory::graph::protocol::GraphStore;
 use amplihack_memory::graph::LbugGraphStore;
 
 fn purge_sensory(store: &mut LbugGraphStore) {
-    // A node with no relationships: the incident-edge passes are skipped and the
-    // plain DELETE removes it exactly as before.
+    // A node with no relationships: no rel tables are rebuilt and the plain
+    // DELETE removes it exactly as before.
     assert!(store.delete_node("sensory-987"));
 }
 ```
@@ -340,10 +352,11 @@ behind the `persistent` feature:
   with no relationships is retained and still passes, proving the edge-pass guard
   keeps the edgeless path working.
 
-The typed Phase-A deletes also run inside the broader **#100** regression suite
-(`consolidation_cycle_with_label_less_reads_does_not_crash` exercises
-`delete_node` over committed CSR groups during a full consolidation cycle) and are
-discussed alongside the still-unresolved CSR rel-delete root cause in
+The Phase-A rebuilds also run inside the broader **#100** regression suite
+(`csr_delete_checkpoint_churn_stays_consistent` drives `delete_node`/`delete_edge`
+over committed CSR groups across interleaved checkpoints, and
+`delete_node_rebuild_preserves_unrelated_edges` checks the rebuild keeps unrelated
+edges intact); these and the resolved CSR rel-delete root cause are discussed in
 [`docs/csr_rel_delete_corruption.md`](csr_rel_delete_corruption.md).
 
 Validate with the feature-gated suite (run a few times, since the original failure

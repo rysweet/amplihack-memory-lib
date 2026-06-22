@@ -310,15 +310,19 @@ consolidation. See
 reference — the #98 incident, root cause, the two-phase delete, and the
 regression coverage.
 
-As a follow-up (#100), every label-less multi-rel-table scan in the persistent
-hot path — neighbor reads, traversals, and the delete edge-strip — now issues
-**typed, per-rel-type** scans (`MATCH (a)-[r:TYPE]->(b)`), so the backend never
-drives lbug's multi-rel-table scanner. This is hardening, not a complete fix: the
-underlying `getGroup(UINT32_MAX)` CSR corruption is an **unresolved**, version-
-independent lbug engine bug in committed-CSR relationship deletion plus
-checkpointing. See
+A follow-up (#100) fixes the underlying `getGroup(UINT32_MAX)` CSR corruption — a
+version-independent lbug engine bug triggered by deleting relationships **in
+place** out of a *committed* CSR rel group plus checkpointing. `delete_edge` and
+`delete_node`'s incident-edge strip no longer issue an in-place `DELETE r`; they
+**rebuild** the affected rel table (copy the survivors into a scratch table and
+atomically swap it in), so the corrupting operation never runs. As additional
+read-side hardening, every label-less multi-rel-table scan in the persistent hot
+path (neighbor reads, traversals) now issues **typed, per-rel-type** scans
+(`MATCH (a)-[r:TYPE]->(b)`), so the backend never drives lbug's multi-rel-table
+scanner either. See
 [`docs/csr_rel_delete_corruption.md`](docs/csr_rel_delete_corruption.md) for the
-two backtraces, the bisecting reproduction, and follow-up options.
+two backtraces, the rebuild design and its crash recovery, and the regression
+coverage.
 
 ### Automatic `SIMILAR_TO` linking between facts
 

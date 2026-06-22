@@ -8,6 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Critical native crash (#100):** the persistent store (`LbugGraphStore`)
+  `SIGSEGV`-crashed the consumer's daemon every ~45–90 minutes during
+  retention/dedup consolidation, in the same `getGroup(UINT32_MAX)` null-pointer
+  dereference family as #98. Bisection pinned the root cause to **deleting
+  relationships in place out of a *committed* CSR rel group** (`delete_edge`, and
+  `delete_node`'s incident-edge strip) while checkpoints are interleaved: that
+  sets the CSR node-group index to the `UINT32_MAX` sentinel, and the next scan or
+  checkpoint to touch the table dereferences it (debug: a recoverable
+  `group_collection.h ... groupIdx < groups.size()` assertion; release: a raw
+  `SIGSEGV`). It is **version-independent** (reproduced on lbug `0.15.3`, `0.15.4`,
+  and `0.17.1`), i.e. an engine bug not fixable by changing *which* scans are
+  issued. Two complementary changes:
+  - **Rebuild-on-delete** removes the trigger: `delete_edge` and `delete_node`'s
+    Phase-A edge strip never issue an in-place `DELETE r` against a committed CSR
+    group. To drop a set of edges from a rel table they **rebuild** it — snapshot
+    the surviving edges (endpoint ids + every column), build a
+    `<rel>__rebuild_tmp` scratch table, `fsync`, then `DROP` the original and
+    `RENAME` the scratch over it. The original is kept fully intact until the
+    replacement is durable, so no acknowledged edge is lost; a crash in the
+    one-statement rename window leaves a `__rebuild_tmp` table that the next open
+    recovers (promote if the canonical is missing, else drop). Edgeless nodes keep
+    the plain-`DELETE` fast path (bisection: deleting an edgeless node is safe), and
+    only rel tables a node is incident to are rebuilt, so the common
+    working-/sensory-memory eviction path rebuilds nothing.
+  - **Typed per-rel-type read scans** as read-side hardening: every label-less
+    multi-rel-table `MATCH (a)-[r]->(b)` in the read hot path (`query_neighbors` /
+    `traverse` with no edge type) now fans out one typed `MATCH (a)-[r:TYPE]->(b)`
+    scan per known rel type and unions the results, so the backend never enters
+    lbug's multi-rel-table scanner (#100's second crash backtrace).
+
+  No `GraphStore` trait or public-API change; durability/recovery is preserved and
+  extended. See `rust/amplihack-memory/docs/csr_rel_delete_corruption.md`.
 - **Critical native crash (#98):** the persistent store
   (`LbugGraphStore`) `SIGSEGV`-crashed the consumer's daemon every ~45–90
   minutes during retention/dedup consolidation. `delete_node` issued a Cypher
