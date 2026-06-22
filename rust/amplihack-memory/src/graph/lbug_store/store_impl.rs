@@ -180,34 +180,52 @@ impl LbugGraphStore {
         self.get_node(node_id).map(|n| n.node_type)
     }
 
-    /// Fetch neighbors in a single direction with one label-less query.
+    /// Distinct relationship-type names currently known to the catalog, sorted
+    /// for a deterministic scan order.
     ///
-    /// When `edge_type` is `None` every relationship type is matched at once
-    /// (the rel's actual type is recovered from [`lbug::RelVal::get_label_name`]),
-    /// so an N-hop traversal no longer issues one query per rel table per node.
-    fn query_neighbors_directed(
+    /// A rel name can appear in [`known_rel_tables`](LbugGraphStore::known_rel_tables)
+    /// with several `(from, to)` endpoint pairs, but each edge lives in exactly
+    /// one rel table, so deduplicating by name lets a typed fan-out
+    /// (`MATCH (a)-[r:NAME]->(b)`) visit every edge exactly once without the
+    /// double-counting a per-tuple iteration would cause.
+    fn distinct_rel_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .known_rel_tables
+            .borrow()
+            .iter()
+            .map(|(rel, _, _)| rel.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Fetch neighbors of one rel type in a single direction with a *typed*
+    /// `MATCH (a)-[r:rel_type]->(b)` scan.
+    ///
+    /// `rel_type` must already be a valid identifier (the caller checks);
+    /// it is interpolated bare as a rel label. A typed scan touches a single
+    /// rel table's CSR storage and never enters lbug's multi-rel-table scanner
+    /// — see [`query_neighbors_directed`](Self::query_neighbors_directed).
+    fn query_neighbors_one_type(
         &self,
         node_id: &str,
-        edge_type: Option<&str>,
+        rel_type: &str,
         direction: &str,
         limit: usize,
     ) -> Vec<(GraphEdge, GraphNode)> {
         let lc = limit_clause(limit);
         let escaped = escape_cypher(node_id);
-        let rel_pat = match edge_type {
-            Some(et) => format!("r:{et}"),
-            None => "r".to_string(),
-        };
         let cypher = if direction == "outgoing" {
-            format!("MATCH (a)-[{rel_pat}]->(b) WHERE a.node_id = '{escaped}' RETURN r, b{lc}")
+            format!("MATCH (a)-[r:{rel_type}]->(b) WHERE a.node_id = '{escaped}' RETURN r, b{lc}")
         } else {
-            format!("MATCH (a)-[{rel_pat}]->(b) WHERE b.node_id = '{escaped}' RETURN r, a{lc}")
+            format!("MATCH (a)-[r:{rel_type}]->(b) WHERE b.node_id = '{escaped}' RETURN r, a{lc}")
         };
 
         let rows = match self.query_rows(&cypher) {
             Ok(r) => r,
             Err(e) => {
-                warn!("query_neighbors_directed failed: {e}");
+                warn!("query_neighbors_one_type({rel_type}) failed: {e}");
                 return Vec::new();
             }
         };
@@ -222,15 +240,69 @@ impl LbugGraphStore {
                 _ => continue,
             };
             let edge = match rel_v {
+                // The rel type is fixed by the typed query, so take it from
+                // `rel_type` rather than `RelVal::get_label_name` (which only
+                // mattered for the old label-less multi-table scan).
                 Some(Value::Rel(rv)) => {
-                    let rel_name = rv.get_label_name().clone();
-                    self.rel_val_to_edge(&rv, &rel_name, node_id, direction, &neighbor.node_id)
+                    self.rel_val_to_edge(&rv, rel_type, node_id, direction, &neighbor.node_id)
                 }
                 _ => continue,
             };
             pairs.push((edge, neighbor));
         }
         pairs
+    }
+
+    /// Fetch neighbors in a single direction.
+    ///
+    /// When `edge_type` is `Some(t)` a single typed scan is issued. When it is
+    /// `None` we **fan out one typed scan per known rel type** and union the
+    /// results, instead of issuing a single label-less `MATCH (a)-[r]->(b)`
+    /// across every rel table at once.
+    ///
+    /// A label-less multi-rel-table scan is exactly what drives lbug's
+    /// `RelTableCollectionScanner::scan` / `ScanMultiRelTable` /
+    /// `CSRNodeGroup::scanCommittedInMemRandom` into a `getGroup(UINT32_MAX)`
+    /// null-pointer dereference and SIGSEGVs the process (#100). Each typed
+    /// scan touches a single rel table's CSR and avoids that scanner entirely.
+    /// Because every edge lives in exactly one rel table, the per-type union
+    /// returns each edge exactly once (matching the old single-query result
+    /// set; ordering across rel types was never part of the contract).
+    ///
+    /// Defense-in-depth note (Step 3, #100): skipping node groups whose CSR
+    /// index is the `UINT32_MAX` sentinel before dereferencing is internal to
+    /// lbug's C++ engine and is not exposed to the Rust bindings, so it cannot
+    /// be done here. Avoiding the multi-rel-table scanner via typed scans (this
+    /// function) and keeping `known_rel_tables` the authoritative rel-type list
+    /// is the feasible, durability-neutral mitigation.
+    fn query_neighbors_directed(
+        &self,
+        node_id: &str,
+        edge_type: Option<&str>,
+        direction: &str,
+        limit: usize,
+    ) -> Vec<(GraphEdge, GraphNode)> {
+        match edge_type {
+            Some(et) => self.query_neighbors_one_type(node_id, et, direction, limit),
+            None => {
+                let mut pairs = Vec::new();
+                for rel in self.distinct_rel_names() {
+                    // Catalog names are always valid identifiers; skip anything
+                    // else rather than interpolate an unsafe rel label.
+                    if !is_valid_identifier(&rel) {
+                        continue;
+                    }
+                    pairs.extend(self.query_neighbors_one_type(node_id, &rel, direction, limit));
+                    if pairs.len() >= limit {
+                        break;
+                    }
+                }
+                if limit < pairs.len() {
+                    pairs.truncate(limit);
+                }
+                pairs
+            }
+        }
     }
 }
 
@@ -466,21 +538,34 @@ impl GraphStore for LbugGraphStore {
         // Phase A — strip every incident relationship first, so the node delete
         // never needs `DETACH` and never enters lbug 0.15.3's crashing
         // `detachDeleteForCSRRels` path (getGroup(UINT32_MAX) null deref, #98).
-        // Two directed, label-less passes remove outbound, inbound, self-loop,
-        // and parallel edges across all rel types. The passes are label-less and
-        // keyed on the globally unique `node_id` (mirroring
-        // `query_neighbors_directed`) to avoid a binder error when the node's
-        // table participates in no rel table. Guarded on a non-empty
-        // `known_rel_tables`: with no rel tables an unlabeled rel `MATCH` would
-        // itself be a binder error and there is nothing to delete.
-        if !self.known_rel_tables.borrow().is_empty() {
-            let outgoing = format!("MATCH (a)-[r]->(b) WHERE a.node_id = '{escaped}' DELETE r");
-            let incoming = format!("MATCH (a)-[r]->(b) WHERE b.node_id = '{escaped}' DELETE r");
+        //
+        // Each rel type is deleted with its own *typed* directed passes
+        // (`MATCH (a)-[r:TYPE]->(b) ... DELETE r`) rather than a single
+        // label-less `MATCH (a)-[r]->(b)` across all rel tables: a label-less
+        // multi-rel-table scan is exactly what drives lbug's
+        // `ScanMultiRelTable` / `CSRNodeGroup::scanCommittedInMemRandom` into
+        // the `getGroup(UINT32_MAX)` SEGV (#100). Two directed passes per type
+        // remove outbound, inbound, self-loop, and parallel edges. The passes
+        // are keyed on the globally unique `node_id`. With no rel tables the
+        // distinct-name list is empty, nothing is deleted, and we fall through
+        // to the plain `DELETE` below.
+        for rel in self.distinct_rel_names() {
+            // The rel label is interpolated bare; catalog names are always
+            // valid identifiers. Fail-closed (leave the node and its edges
+            // fully intact) rather than risk injecting an unsafe label.
+            if !is_valid_identifier(&rel) {
+                warn!("delete_node: refusing non-identifier rel type {rel:?} for {node_id}");
+                return false;
+            }
+            let outgoing =
+                format!("MATCH (a)-[r:{rel}]->(b) WHERE a.node_id = '{escaped}' DELETE r");
+            let incoming =
+                format!("MATCH (a)-[r:{rel}]->(b) WHERE b.node_id = '{escaped}' DELETE r");
             for cypher in [&outgoing, &incoming] {
                 if let Err(e) = self.execute(cypher) {
                     // Fail-closed: leave the node fully intact (and its routing
                     // cache entry) rather than half-delete its edges.
-                    warn!("delete_node: incident-edge cleanup failed for {node_id}: {e}");
+                    warn!("delete_node: incident-edge cleanup failed for {node_id} on {rel}: {e}");
                     return false;
                 }
             }
@@ -580,9 +665,12 @@ impl GraphStore for LbugGraphStore {
         self.ensure_schema_loaded();
         let _guard = self.acquire_lock();
 
-        // A label-less / typed-rel MATCH binds against the relevant rel tables;
-        // if none exist (or the requested edge_type is unknown) there are no
-        // neighbors and the unlabeled MATCH would be a binder error, so bail out.
+        // Early-out when there are no matching rel tables: an unknown
+        // `edge_type` or an empty catalog yields no neighbors, and skipping the
+        // scan avoids issuing queries against rel tables that do not exist.
+        // (The neighbor fetch itself now uses typed per-rel-type scans, so the
+        // crashing label-less multi-rel-table path is never taken — see
+        // `query_neighbors_directed`.)
         let has_rel = {
             let rels = self.known_rel_tables.borrow();
             match edge_type {

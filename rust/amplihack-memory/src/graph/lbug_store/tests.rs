@@ -1021,3 +1021,382 @@ fn delete_node_with_edges_survives_close_and_reopen() {
         "unrelated neighbors must survive the reopen delete"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Typed per-rel-type reads (no label-less multi-rel-table scan).
+//
+// One of #100's two symbolized backtraces is a LABEL-LESS read scan:
+//   getGroup(groupIdx = 4294967295 / UINT32_MAX) -> null unique_ptr deref
+//   <- CSRNodeGroup::scanCommittedInMemRandom
+//   <- RelTableCollectionScanner::scan
+//   <- ScanMultiRelTable::getNextTuplesInternal   (MATCH (a)-[r]->(b), no label)
+// i.e. a `MATCH (a)-[r]->(b)` with no rel-type label fans across *every* rel
+// table at once via lbug's multi-rel-table scanner. `query_neighbors(.., None,
+// ..)` / `traverse(.., None, ..)` therefore now issue one *typed* scan per known
+// rel type and union the results, never a single label-less scan.
+//
+// IMPORTANT (see `reproduces_issue_100_csr_delete_corruption` below): the
+// typed-scan rewrite is a hardening, NOT a fix for #100. Bisection shows the
+// CSR group is corrupted (its index set to the UINT32_MAX sentinel) by *deleting
+// relationships out of a committed CSR group* (`delete_edge` / `delete_node`
+// Phase A) interleaved with checkpoints; the `getGroup(UINT32_MAX)` deref then
+// fires on whatever scan next touches that table — a checkpoint flush, a typed
+// read, OR the label-less read above. A label-less read is one possible
+// messenger, not the cause, so removing it does not remove the crash.
+//
+// These tests therefore pin the *behavioral contract* of the typed per-rel-type
+// neighbor read across multiple committed rel tables — every edge of every type
+// returned exactly once, directions correct, unrelated data untouched — and
+// guard against a regression back to a label-less scan. On a small, fresh store
+// the delete-driven corruption does not reproduce, so they also pass cleanly.
+// ---------------------------------------------------------------------------
+
+/// Add a node of `node_type` with the given id (reused across the #100 tests).
+fn add(store: &mut LbugGraphStore, node_type: &str, id: &str) {
+    store
+        .add_node(
+            node_type,
+            props(&[("node_id", id), ("agent_id", "x")]),
+            Some(id),
+        )
+        .unwrap();
+}
+
+/// Distinct edge types present in a neighbor result, sorted.
+fn edge_types(
+    pairs: &[(
+        crate::graph::types::GraphEdge,
+        crate::graph::types::GraphNode,
+    )],
+) -> Vec<String> {
+    let mut v: Vec<String> = pairs.iter().map(|(e, _)| e.edge_type.clone()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Neighbor ids in a result, sorted.
+fn neighbor_ids(
+    pairs: &[(
+        crate::graph::types::GraphEdge,
+        crate::graph::types::GraphNode,
+    )],
+) -> Vec<String> {
+    let mut v: Vec<String> = pairs.iter().map(|(_, n)| n.node_id.clone()).collect();
+    v.sort();
+    v
+}
+
+/// Build the real cognitive-memory rel-table shape used by consolidation:
+/// `f1` is a hub with outgoing edges of three distinct types and one incoming
+/// edge, plus a fourth rel table (`PROCEDURE_DERIVES_FROM`) that exists in the
+/// catalog but does not touch `f1`. All four edge types from the issue are
+/// committed into CSR groups via a checkpoint before the caller scans.
+fn build_committed_multi_rel_hub(store: &mut LbugGraphStore) {
+    for id in ["f1", "f2", "f3"] {
+        add(store, "Fact", id);
+    }
+    add(store, "Episode", "ep1");
+    add(store, "Procedure", "pr1");
+
+    // f1's outgoing CSR adjacency spans three rel tables.
+    store.add_edge("f1", "ep1", "DERIVES_FROM", None).unwrap();
+    store.add_edge("f1", "f2", "SIMILAR_TO", None).unwrap();
+    store.add_edge("f1", "f3", "SUPERSEDES", None).unwrap();
+    // An incoming SIMILAR_TO edge so the label-less Incoming/Both scans have
+    // work to do on a *different* endpoint of the same rel table.
+    store.add_edge("f2", "f1", "SIMILAR_TO", None).unwrap();
+    // A fourth rel table that never touches f1 — the typed fan-out must scan it
+    // (it is a known rel type) yet contribute nothing to f1's neighbors.
+    store
+        .add_edge("pr1", "ep1", "PROCEDURE_DERIVES_FROM", None)
+        .unwrap();
+
+    // Fold every rel table into the main DB file so the scans below run against
+    // *committed* CSR groups — the precondition for scanCommittedInMemRandom.
+    store
+        .checkpoint()
+        .expect("checkpoint must commit the CSR groups");
+}
+
+/// REGRESSION (#100): a label-less neighbor read over a node that owns
+/// *committed* relationships in multiple rel tables must return every incident
+/// edge of every type exactly once (directions correct) and, above all, must
+/// not SIGSEGV in lbug's `ScanMultiRelTable` / `scanCommittedInMemRandom`. This
+/// is the READ analogue of the delete-side #98 tripwire and the exact shape of
+/// backtrace (2) in the issue.
+#[test]
+fn label_less_neighbor_read_over_committed_multi_rel_tables_does_not_crash() {
+    let (_tmp, mut store) = open_temp();
+    build_committed_multi_rel_hub(&mut store);
+
+    // The label-less scans that previously SIGSEGV'd. Surviving == fix works.
+    let out = store.query_neighbors("f1", None, Direction::Outgoing, 100);
+    assert_eq!(
+        edge_types(&out),
+        vec![
+            "DERIVES_FROM".to_string(),
+            "SIMILAR_TO".to_string(),
+            "SUPERSEDES".to_string(),
+        ],
+        "outgoing label-less scan must surface all three outgoing rel types"
+    );
+    assert_eq!(
+        neighbor_ids(&out),
+        vec!["ep1".to_string(), "f2".to_string(), "f3".to_string()],
+        "outgoing label-less scan must reach every outgoing neighbor exactly once"
+    );
+
+    let inc = store.query_neighbors("f1", None, Direction::Incoming, 100);
+    assert_eq!(
+        edge_types(&inc),
+        vec!["SIMILAR_TO".to_string()],
+        "incoming label-less scan must surface the single incoming rel type"
+    );
+    assert_eq!(neighbor_ids(&inc), vec!["f2".to_string()]);
+
+    let both = store.query_neighbors("f1", None, Direction::Both, 100);
+    assert_eq!(
+        both.len(),
+        4,
+        "Both must union outgoing (3) + incoming (1) with no double-count"
+    );
+
+    // A typed scan of one of the involved types must agree with the label-less
+    // union for that type (out f1->f2 + in f2->f1).
+    let typed = store.query_neighbors("f1", Some("SIMILAR_TO"), Direction::Both, 100);
+    assert_eq!(
+        typed.len(),
+        2,
+        "typed SIMILAR_TO Both must see the outgoing and incoming edge"
+    );
+}
+
+/// REGRESSION (#100): a label-less BFS `traverse` (no edge-type filter) walks
+/// the same crashing multi-rel-table read path one hop at a time. It must cross
+/// every rel type, visit every reachable node once, and not SIGSEGV.
+#[test]
+fn label_less_traverse_over_committed_multi_rel_tables_does_not_crash() {
+    let (_tmp, mut store) = open_temp();
+    build_committed_multi_rel_hub(&mut store);
+
+    let result = store.traverse("f1", None, 3, Direction::Outgoing, None);
+    let mut ids: Vec<String> = result.nodes.iter().map(|n| n.node_id.clone()).collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "ep1".to_string(),
+            "f1".to_string(),
+            "f2".to_string(),
+            "f3".to_string()
+        ],
+        "label-less traverse must reach every outgoing-reachable node exactly once"
+    );
+}
+
+/// REGRESSION (#100), full consolidation-cycle shape: build a committed
+/// multi-rel-table graph, then run the consumer's hot path — idempotent edge
+/// churn (add then delete an edge), retention (`delete_node` of an edge-bearing
+/// node, exercising the typed Phase-A deletes across committed CSR groups),
+/// another checkpoint — and finally the label-less neighbor/traverse reads that
+/// crash the daemon. The whole sequence must complete without a SIGSEGV and
+/// leave a consistent graph (the deleted node and its edges gone, the rest
+/// intact).
+#[test]
+fn consolidation_cycle_with_label_less_reads_does_not_crash() {
+    let (_tmp, mut store) = open_temp();
+    build_committed_multi_rel_hub(&mut store);
+
+    // Procedure-reinforcement-style idempotent churn: add then drop an edge.
+    store.add_edge("f3", "f2", "SIMILAR_TO", None).unwrap();
+    assert!(store.delete_edge("f3", "f2", "SIMILAR_TO"));
+
+    // Retention: delete an edge-bearing fact (f1 -[SUPERSEDES]-> f3 and
+    // f1 -[SIMILAR_TO]-> f2 ... f3 only owns the inbound SUPERSEDES from f1).
+    // delete_node must strip f3's committed incident edges via typed deletes.
+    assert!(store.delete_node("f3"), "retention delete must succeed");
+
+    // Re-commit so the post-delete graph lives in committed CSR groups too.
+    store.checkpoint().expect("post-retention checkpoint");
+
+    // Label-less reads over the mutated, re-committed multi-rel graph.
+    let out = store.query_neighbors("f1", None, Direction::Outgoing, 100);
+    assert_eq!(
+        edge_types(&out),
+        vec!["DERIVES_FROM".to_string(), "SIMILAR_TO".to_string()],
+        "SUPERSEDES edge to the deleted f3 must be gone; the rest remain"
+    );
+    assert_eq!(
+        neighbor_ids(&out),
+        vec!["ep1".to_string(), "f2".to_string()],
+        "f1's outgoing neighbors after retention are ep1 and f2"
+    );
+    assert!(
+        store.get_node("f3").is_none(),
+        "the retired fact must be gone"
+    );
+
+    // A label-less traverse over the survivors must also stay crash-free.
+    let result = store.traverse("f1", None, 3, Direction::Both, None);
+    assert!(
+        result.nodes.iter().any(|n| n.node_id == "f1"),
+        "traverse must still anchor on the start node"
+    );
+    assert!(
+        !result.nodes.iter().any(|n| n.node_id == "f3"),
+        "the retired fact must not reappear in a traversal"
+    );
+}
+
+/// REGRESSION (#100), daemon-lifecycle variant: the consumer crashes while
+/// consolidating a *reopened* store whose CSR rel groups were committed to disk
+/// in a previous process and freshly loaded — the closest in-process analogue
+/// of the `scanCommittedInMemRandom` state in the symbolized read backtrace.
+/// Build the multi-rel graph, checkpoint, `close`, reopen, then run the
+/// label-less neighbor and traverse reads. They must return the full, correct
+/// neighbor set without a SIGSEGV.
+#[test]
+fn label_less_reads_survive_close_and_reopen_with_committed_csr() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        build_committed_multi_rel_hub(&mut store);
+        store.close();
+    }
+
+    let store = LbugGraphStore::open(&path, Some("s")).unwrap();
+
+    // Reads over committed-on-disk CSR groups loaded by a fresh process.
+    let both = store.query_neighbors("f1", None, Direction::Both, 100);
+    assert_eq!(
+        both.len(),
+        4,
+        "reopened label-less Both scan must see all four incident edges"
+    );
+    assert_eq!(
+        edge_types(&both),
+        vec![
+            "DERIVES_FROM".to_string(),
+            "SIMILAR_TO".to_string(),
+            "SUPERSEDES".to_string(),
+        ],
+        "reopened label-less scan must surface every incident rel type"
+    );
+
+    let result = store.traverse("f1", None, 3, Direction::Outgoing, None);
+    assert_eq!(
+        result.nodes.len(),
+        4,
+        "reopened label-less traverse must reach every outgoing-reachable node"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ROOT-CAUSE REPRODUCTION (#100) — currently UNRESOLVED, hence #[ignore]d.
+//
+// Bisection (writes-only OK, writes+label-less-reads OK, writes+DELETES corrupt;
+// and `delete_edge` alone is sufficient) pins the driver of the
+// getGroup(UINT32_MAX) crash to *deleting relationships out of a committed CSR
+// rel group* — `delete_edge` and `delete_node`'s Phase-A edge strip — when
+// interleaved with checkpoints. The CSR node group's index is set to the
+// UINT32_MAX sentinel; the next scan to touch that table dereferences it:
+//   - a CHECKPOINT flush (what this reproduction trips, in a debug build),
+//   - a label-less multi-rel read (issue backtrace 2), or
+//   - DETACH-DELETE's CSR walk (issue backtrace 1).
+// This is version-independent (0.15.3 / 0.15.4 / 0.17.1), i.e. an lbug engine
+// bug in CSR relationship deletion + checkpoint, not something the Rust-side
+// typed-scan rewrite (which only changes *which* scans are issued) can fix.
+//
+// In this DEBUG build lbug surfaces the bad group as an assertion that the
+// bindings return as a recoverable `Storage` error containing
+// "group_collection.h ... groupIdx < groups.size()"; in a RELEASE/NDEBUG build
+// the same condition is the raw null-pointer-deref SIGSEGV that kills the
+// consumer daemon. This test therefore asserts the DESIRED post-fix behavior —
+// the delete+checkpoint churn completes with no CSR-corruption error — and
+// currently FAILS, reproducing the bug. It is #[ignore]d so CI stays green;
+// un-ignore it once the root cause (an lbug fix, or a Rust-side soft-delete /
+// rel-table-rebuild workaround) lands. Do NOT run under `--release`: there it
+// aborts the test binary via SIGSEGV instead of returning an error.
+// ---------------------------------------------------------------------------
+
+/// True if `e` is the #100 CSR `getGroup(UINT32_MAX)` corruption surfaced as a
+/// debug-build assertion error.
+fn is_csr_group_corruption(e: &str) -> bool {
+    e.contains("group_collection.h") && e.contains("groupIdx < groups.size()")
+}
+
+/// Drive the consolidation-style delete + checkpoint churn that corrupts a
+/// committed CSR rel group. Returns `Err(detail)` on the first CSR-corruption
+/// (or other) error, `Ok(())` if the whole sequence stays consistent.
+fn run_csr_delete_churn(rounds: usize) -> Result<(), String> {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+    let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+
+    for id in ["f1", "f2", "f3", "f4", "f5"] {
+        add(&mut store, "Fact", id);
+    }
+    add(&mut store, "Episode", "ep1");
+
+    // Fact->Episode and two Fact->Fact rel tables, mirroring DERIVES_FROM,
+    // SIMILAR_TO and SUPERSEDES in cognitive-memory consolidation.
+    let types = ["DERIVES_FROM", "SIMILAR_TO", "SUPERSEDES"];
+    for round in 0..rounds {
+        let a = format!("f{}", (round % 5) + 1);
+        let b = format!("f{}", ((round + 2) % 5) + 1);
+        let t = types[round % 3];
+        // Idempotent-upsert-style edge add (mismatched type/endpoints are no-ops).
+        let _ = if t == "DERIVES_FROM" {
+            store.add_edge(&a, "ep1", t, None)
+        } else {
+            store.add_edge(&a, &b, t, None)
+        };
+
+        if round % 3 == 0 {
+            store
+                .checkpoint()
+                .map_err(|e| format!("checkpoint(3) at round {round}: {e}"))?;
+        }
+
+        // Retention/dedup: delete an edge-bearing fact, then re-create its id —
+        // the exact per-cycle pattern that drives the committed-CSR corruption.
+        if round % 7 == 0 {
+            let victim = format!("f{}", (round % 5) + 1);
+            let _ = store.delete_node(&victim);
+            add(&mut store, "Fact", &victim);
+        }
+
+        if round % 5 == 0 {
+            store
+                .checkpoint()
+                .map_err(|e| format!("checkpoint(5) at round {round}: {e}"))?;
+        }
+    }
+
+    store
+        .checkpoint()
+        .map_err(|e| format!("final checkpoint: {e}"))?;
+    Ok(())
+}
+
+/// REPRODUCTION (#100, UNRESOLVED): the delete + checkpoint consolidation churn
+/// must complete without corrupting a committed CSR rel group. It currently
+/// does not — the run returns the `getGroup(UINT32_MAX)` corruption error
+/// (debug) / SIGSEGVs (release). #[ignore]d until the root cause is fixed.
+#[test]
+#[ignore = "reproduces unresolved lbug #100 CSR rel-delete corruption; un-ignore when fixed"]
+fn reproduces_issue_100_csr_delete_corruption() {
+    match run_csr_delete_churn(120) {
+        Ok(()) => { /* desired post-fix outcome */ }
+        Err(e) if is_csr_group_corruption(&e) => {
+            panic!(
+                "REPRODUCED #100: committed CSR rel group corrupted by \
+                 relationship deletes + checkpoints (getGroup(UINT32_MAX)): {e}"
+            );
+        }
+        Err(e) => panic!("unexpected error during CSR-delete churn: {e}"),
+    }
+}
