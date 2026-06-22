@@ -302,6 +302,14 @@ full reference — the configuration model, the recovery state machine, quaranti
 semantics, the checkpoint-health signal, the public API, and an operational
 runbook.
 
+The persistent backend also deletes nodes **without** Cypher `DETACH DELETE`
+(removing every incident edge first, then a plain `DELETE`) to dodge a native
+CSR-rel-table `SIGSEGV` in the pinned engine during retention/dedup
+consolidation. See
+[`docs/safe_node_deletion.md`](docs/safe_node_deletion.md) for the full
+reference — the #98 incident, root cause, the two-phase delete, and the
+regression coverage.
+
 ### Automatic `SIMILAR_TO` linking between facts
 
 `CognitiveMemory` can automatically connect related semantic facts with
