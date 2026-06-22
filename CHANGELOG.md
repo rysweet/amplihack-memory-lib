@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Critical CSR corruption / native crash (#100):** the persistent store
+  (`LbugGraphStore`) still `SIGSEGV`-crashed the consumer daemon during
+  retention/dedup consolidation even after the #98/#99 `DETACH`-avoidance work.
+  Root cause (bisected): a **physical relationship delete out of a *committed*
+  CSR rel group** — `delete_edge`, and `delete_node`'s incident-edge strip —
+  interleaved with checkpoints drives lbug's CSR node-group index to the
+  `UINT32_MAX` sentinel; the next scan to touch that table dereferences a null
+  group (`getGroup(UINT32_MAX)`). It is version-independent (reproduced on lbug
+  0.15.3 / 0.15.4 / 0.17.1), i.e. an engine-level CSR delete+checkpoint bug, not
+  a consumer-side concurrency issue. **Fix — soft delete (tombstone):**
+  `delete_node` / `delete_edge` no longer issue any physical `DELETE`. They mark
+  rows deleted with a reserved `_deleted` column (`SET …._deleted = '1'`, a
+  property write that leaves the CSR adjacency structure untouched), and every
+  read filters tombstoned rows out. `add_node` revives a tombstoned id so the
+  "delete then re-add the same id" consolidation pattern still works. The
+  `_deleted` column is created on every node/rel table and back-filled on older
+  stores via `ALTER TABLE … ADD` at reopen. The observable delete/recall
+  contract is unchanged. A 400-round delete+checkpoint churn that previously
+  corrupted a committed CSR group by round ~10 now completes cleanly
+  (`reproduces_issue_100_csr_delete_corruption`). Tombstoned rows remain
+  physically resident until a future compaction pass.
+
 - **Critical native crash (#98):** the persistent store
   (`LbugGraphStore`) `SIGSEGV`-crashed the consumer's daemon every ~45–90
   minutes during retention/dedup consolidation. `delete_node` issued a Cypher

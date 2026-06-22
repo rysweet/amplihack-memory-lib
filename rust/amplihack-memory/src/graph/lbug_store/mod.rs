@@ -677,9 +677,13 @@ impl LbugGraphStore {
             let tupper = ttype.to_ascii_uppercase();
             if tupper.contains("REL") {
                 if let Some((from, to)) = self.introspect_rel_endpoints(&name) {
+                    // Back-fill the tombstone column on stores created before
+                    // the #100 soft-delete fix so reads/deletes can rely on it.
+                    self.ensure_soft_delete_column(&name);
                     self.known_rel_tables.borrow_mut().insert((name, from, to));
                 }
             } else if tupper.contains("NODE") {
+                self.ensure_soft_delete_column(&name);
                 let cols = self.introspect_table_columns(&name);
                 self.known_node_tables.borrow_mut().insert(name.clone());
                 self.node_table_columns.borrow_mut().insert(name, cols);
@@ -703,6 +707,30 @@ impl LbugGraphStore {
             }
         }
         cols
+    }
+
+    /// Ensure the reserved soft-delete tombstone column ([`DELETED_COL`]) exists
+    /// on `table`.
+    ///
+    /// Soft deletes (`SET <alias>._deleted = '1'`) replace physical `DELETE`
+    /// against committed CSR rel groups, which corrupts lbug's CSR node-group
+    /// index (`getGroup(UINT32_MAX)` SEGV, #100). The column must therefore be
+    /// present on every node and rel table before a delete or a filtered read.
+    /// Idempotent and reopen-safe: introspects first so a redundant
+    /// `ALTER ... ADD` (which errors when the column already exists) is skipped.
+    /// Best-effort — a failure is logged and the column simply stays absent
+    /// (reads then show, rather than hide, rows on that table).
+    fn ensure_soft_delete_column(&self, table: &str) {
+        if !is_valid_identifier(table) {
+            return;
+        }
+        if self.introspect_table_columns(table).contains(DELETED_COL) {
+            return;
+        }
+        let ddl = format!("ALTER TABLE {table} ADD {DELETED_COL} STRING DEFAULT ''");
+        if let Err(e) = self.execute(&ddl) {
+            warn!("ensure_soft_delete_column: failed to add {DELETED_COL} to {table}: {e}");
+        }
     }
 
     /// Return (from_table, to_table) for a rel table, if discoverable.
@@ -763,6 +791,7 @@ impl LbugGraphStore {
         let mut defs = vec![
             "node_id STRING".to_string(),
             "graph_origin STRING".to_string(),
+            format!("{DELETED_COL} STRING DEFAULT ''"),
         ];
         for col in extra_cols {
             defs.push(format!("{col} STRING DEFAULT ''"));
@@ -809,6 +838,7 @@ impl LbugGraphStore {
             format!("FROM {from} TO {to}"),
             "edge_id STRING".to_string(),
             "graph_origin STRING".to_string(),
+            format!("{DELETED_COL} STRING DEFAULT ''"),
         ];
         for col in extra_cols {
             defs.push(format!("{col} STRING DEFAULT ''"));
@@ -835,6 +865,29 @@ impl Drop for LbugGraphStore {
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// Reserved tombstone column used for soft deletes (#100).
+///
+/// `delete_node` / `delete_edge` mark a row deleted by `SET`ting this column to
+/// [`DELETED_MARK`] instead of issuing a physical `DELETE` against a committed
+/// CSR rel group — the operation that drives lbug's CSR node-group index to the
+/// `UINT32_MAX` sentinel and SEGVs the next scan (`getGroup(UINT32_MAX)`). Reads
+/// filter tombstoned rows out via [`not_deleted`]. The name is `_`-prefixed so
+/// `node_val_to_graph_node` / `rel_val_to_edge` already strip it from returned
+/// properties (the existing reserved-underscore convention).
+pub(crate) const DELETED_COL: &str = "_deleted";
+
+/// Value written to [`DELETED_COL`] to mark a row deleted. Live rows hold the
+/// column default (`''`) or `NULL` (back-filled rows on older stores).
+pub(crate) const DELETED_MARK: &str = "1";
+
+/// A Cypher predicate that is true only for *live* (non-tombstoned) rows bound
+/// to `alias`. Tolerant of both the `''` default and a `NULL` back-fill so it
+/// stays correct on stores migrated by `ALTER TABLE ... ADD` as well as fresh
+/// ones, and never hides a live row.
+pub(crate) fn not_deleted(alias: &str) -> String {
+    format!("({alias}.{DELETED_COL} IS NULL OR {alias}.{DELETED_COL} = '')")
+}
 
 /// The system configuration used for every open.
 ///
