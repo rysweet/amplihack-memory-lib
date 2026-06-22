@@ -761,3 +761,263 @@ fn last_checkpoint_error_is_none_on_a_healthy_store() {
         "healthy auto-checkpoints must not record a checkpoint error"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Safe node deletion: never hit lbug 0.15.3's buggy DETACH-DELETE-with-CSR-rels
+// path (#98). In a long-running consumer daemon the pinned engine SIGSEGVs in
+//   getGroup(groupIdx = 4294967295 / UINT32_MAX) -> null unique_ptr deref
+//   <- CSRNodeGroup::scanCommittedInMemRandom <- CSRNodeGroup::scan
+//   <- RelTableScanState::scanNext <- RelTable::detachDeleteForCSRRels
+//   <- RelTable::detachDelete <- DeleteNode (Cypher DETACH DELETE)
+// when a `DETACH DELETE n` removes a node that owns relationships in a
+// *committed* (checkpointed) CSR rel group. `delete_node` must therefore strip
+// every incident edge first, then plain-`DELETE` the now-isolated node — never
+// emit `DETACH`.
+//
+// The native crash is timing/state-dependent: it depends on internal CSR
+// node-group allocation state that accumulates over hours of consolidation, so
+// it is not deterministically reproducible from a fresh, small store. These
+// tests therefore (a) pin down the *behavioral contract* of the rewritten
+// delete — node + every incident edge (outgoing, incoming, self-loop) removed,
+// unrelated data untouched, `true` returned — and (b) act as a **crash
+// tripwire**: each forces a checkpoint to materialize a committed CSR group and
+// then deletes an edge-bearing node, so if the engine ever does take the
+// detachDelete CSR path and SIGSEGVs, the test binary dies and the suite fails.
+// A re-introduction of `DETACH DELETE` would reopen the crash on the consumer;
+// these tests lock in the delete-edges-first behavior that prevents it.
+// ---------------------------------------------------------------------------
+
+/// REGRESSION (#98): deleting a node that owns *committed* CSR relationships
+/// (outgoing, incoming, and a self-loop) must succeed, remove the node and all
+/// of its incident edges, leave unrelated nodes intact, and — above all — not
+/// SIGSEGV in lbug's `detachDeleteForCSRRels`. The edge-bearing committed-CSR
+/// delete is exactly the path that crashes the consumer's daemon under the old
+/// `DETACH DELETE`; the delete-edges-first rewrite must satisfy this contract
+/// without ever emitting `DETACH`.
+#[test]
+fn delete_node_with_committed_csr_edges_does_not_crash() {
+    let (_tmp, mut store) = open_temp();
+
+    for id in ["a", "b", "c"] {
+        store
+            .add_node(
+                "Thing",
+                props(&[("node_id", id), ("agent_id", "x")]),
+                Some(id),
+            )
+            .unwrap();
+    }
+
+    // a owns three relationships of distinct types so the deleted node has a
+    // populated CSR adjacency in every shape that detachDelete walks:
+    //   - outgoing  a -[LINKS]-> b
+    //   - incoming  b -[REL2]-> a
+    //   - self/loop a -[SELF]-> a
+    store.add_edge("a", "b", "LINKS", None).unwrap();
+    store.add_edge("b", "a", "REL2", None).unwrap();
+    store.add_edge("a", "a", "SELF", None).unwrap();
+
+    // Fold the writes into the main DB file so the rels live in a *committed*
+    // CSR node group — the exact precondition for the getGroup(UINT32_MAX)
+    // null-deref. Without this the rels stay in the in-memory delta and the
+    // crashing code path is never reached.
+    store
+        .checkpoint()
+        .expect("checkpoint must commit the CSR group");
+
+    // The call that previously SIGSEGV'd. Surviving past it == the fix works.
+    assert!(
+        store.delete_node("a"),
+        "deleting an edge-bearing node must report success"
+    );
+
+    // The node itself is gone.
+    assert!(
+        store.get_node("a").is_none(),
+        "the deleted node must no longer resolve"
+    );
+
+    // Every edge incident to `a` (both directions + the self-loop) is gone:
+    // b's only relationships were a->b and b->a, so b is now fully isolated.
+    assert!(
+        store
+            .query_neighbors("a", None, Direction::Both, 10)
+            .is_empty(),
+        "the deleted node must have no remaining incident edges"
+    );
+    assert!(
+        store
+            .query_neighbors("b", None, Direction::Both, 10)
+            .is_empty(),
+        "edges pointing at/from the deleted node must be removed from its neighbors"
+    );
+
+    // An unrelated node is untouched by the targeted delete.
+    assert!(
+        store.get_node("b").is_some(),
+        "a surviving neighbor must remain after the delete"
+    );
+    assert!(
+        store.get_node("c").is_some(),
+        "an unrelated node must be untouched by the delete"
+    );
+}
+
+/// REGRESSION (#98) + injection hardening (SR-1): the edge-bearing delete path
+/// must keep escaping `node_id` everywhere it is interpolated into Cypher. A
+/// node whose id contains quotes/backslashes is given committed CSR edges, then
+/// deleted; it must succeed, vanish, and take only its own edges with it.
+#[test]
+fn delete_node_with_edges_escapes_injection_id() {
+    let (_tmp, mut store) = open_temp();
+
+    // A node_id packed with Cypher-significant characters. If any interpolation
+    // skips escape_cypher the edge-delete or node-delete statement breaks (or,
+    // worse, mutates unrelated rows) and these assertions fail.
+    let weird = "a'b\\c\"d";
+    store
+        .add_node(
+            "Thing",
+            props(&[("node_id", weird), ("agent_id", "x")]),
+            Some(weird),
+        )
+        .unwrap();
+    store
+        .add_node(
+            "Thing",
+            props(&[("node_id", "safe"), ("agent_id", "x")]),
+            Some("safe"),
+        )
+        .unwrap();
+
+    store.add_edge(weird, "safe", "LINKS", None).unwrap();
+    store.add_edge("safe", weird, "REL2", None).unwrap();
+    store.add_edge(weird, weird, "SELF", None).unwrap();
+
+    store
+        .checkpoint()
+        .expect("checkpoint must commit the CSR group");
+
+    assert!(
+        store.delete_node(weird),
+        "deleting an edge-bearing node with a tricky id must succeed"
+    );
+    assert!(
+        store.get_node(weird).is_none(),
+        "the escaped-id node must be gone"
+    );
+    assert!(
+        store.get_node("safe").is_some(),
+        "the neighbor must survive — escaping must target only the deleted node"
+    );
+    assert!(
+        store
+            .query_neighbors("safe", None, Direction::Both, 10)
+            .is_empty(),
+        "edges to/from the deleted node must be removed from the survivor"
+    );
+}
+
+/// Existing behavior must still hold once rel tables exist: deleting an
+/// *edgeless* node (after a checkpoint, with other relationships present in the
+/// catalog) succeeds and leaves every unrelated node and edge intact. This
+/// exercises the rewritten path's guard — the incident-edge passes run but
+/// match nothing, then the plain `DELETE` removes the isolated node.
+#[test]
+fn delete_edgeless_node_with_rel_tables_present() {
+    let (_tmp, mut store) = open_temp();
+
+    for id in ["p", "q", "z"] {
+        store
+            .add_node(
+                "Thing",
+                props(&[("node_id", id), ("agent_id", "x")]),
+                Some(id),
+            )
+            .unwrap();
+    }
+    // An unrelated edge so the catalog has a rel table (known_rel_tables is
+    // non-empty), but `z` itself owns no relationships.
+    store.add_edge("p", "q", "LINKS", None).unwrap();
+    store.checkpoint().expect("checkpoint must commit");
+
+    assert!(
+        store.delete_node("z"),
+        "deleting an edgeless node must still succeed when rel tables exist"
+    );
+    assert!(
+        store.get_node("z").is_none(),
+        "the edgeless node must be gone"
+    );
+
+    // The unrelated edge and its endpoints are untouched.
+    assert!(
+        store.get_node("p").is_some(),
+        "unrelated node p must survive"
+    );
+    assert!(
+        store.get_node("q").is_some(),
+        "unrelated node q must survive"
+    );
+    let nbrs = store.query_neighbors("p", Some("LINKS"), Direction::Outgoing, 10);
+    assert_eq!(nbrs.len(), 1, "the unrelated edge must be preserved");
+    assert_eq!(nbrs[0].1.node_id, "q");
+}
+
+/// REGRESSION (#98), daemon-lifecycle variant: the consumer crashes while
+/// consolidating a *reopened* store, where the CSR rel groups were committed to
+/// disk in a previous process and then freshly loaded. Reproduce that shape —
+/// build edges, checkpoint, `close`, reopen — then delete an edge-bearing node.
+/// The reopened, committed-on-disk CSR group is the closest in-process analogue
+/// of the `scanCommittedInMemRandom` state in the symbolized backtrace, so this
+/// is the strongest crash tripwire; behaviorally the delete must still remove
+/// the node and all of its incident edges with the survivor left intact.
+#[test]
+fn delete_node_with_edges_survives_close_and_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .add_node(
+                    "Thing",
+                    props(&[("node_id", id), ("agent_id", "x")]),
+                    Some(id),
+                )
+                .unwrap();
+        }
+        store.add_edge("a", "b", "LINKS", None).unwrap();
+        store.add_edge("c", "a", "LINKS", None).unwrap();
+        store.add_edge("a", "a", "SELF", None).unwrap();
+        // Fold the rels into the main DB file, then drop the handle so the next
+        // process loads them as committed-on-disk CSR groups.
+        store
+            .checkpoint()
+            .expect("checkpoint must commit the CSR group");
+        store.close();
+    }
+
+    let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+
+    // The delete that crashes the consumer's daemon after a long uptime.
+    assert!(
+        store.delete_node("a"),
+        "deleting an edge-bearing node after reopen must succeed"
+    );
+    assert!(
+        store.get_node("a").is_none(),
+        "the deleted node must be gone after reopen"
+    );
+    assert!(
+        store
+            .query_neighbors("b", None, Direction::Both, 10)
+            .is_empty(),
+        "edges incident to the deleted node must be removed after reopen"
+    );
+    assert!(
+        store.get_node("b").is_some() && store.get_node("c").is_some(),
+        "unrelated neighbors must survive the reopen delete"
+    );
+}

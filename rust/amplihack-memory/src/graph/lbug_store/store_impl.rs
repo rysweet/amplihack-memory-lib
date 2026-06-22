@@ -449,12 +449,45 @@ impl GraphStore for LbugGraphStore {
             Some(t) => t,
             None => return false,
         };
+        // The table label is interpolated bare (no quoting) into the Phase B
+        // query, so it must be a safe identifier. Real tables always are, but
+        // refuse rather than risk injection if a corrupt cache entry slips in.
+        if !is_valid_identifier(&table) {
+            return false;
+        }
+
+        // Populate `known_rel_tables` from the on-disk catalog so the guard
+        // below is correct on a freshly reopened store. Does not take the lock.
+        self.ensure_schema_loaded();
 
         let _guard = self.acquire_lock();
-        let cypher = format!(
-            "MATCH (n:{table}) WHERE n.node_id = '{}' DETACH DELETE n",
-            escape_cypher(node_id)
-        );
+        let escaped = escape_cypher(node_id);
+
+        // Phase A — strip every incident relationship first, so the node delete
+        // never needs `DETACH` and never enters lbug 0.15.3's crashing
+        // `detachDeleteForCSRRels` path (getGroup(UINT32_MAX) null deref, #98).
+        // Two directed, label-less passes remove outbound, inbound, self-loop,
+        // and parallel edges across all rel types. The passes are label-less and
+        // keyed on the globally unique `node_id` (mirroring
+        // `query_neighbors_directed`) to avoid a binder error when the node's
+        // table participates in no rel table. Guarded on a non-empty
+        // `known_rel_tables`: with no rel tables an unlabeled rel `MATCH` would
+        // itself be a binder error and there is nothing to delete.
+        if !self.known_rel_tables.borrow().is_empty() {
+            let outgoing = format!("MATCH (a)-[r]->(b) WHERE a.node_id = '{escaped}' DELETE r");
+            let incoming = format!("MATCH (a)-[r]->(b) WHERE b.node_id = '{escaped}' DELETE r");
+            for cypher in [&outgoing, &incoming] {
+                if let Err(e) = self.execute(cypher) {
+                    // Fail-closed: leave the node fully intact (and its routing
+                    // cache entry) rather than half-delete its edges.
+                    warn!("delete_node: incident-edge cleanup failed for {node_id}: {e}");
+                    return false;
+                }
+            }
+        }
+
+        // Phase B — delete the now-isolated node with a plain DELETE (no DETACH).
+        let cypher = format!("MATCH (n:{table}) WHERE n.node_id = '{escaped}' DELETE n");
         if self.execute(&cypher).is_ok() {
             self.id_table_cache.borrow_mut().remove(node_id);
             if let Err(e) = self.post_write_barrier() {

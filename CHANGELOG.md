@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Critical native crash (#98):** the persistent store
+  (`LbugGraphStore`) `SIGSEGV`-crashed the consumer's daemon every ~45–90
+  minutes during retention/dedup consolidation. `delete_node` issued a Cypher
+  `MATCH (n) WHERE n.node_id = '…' DETACH DELETE n`, and when the node had
+  relationships in a committed CSR rel table, `lbug 0.15.3`'s
+  `detachDeleteForCSRRels` computed an invalid CSR node-group index
+  (`getGroup(UINT32_MAX)` → null `unique_ptr` deref) and crashed. After the
+  graph-enhancement work most nodes carry edges (`DERIVES_FROM`, `SIMILAR_TO`,
+  `SUPERSEDES`, `PROCEDURE_DERIVES_FROM`), so consolidation routinely
+  detach-deleted an edge-bearing node and brought the daemon down. Two
+  complementary fixes:
+  - **Edge-first, no-`DETACH` deletion** removes the trigger: `delete_node` now
+    deletes every incident relationship first via two directed, label-less
+    passes (`MATCH (a)-[r]->(b) WHERE a.node_id='…' DELETE r` for both
+    directions, covering self-loops and parallel edges), then deletes the
+    now-isolated node with a plain `DELETE` (no `DETACH`), so the buggy
+    `detachDeleteForCSRRels` path is never entered. The whole operation runs
+    under the write lock and is fail-closed: if the edge cleanup errors,
+    `delete_node` returns `false` without touching the node, so no half-deleted,
+    edge-orphaned node is left behind. Return semantics, id→table cache
+    eviction, the per-write durability barrier, and auto-checkpointing are
+    unchanged. See `rust/amplihack-memory/docs/safe_node_deletion.md`.
+  - **Optional engine patch bump** as defense in depth: where it builds cleanly the
+    pinned `lbug` engine is bumped from `=0.15.3` to `=0.15.4` (latest 0.15.x patch;
+    no jump to 0.17.x), otherwise the pin stays at `=0.15.3`. The workaround stands
+    on its own and does not depend on the bump.
 - **Critical durability bug (#95):** a failed auto-`CHECKPOINT` could
   permanently brick the persistent store and crash-loop the consumer. The
   buffer-pool cap was hardcoded at **128 MiB**, so on a busy host a checkpoint
