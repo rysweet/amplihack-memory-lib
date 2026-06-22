@@ -10,6 +10,15 @@ whenever a node with relationships stored in a CSR rel table was detach-deleted.
 This page is the authoritative description of the fix for issue **#98** ("CRITICAL
 native crash — daemon SEGV-crashes every ~45–90 minutes during a `DETACH DELETE`").
 
+> **Related work (#100).** Phase A's incident-edge strip later moved from a
+> single *label-less* pass to **typed, per-rel-type passes** as a follow-up
+> hardening for issue **#100** (a second `getGroup(UINT32_MAX)` backtrace that
+> originates in a label-less multi-rel-table *read* scan). This page reflects the
+> current typed-delete implementation. #100's read-side hardening **and the
+> still-unresolved CSR rel-delete root cause** are covered in
+> [`docs/csr_rel_delete_corruption.md`](csr_rel_delete_corruption.md); the
+> edge-first/no-`DETACH` contract described here is unchanged by that work.
+
 - **No more native crashes.** A node that carries relationships — which, after the
   graph-enhancement work, is *most* fact and procedure nodes — can now be deleted
   without tripping the engine's buggy `detachDeleteForCSRRels` code path. The
@@ -106,22 +115,32 @@ node deletion never needs `DETACH` and never enters `detachDeleteForCSRRels`.
 `delete_node` now performs the deletion in two ordered phases, both inside a single
 critical section so no intermediate state is ever externally observable:
 
-1. **Phase A — remove every incident relationship.** Two directed, *label-less*
-   Cypher passes delete all edges touching the node, in both directions, across all
-   relationship types:
+1. **Phase A — remove every incident relationship.** For each relationship type
+   the store knows about (`distinct_rel_names()`, derived from the
+   `known_rel_tables` catalog cache), two directed, *typed* Cypher passes delete
+   all edges of that type touching the node, in both directions:
 
    ```cypher
+   -- for each known rel type TYPE:
    -- outgoing edges (node is the source)
-   MATCH (a)-[r]->(b) WHERE a.node_id = '<escaped id>' DELETE r
+   MATCH (a)-[r:TYPE]->(b) WHERE a.node_id = '<escaped id>' DELETE r
    -- incoming edges (node is the target)
-   MATCH (a)-[r]->(b) WHERE b.node_id = '<escaped id>' DELETE r
+   MATCH (a)-[r:TYPE]->(b) WHERE b.node_id = '<escaped id>' DELETE r
    ```
 
-   Two directed passes together remove outbound, inbound, self-loop, and parallel
-   edges. The passes are label-less and matched purely on the globally unique
-   `node_id`, mirroring the proven `query_neighbors_directed` query shape; this
-   avoids a binder error that a node-labelled rel pattern would raise when the
-   node's table participates in no rel table.
+   Two directed passes per type together remove outbound, inbound, self-loop, and
+   parallel edges; iterating over every known rel type covers all of them. The
+   passes are matched on the globally unique `node_id`.
+
+   Each pass is **typed** (`-[r:TYPE]->`) rather than label-less
+   (`-[r]->`): a single label-less rel `MATCH` fans across *every* rel table at
+   once through lbug's multi-rel-table scanner, which is the second
+   `getGroup(UINT32_MAX)` SIGSEGV backtrace in **#100**. A typed pass only ever
+   touches one rel table's CSR storage and never enters that scanner. See
+   [`docs/csr_rel_delete_corruption.md`](csr_rel_delete_corruption.md). Rel-type
+   names come straight from the catalog and are always safe identifiers; a
+   non-identifier name (a corrupt cache) is refused fail-closed (the node and its
+   edges are left fully intact) rather than interpolated as a bare rel label.
 
 2. **Phase B — delete the now-isolated node with a plain `DELETE` (no `DETACH`).**
 
@@ -139,14 +158,15 @@ critical section so no intermediate state is ever externally observable:
   back to a catalog lookup). If the node ID is unknown (no table), `delete_node`
   returns `false` immediately.
 - **Edge-pass guard.** After the schema cache is ensured loaded from the on-disk
-  catalog (`ensure_schema_loaded`, which populates `known_rel_tables`), Phase A runs
-  only when the store knows about at least one relationship table — the same guard
-  the proven `query_neighbors` path uses. When no rel tables exist, the edge passes
-  are skipped (an unlabeled rel `MATCH` would raise a binder error and there is
-  nothing to delete), keeping the edgeless-node path green.
-- **Fail-closed.** If either Phase A pass returns an error, `delete_node` logs a
-  warning and returns `false` **without** running Phase B and **without** evicting
-  the routing cache — the node is left fully intact rather than half-deleted.
+  catalog (`ensure_schema_loaded`, which populates `known_rel_tables`), Phase A
+  iterates over the distinct known rel-type names. When the store knows of no rel
+  tables, that list is empty, so no edge passes run and control falls straight
+  through to the plain Phase-B `DELETE` — keeping the edgeless-node path green
+  (and there is nothing to delete anyway).
+- **Fail-closed.** If any Phase A pass returns an error — or a known rel-type name
+  is not a safe identifier — `delete_node` logs a warning and returns `false`
+  **without** running Phase B and **without** evicting the routing cache, so the
+  node is left fully intact rather than half-deleted.
 - **Atomic.** Phase A, Phase B, the cache eviction, the durability barrier, and the
   auto-checkpoint bookkeeping all run under one non-reentrant lock, so a concurrent
   reader never observes a node with some-but-not-all of its edges removed.
@@ -166,14 +186,14 @@ sequenceDiagram
     S->>S: resolve table (else return false)
     S->>S: ensure_schema_loaded → populate known_rel_tables
     S->>S: acquire write lock
-    S->>S: has_rel? = known_rel_tables is non-empty
-    alt has_rel (store knows ≥1 rel table)
-        S->>E: MATCH (a)-[r]->(b) WHERE a.node_id='fact-123' DELETE r
-        S->>E: MATCH (a)-[r]->(b) WHERE b.node_id='fact-123' DELETE r
-        Note over S,E: on error → warn + return false (no node delete)
-    else no rel tables
-        Note over S,E: edge passes skipped (unlabeled MATCH would be a binder error)
+    S->>S: rel_types = distinct_rel_names() (from known_rel_tables)
+    loop for each known rel TYPE
+        S->>E: MATCH (a)-[r:TYPE]->(b) WHERE a.node_id='fact-123' DELETE r
+        S->>E: MATCH (a)-[r:TYPE]->(b) WHERE b.node_id='fact-123' DELETE r
+        Note over S,E: typed scan — never lbug's multi-rel-table scanner (#100)
+        Note over S,E: on error / unsafe name → warn + return false (no node delete)
     end
+    Note over S,E: empty rel_types ⇒ no passes ⇒ fall through to plain DELETE
     S->>E: MATCH (n:Fact) WHERE n.node_id='fact-123' DELETE n
     Note over S,E: plain DELETE — never DETACH, never detachDeleteForCSRRels
     S->>S: evict id→table cache · durability barrier · maybe checkpoint
@@ -319,6 +339,12 @@ behind the `persistent` feature:
 - **Edgeless delete (existing behavior).** The pre-existing test that deletes a node
   with no relationships is retained and still passes, proving the edge-pass guard
   keeps the edgeless path working.
+
+The typed Phase-A deletes also run inside the broader **#100** regression suite
+(`consolidation_cycle_with_label_less_reads_does_not_crash` exercises
+`delete_node` over committed CSR groups during a full consolidation cycle) and are
+discussed alongside the still-unresolved CSR rel-delete root cause in
+[`docs/csr_rel_delete_corruption.md`](csr_rel_delete_corruption.md).
 
 Validate with the feature-gated suite (run a few times, since the original failure
 was a probabilistic native crash):

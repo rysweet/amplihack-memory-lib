@@ -310,6 +310,16 @@ consolidation. See
 reference — the #98 incident, root cause, the two-phase delete, and the
 regression coverage.
 
+As a follow-up (#100), every label-less multi-rel-table scan in the persistent
+hot path — neighbor reads, traversals, and the delete edge-strip — now issues
+**typed, per-rel-type** scans (`MATCH (a)-[r:TYPE]->(b)`), so the backend never
+drives lbug's multi-rel-table scanner. This is hardening, not a complete fix: the
+underlying `getGroup(UINT32_MAX)` CSR corruption is an **unresolved**, version-
+independent lbug engine bug in committed-CSR relationship deletion plus
+checkpointing. See
+[`docs/csr_rel_delete_corruption.md`](docs/csr_rel_delete_corruption.md) for the
+two backtraces, the bisecting reproduction, and follow-up options.
+
 ### Automatic `SIMILAR_TO` linking between facts
 
 `CognitiveMemory` can automatically connect related semantic facts with
