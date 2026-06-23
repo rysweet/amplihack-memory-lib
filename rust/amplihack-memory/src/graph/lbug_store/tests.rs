@@ -1596,3 +1596,321 @@ fn delete_edge_tombstones_only_that_edge() {
     assert!(store.get_node("f1").is_some());
     assert!(store.get_node("f3").is_some());
 }
+
+// ---------------------------------------------------------------------------
+// Storage-format migration (#100): a live store written by lbug 0.15.4 (on-disk
+// storage format v40) must open LOSSLESSLY under the current engine and, under
+// lbug 0.17.x, upgrade to v41 on the first checkpoint. See
+// docs/lbug_0_17_upgrade.md.
+//
+// The fixture under `fixtures/v40_store/` is FROZEN test data captured from a
+// real lbug 0.15.4 build (the last engine line that emits storage format v40),
+// so it can only ever be regenerated from a 0.15.4 checkout. It is committed and
+// never rewritten by the regression tests. Regenerate (ONLY on lbug 0.15.4) with:
+//   cargo test -p amplihack-memory --features persistent \
+//     graph::lbug_store::tests::generate_v40_store_fixture -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+
+/// On-disk storage versions relevant to this migration.
+const STORAGE_VERSION_V40: u64 = 40; // lbug 0.12 – 0.16.x
+const STORAGE_VERSION_V41: u64 = 41; // lbug 0.17.x
+
+/// The on-disk storage version the *current* engine upgrades a store to on its
+/// first checkpoint. The 0.15.4 → 0.17.1 migration targets v41.
+const CURRENT_ENGINE_STORAGE_VERSION: u64 = STORAGE_VERSION_V41;
+
+/// Name of the committed fixture directory and the database file inside it.
+const V40_FIXTURE: &str = "v40_store";
+const FIXTURE_DB_NAME: &str = "graph.ladybug";
+
+/// The deterministic dataset baked into the committed v40 fixture. The generator
+/// and the regression tests agree on this exact shape so content (not just
+/// counts) can be verified after the store is reopened by a newer engine.
+const FIXTURE_FACTS: &[&str] = &["f1", "f2", "f3", "f4", "f5"];
+const FIXTURE_EPISODES: &[&str] = &["ep1", "ep2", "ep3"];
+const FIXTURE_PROCEDURES: &[&str] = &["pr1", "pr2"];
+/// 5 facts + 3 episodes + 2 procedures.
+const FIXTURE_NODE_COUNT: usize = 10;
+/// (source, target, edge_type) — seven edges spanning four rel tables.
+const FIXTURE_EDGES: &[(&str, &str, &str)] = &[
+    ("f1", "ep1", "DERIVES_FROM"),
+    ("f2", "ep2", "DERIVES_FROM"),
+    ("f1", "f2", "SIMILAR_TO"),
+    ("f2", "f3", "SIMILAR_TO"),
+    ("f3", "f4", "SUPERSEDES"),
+    ("pr1", "ep1", "PROCEDURE_DERIVES_FROM"),
+    ("pr2", "ep3", "PROCEDURE_DERIVES_FROM"),
+];
+
+/// Deterministic per-node `name` so content can be asserted after a reopen.
+fn fixture_node_name(id: &str) -> String {
+    format!("{id}-name")
+}
+
+/// Add one fixture node with its stable `agent_id` + `name` properties.
+fn add_fixture_node(store: &mut LbugGraphStore, node_type: &str, id: &str) {
+    let name = fixture_node_name(id);
+    store
+        .add_node(
+            node_type,
+            props(&[("node_id", id), ("agent_id", "fixture"), ("name", &name)]),
+            Some(id),
+        )
+        .unwrap();
+}
+
+/// Seed the deterministic fixture dataset into a fresh store and checkpoint it so
+/// every node/edge is committed into the main DB file (no WAL left behind).
+fn seed_fixture_dataset(store: &mut LbugGraphStore) {
+    for id in FIXTURE_FACTS {
+        add_fixture_node(store, "Fact", id);
+    }
+    for id in FIXTURE_EPISODES {
+        add_fixture_node(store, "Episode", id);
+    }
+    for id in FIXTURE_PROCEDURES {
+        add_fixture_node(store, "Procedure", id);
+    }
+    for (src, tgt, edge_type) in FIXTURE_EDGES {
+        store.add_edge(src, tgt, edge_type, None).unwrap();
+    }
+    store
+        .checkpoint()
+        .expect("seed checkpoint must commit the fixture into the main DB file");
+}
+
+/// Every on-disk storage version recorded in a LadybugDB main file.
+///
+/// The database header is the 4-byte ASCII magic `LBUG` immediately followed by
+/// a little-endian `u64` storage version: the self-describing debugging-info
+/// markers are compiled out unless `DESER_DEBUG` is defined (it is not in this
+/// build), so the version trails the magic directly. A store can carry more than
+/// one header image (shadow paging / pre- and post-upgrade), so every match is
+/// returned and callers assert on membership.
+fn on_disk_storage_versions(db_path: &Path) -> Vec<u64> {
+    let bytes = fs::read(db_path).expect("fixture database file must be readable");
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 12 <= bytes.len() {
+        if &bytes[i..i + 4] == b"LBUG" {
+            let mut v = [0u8; 8];
+            v.copy_from_slice(&bytes[i + 4..i + 12]);
+            out.push(u64::from_le_bytes(v));
+            i += 12;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Absolute path to a committed fixture directory under the crate's source tree.
+fn fixture_dir(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("graph")
+        .join("lbug_store")
+        .join("fixtures")
+        .join(name)
+}
+
+/// Copy a committed fixture store into a fresh tempdir (so tests never mutate the
+/// checked-in bytes) and return `(tempdir, staged db path)`.
+fn stage_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
+    let src = fixture_dir(name);
+    assert!(
+        src.is_dir(),
+        "missing fixture dir {src:?} — regenerate with \
+         `generate_v40_store_fixture -- --ignored` on a lbug 0.15.4 build"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    for entry in fs::read_dir(&src).unwrap() {
+        let p = entry.unwrap().path();
+        if p.is_file() {
+            fs::copy(&p, tmp.path().join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    let db = tmp.path().join(FIXTURE_DB_NAME);
+    assert!(db.is_file(), "fixture must contain {FIXTURE_DB_NAME}");
+    (tmp, db)
+}
+
+/// Generator for the committed v40 fixture. IGNORED in normal runs: it writes
+/// into the source tree and is only meaningful on a lbug 0.15.4 build (the last
+/// engine that emits storage format v40). Run once with:
+///   cargo test -p amplihack-memory --features persistent \
+///     graph::lbug_store::tests::generate_v40_store_fixture -- --ignored --nocapture
+#[test]
+#[ignore = "writes committed test data; run manually on a lbug 0.15.4 build"]
+fn generate_v40_store_fixture() {
+    let dir = fixture_dir(V40_FIXTURE);
+    fs::create_dir_all(&dir).unwrap();
+    // Start from a clean directory so the fixture is exactly the seeded dataset.
+    for entry in fs::read_dir(&dir).unwrap() {
+        let p = entry.unwrap().path();
+        if p.is_file() {
+            fs::remove_file(&p).unwrap();
+        }
+    }
+
+    let db = dir.join(FIXTURE_DB_NAME);
+    {
+        let mut store = LbugGraphStore::open(&db, Some("fixture")).unwrap();
+        seed_fixture_dataset(&mut store);
+        store.close(); // checkpoints and drops the WAL, leaving just the db file
+    }
+    let _ = fs::remove_file(wal_path_for(&db));
+
+    // Guard: the freshly written fixture really is storage format v40.
+    let versions = on_disk_storage_versions(&db);
+    assert!(
+        versions.contains(&STORAGE_VERSION_V40),
+        "generator must emit a v40 store — saw {versions:?}; are you on lbug 0.15.4?"
+    );
+    assert!(
+        !versions.contains(&STORAGE_VERSION_V41),
+        "v40 fixture must not already be v41 — saw {versions:?}"
+    );
+    eprintln!("wrote v40 fixture to {db:?} (on-disk storage versions: {versions:?})");
+}
+
+/// MIGRATION REGRESSION (#100): a live store written by lbug 0.15.4 (on-disk
+/// storage format v40) must open IN PLACE under the current engine with zero
+/// data loss. The resilient open must classify it `Clean`, never
+/// `RebuiltAfterCorruption` (the rebuild-from-empty branch that destroys
+/// memory), and every node and edge must be present and correct afterwards.
+///
+/// Green on lbug 0.15.4 (it reads its own format) AND must stay green on lbug
+/// 0.17.1 (which reads v40), proving the binary swap is lossless. This is the
+/// CI-blocking "no data loss" proof.
+#[test]
+fn v40_fixture_opens_clean_and_preserves_all_data() {
+    let (_tmp, db) = stage_fixture(V40_FIXTURE);
+
+    let (store, report) =
+        LbugGraphStore::open_with_recovery(&db, Some("fixture")).expect("v40 store must open");
+
+    // The single most important assertion: a readable old-format store is NEVER
+    // quarantined-and-rebuilt. A rebuild here would be silent memory loss.
+    assert_ne!(
+        report.outcome,
+        WalRecoveryOutcome::RebuiltAfterCorruption,
+        "a readable v40 store must not be rebuilt from empty (data loss!)"
+    );
+    assert_eq!(
+        report.outcome,
+        WalRecoveryOutcome::Clean,
+        "a healthy v40 store must open Clean under the new engine, got {:?}",
+        report.outcome
+    );
+    assert!(
+        report.quarantined_wal.is_none(),
+        "no quarantine artifact may be written for a healthy v40 store"
+    );
+
+    // Every node survives.
+    assert_eq!(
+        store.count_all_nodes(),
+        FIXTURE_NODE_COUNT,
+        "every fixture node must survive the v40 -> current-format open"
+    );
+
+    // Node content is intact (ids + properties), not merely counts.
+    for id in FIXTURE_FACTS
+        .iter()
+        .chain(FIXTURE_EPISODES)
+        .chain(FIXTURE_PROCEDURES)
+    {
+        let n = store
+            .get_node(id)
+            .unwrap_or_else(|| panic!("fixture node {id} missing after open"));
+        assert_eq!(n.node_id, *id);
+        assert_eq!(
+            n.properties.get("agent_id").map(String::as_str),
+            Some("fixture")
+        );
+        assert_eq!(
+            n.properties.get("name").map(String::as_str),
+            Some(fixture_node_name(id).as_str()),
+            "node {id} property content must be preserved across the open"
+        );
+    }
+
+    // Edges (CSR adjacency) survive: f1's outgoing neighbors are exactly ep1
+    // (DERIVES_FROM) and f2 (SIMILAR_TO).
+    let out = store.query_neighbors("f1", None, Direction::Outgoing, 100);
+    assert_eq!(
+        neighbor_ids(&out),
+        vec!["ep1".to_string(), "f2".to_string()],
+        "f1's outgoing neighbors must survive"
+    );
+    assert_eq!(
+        edge_types(&out),
+        vec!["DERIVES_FROM".to_string(), "SIMILAR_TO".to_string()]
+    );
+    // A different rel table also survives: pr2 -PROCEDURE_DERIVES_FROM-> ep3.
+    let pout = store.query_neighbors("pr2", None, Direction::Outgoing, 100);
+    assert_eq!(neighbor_ids(&pout), vec!["ep3".to_string()]);
+    assert_eq!(
+        edge_types(&pout),
+        vec!["PROCEDURE_DERIVES_FROM".to_string()]
+    );
+}
+
+/// The committed fixture is genuinely storage format v40 on disk, and the
+/// current engine upgrades it to v41 on the first checkpoint — the one-way,
+/// in-place v40 -> v41 conversion described in docs/lbug_0_17_upgrade.md.
+///
+/// RED -> GREEN: under lbug 0.15.4 the post-checkpoint version stays 40 and the
+/// final assertion fails — that is the intended failing test that the lbug
+/// 0.17.1 engine bump turns green, proving the on-disk format actually migrated
+/// (and did not, say, silently keep writing v40).
+#[test]
+fn v40_fixture_on_disk_is_v40_and_upgrades_after_checkpoint() {
+    let (_tmp, db) = stage_fixture(V40_FIXTURE);
+
+    // The frozen fixture bytes are v40 (and not yet v41).
+    let before = on_disk_storage_versions(&db);
+    assert!(
+        before.contains(&STORAGE_VERSION_V40),
+        "committed fixture must be storage format v40, saw {before:?}"
+    );
+    assert!(
+        !before.contains(&STORAGE_VERSION_V41),
+        "committed fixture must not already be v41, saw {before:?}"
+    );
+
+    // Open under the current engine, make a durable write, checkpoint, close.
+    {
+        let mut store =
+            LbugGraphStore::open(&db, Some("fixture")).expect("v40 store must open in place");
+        store
+            .add_node(
+                "Fact",
+                props(&[
+                    ("node_id", "f-new"),
+                    ("agent_id", "fixture"),
+                    ("name", "post-upgrade"),
+                ]),
+                Some("f-new"),
+            )
+            .expect("a write against the upgraded store must succeed");
+        store.checkpoint().expect("checkpoint must succeed");
+        store.close();
+    }
+
+    // After the first checkpoint the on-disk store is the current engine's
+    // format. For the lbug 0.17.1 target that is v41 (forward-only). Under lbug
+    // 0.15.4 it stays v40 and this fails — the intended red signal.
+    let after = on_disk_storage_versions(&db);
+    assert!(
+        after.contains(&CURRENT_ENGINE_STORAGE_VERSION),
+        "after a checkpoint the store must be storage format \
+         v{CURRENT_ENGINE_STORAGE_VERSION} (v40 -> v41 migration), saw {after:?}. \
+         If this fails on lbug 0.15.4 that is expected: the 0.17.1 engine bump turns it green."
+    );
+
+    // Sanity: the upgraded store still opens and retains all data (10 + 1).
+    let store = LbugGraphStore::open(&db, Some("fixture")).expect("upgraded store must reopen");
+    assert_eq!(store.count_all_nodes(), FIXTURE_NODE_COUNT + 1);
+}

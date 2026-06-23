@@ -77,9 +77,21 @@ jobs:
         working-directory: rust/amplihack-memory
         run: cargo test --features python
 
-      # persistent feature compiles the LadybugDB (lbug) C++ engine from source,
-      # which is slow on shared runners — keep it non-blocking for now while it
-      # provides upstream coverage of the persistent GraphStore backend.
+      # The v40 -> v41 on-disk store-format migration (issue #100) must NEVER
+      # regress into data loss, so the no-data-loss proof is a BLOCKING gate.
+      # It is fast and deterministic: lbug 0.17.x links a prebuilt engine archive
+      # (no from-source C++ compile), opens a committed v40 fixture store, and
+      # asserts it opens Clean (never RebuiltAfterCorruption) with every node and
+      # edge intact, then upgrades to v41 on checkpoint. See
+      # docs/lbug_0_17_upgrade.md.
+      - name: Data-loss gate (v40 store opens losslessly under lbug 0.17.x)
+        working-directory: rust/amplihack-memory
+        run: cargo test --features persistent --lib graph::lbug_store::tests::v40
+
+      # The remaining persistent-feature suite includes the probabilistic
+      # 400-round CSR delete+checkpoint churn (reproduces_issue_100_*), a native
+      # stress test kept non-blocking to avoid CI flakiness from rare native
+      # crashes upstream. The data-loss gate above is the blocking guarantee.
       - name: Run tests (persistent feature)
         working-directory: rust/amplihack-memory
         continue-on-error: true

@@ -30,7 +30,7 @@ impl crate::backends::ExperienceBackend for MockBackend {
             .experiences
             .iter()
             .filter(|e| {
-                experience_type.map_or(true, |et| e.experience_type == et)
+                experience_type.is_none_or(|et| e.experience_type == et)
                     && e.confidence >= min_confidence
             })
             .take(limit)

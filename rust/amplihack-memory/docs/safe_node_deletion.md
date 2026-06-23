@@ -303,6 +303,14 @@ lbug = { version = "=0.15.4", optional = true }   # otherwise stays "=0.15.3"
 - The bump is intentionally limited to the 0.15.x line. Moving to 0.17.x is a major
   change with separate risk and is **not** part of this fix.
 
+> **Update (#100) — the 0.17.x move now exists as a separate, coordinated
+> upgrade.** The engine is being bumped `lbug 0.15.4` → `0.17.1` for both
+> `amplihack-memory-lib` and Simard. The storage format goes v40 → v41 but is
+> read-compatible (0.17.1 opens a v40 store in place, upgrading on first
+> checkpoint), so there is no data migration. The soft-delete tombstone above
+> remains the version-independent crash fix and is carried forward unchanged. See
+> [`lbug_0_17_upgrade.md`](lbug_0_17_upgrade.md) for the full reference.
+
 ---
 
 ## Compatibility & guarantees

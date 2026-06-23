@@ -310,6 +310,13 @@ consolidation. See
 reference — the #98 incident, root cause, the two-phase delete, and the
 regression coverage.
 
+The pinned engine is being upgraded from `lbug 0.15.4` to `lbug 0.17.1`
+(storage format v40 → v41, read-compatible in place — no data migration). See
+[`docs/lbug_0_17_upgrade.md`](docs/lbug_0_17_upgrade.md) for the full reference —
+the version-independent CSR crash, the one-way v40→v41 storage upgrade, the
+additive Rust API delta, build/CI configuration, the optional patched engine,
+Simard coordination, and the live-store upgrade runbook.
+
 ### Automatic `SIMILAR_TO` linking between facts
 
 `CognitiveMemory` can automatically connect related semantic facts with
