@@ -144,7 +144,8 @@ marks it landed.
 | ~~Typed `count_all_nodes() -> NodeCount`~~ (**superseded** — the gate treats a `0` count over a material footprint as suspect) | ❌ not needed | — |
 | ~~Production-scale v40 fixture~~ (**superseded** — bug is scale-independent; a real-store copy is exercised by the env-gated `v40_real_store_parity_*` test) | ❌ not needed | — |
 | **Engine read-path fix** (cross-repo) (**superseded** — engine is not at fault; verified: `count(n)` reads the real store's full 2813) | ❌ not needed | ~~`rysweet/lbug-patched`~~ |
-| **Simard** 0.17.1 re-pin + safe-update parity gate | 🚧 planned | Simard checkout |
+| **Simard** integration contract (re-pin preconditions + `Value::Json` non-breaking) | ✅ verified (this branch, read-only) | `Simard:Cargo.toml`, `Simard:src/cognitive_memory/mod.rs:290` |
+| **Simard** 0.17.1 re-pin + safe-update parity gate | 🚧 planned (after PR #108 merges) | Simard checkout |
 
 The implementation order and per-PR scope are in
 [PR dependency order](#pr-dependency-order-strict-each-green-ci-merge-ready).
@@ -607,6 +608,24 @@ section:
 4. No code edits to `src/cognitive_memory/mod.rs` or its `as_str` / `as_i64` /
    `as_f64` helpers — they already use `_ =>` catch-all arms, so the additive
    `Value::Json` variant is non-breaking.
+
+> **✅ Integration contract — verified (this branch).** The four re-pin
+> preconditions above were checked against the live Simard checkout
+> (`/home/azureuser/src/Simard`, branch
+> `engineer/fix-meeting-subprocess-timeout-and-structured-decisions`), **read-only**:
+>
+> - `Cargo.toml` carries `lbug = "0.15"`, an unpinned `amplihack-memory` git
+>   dependency (no `rev`/`tag`), and **no** `[patch]` section — exactly the
+>   starting state assumed by steps 1–3.
+> - `src/cognitive_memory/mod.rs:290–310` defines `as_str` / `as_i64` / `as_f64`,
+>   and **all three end in a `_ => None` catch-all arm**, so the additive
+>   `lbug::Value::Json` variant introduced by 0.17.1 cannot break Simard's value
+>   extraction (step 4 holds; no Simard code edit is required).
+>
+> No Simard file was modified and the live `~/.simard/cognitive` store was not
+> opened — this is contract verification only. The re-pin itself is still
+> **pending**: it lands in the separate Simard checkout **after** PR #108 merges,
+> and **must not** deploy 0.17.1 to the live `simard-ooda` daemon.
 
 ### Simard safe-update parity gate (the second defense layer)
 
