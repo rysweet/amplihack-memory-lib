@@ -166,6 +166,33 @@ impl CognitiveMemory {
             path.as_ref(),
             Some(&store_id),
         )?;
+        // #107: fail closed if the empty-read gate tripped. A populated store
+        // that read back empty must NOT be handed back as a usable (empty) graph
+        // — a consumer would run "clean" cycles over it and checkpoint, upgrading
+        // an empty store to v41 and destroying the data permanently. The store is
+        // sealed and its v40 bytes are intact; surface a hard error so the caller
+        // rolls back (or deploys a build with the read fix) instead.
+        if recovery.outcome == crate::graph::WalRecoveryOutcome::SuspectedDataLoss {
+            let footprint_bytes = std::fs::metadata(store.db_path())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            // The gate set `recovered_records` to the (empty) count it reacted to;
+            // use it rather than re-reading `count_all_nodes()`, whose unfiltered
+            // `count(n)` can disagree with the suspect read the gate rejected.
+            let read_count = recovery.recovered_records;
+            tracing::error!(
+                agent = %trimmed,
+                footprint_bytes,
+                read_count,
+                "CognitiveMemory::open_persistent: #107 empty-read gate tripped — refusing \
+                 to open a populated store that read back empty (store left intact, not \
+                 checkpointed)"
+            );
+            return Err(MemoryError::SuspectedDataLoss {
+                footprint_bytes,
+                read_count,
+            });
+        }
         if recovery.recovered() {
             tracing::warn!(
                 agent = %trimmed,

@@ -30,6 +30,17 @@ the catalog") and builds on the corrupt-WAL recovery added for **#88**.
 - **Strict mode preserved.** The strict `open()` still errors on corruption (so
   tests and tools that *want* to detect corruption can); only the resilient
   `open_with_recovery()` self-heals.
+- **No silent empty reads (issue #107) — _implemented_.** Distinct from
+  corruption: an engine that *opens* a populated store but reads it back **empty**
+  is caught by an **empty-read safety gate** that runs (as a read-only peek)
+  before any write. It returns
+  [`WalRecoveryOutcome::SuspectedDataLoss`](#walrecoveryoutcome-reference),
+  **refuses to checkpoint or rebuild**, and leaves the on-disk bytes untouched so
+  the store stays readable by the writer's engine. This gate **is implemented**
+  (see [`docs/lbug_0_17_upgrade.md`](lbug_0_17_upgrade.md#implementation-status));
+  for the specific `lbug 0.17.1` v40 silent empty-read, the root cause was a
+  **lib-side** tombstone-filter bug fixed in the read path, so the gate is the
+  belt-and-suspenders backstop and the read-path fix restores full parity.
 
 > **Feature gate.** Everything on this page requires the `persistent` cargo
 > feature (which pulls in the `lbug` engine):
@@ -42,13 +53,14 @@ the catalog") and builds on the corrupt-WAL recovery added for **#88**.
 1. [Why this exists (the #95 incident)](#why-this-exists-the-95-incident)
 2. [Configuration — buffer pool & max DB size](#configuration--buffer-pool--max-db-size)
 3. [The recovery state machine](#the-recovery-state-machine)
-4. [`WalRecoveryOutcome` reference](#walrecoveryoutcome-reference)
-5. [Quarantine semantics](#quarantine-semantics)
-6. [Checkpoint health signal](#checkpoint-health-signal)
-7. [Public API reference](#public-api-reference)
-8. [Tutorial — operating a resilient persistent store](#tutorial--operating-a-resilient-persistent-store)
-9. [Operational runbook](#operational-runbook)
-10. [Compatibility & guarantees](#compatibility--guarantees)
+4. [The empty-read parity gate (#107)](#the-empty-read-parity-gate-107)
+5. [`WalRecoveryOutcome` reference](#walrecoveryoutcome-reference)
+6. [Quarantine semantics](#quarantine-semantics)
+7. [Checkpoint health signal](#checkpoint-health-signal)
+8. [Public API reference](#public-api-reference)
+9. [Tutorial — operating a resilient persistent store](#tutorial--operating-a-resilient-persistent-store)
+10. [Operational runbook](#operational-runbook)
+11. [Compatibility & guarantees](#compatibility--guarantees)
 
 ---
 
@@ -192,8 +204,15 @@ yields a working database:
 ```
 open_with_recovery(db_path)
 │
+├─ 0. EMPTY-READ GATE  [#107, landed]  — read-only peek, before any read-write open
+│      (committed footprint vs unfiltered node count; a read-only open cannot mutate the file)
+│      ├─ footprint Empty ...........................► proceed to step 1 (fresh/empty store)
+│      ├─ footprint NonEmpty & count > 0 ............► proceed to step 1 (populated, reads populated)
+│      └─ footprint NonEmpty & count 0/unreadable ..► SuspectedDataLoss
+│            (return a sealed read-only handle: no checkpoint, no rebuild, bytes untouched)
+│
 ├─ 1. strict open
-│      └─ Ok ───────────────────────────────► Clean
+│      └─ Ok ──► Clean
 │
 ├─ 2. strict open failed
 │      ├─ WAL file present?
@@ -222,9 +241,22 @@ step 6 had no fallback, so a corrupt catalog propagated an error and crash-loope
 the consumer. Now both route through quarantine-and-rebuild, so a corrupt catalog
 self-heals whether or not a WAL was present.
 
+The **#107** change (**landed**, step 0 in the diagram above) is the **empty-read
+gate run as a read-only peek *before* the read-write open**. A silent empty read
+is *not* an open failure — the engine returns `Ok` — so none of the corruption
+branches would fire. The gate intercepts it **before any write** and, on a
+populated-but-empty read, returns `SuspectedDataLoss` instead of `Clean`. It runs
+read-only precisely so the inspection itself cannot mutate the store (a read-write
+open rewrites a checkpoint header on drop even with no writes); it **never** routes
+into `rebuild_after_corruption`, since rebuilding (or checkpointing) would write
+v41 over a store whose bytes are actually fine, destroying the rollback path. See
+[The empty-read parity gate (#107)](#the-empty-read-parity-gate-107).
+
 `Clean`, `RecoveredPrefix`, and `CheckpointOnly` behave exactly as they did
-before — the only behavioural change is that the previously-erroring catalog
-cases now produce `RebuiltAfterCorruption` instead of an error.
+before. The behavioural changes are: the previously-erroring catalog cases now
+produce `RebuiltAfterCorruption` (#95, **landed**), and a populated store that
+reads empty produces `SuspectedDataLoss` (#107, **landed**) instead of a silent
+`Clean`.
 
 ### Detection: how "catalog corruption" is recognised
 
@@ -237,6 +269,93 @@ entry point any persistent open failure that survives WAL quarantine triggers a
 rebuild, because a running store with an empty graph is strictly better than a
 daemon that `exit(1)`s forever.
 
+> **The empty-read gate is the deliberate exception to "availability over data".**
+> Everywhere else this page favours a running-but-empty store over a crash loop.
+> The parity gate inverts that *only* for the silent-empty-read case, because
+> there the bytes are intact and "run empty + checkpoint" would convert a
+> recoverable situation into permanent loss. Fail-closed is correct precisely
+> because rollback is still possible.
+
+---
+
+## The empty-read parity gate (#107)
+
+> **✅ Landed.** The gate, the `WalRecoveryOutcome::SuspectedDataLoss` outcome, the
+> `MemoryError::SuspectedDataLoss` error, and the `CommittedFootprint` probe
+> described in this section are **implemented** (the node count uses the existing
+> unfiltered `count_all_nodes() -> usize`; a `0` over a material footprint is
+> treated as suspect). See
+> [Implementation status](lbug_0_17_upgrade.md#implementation-status).
+
+The parity gate defends against an engine that **opens a store successfully but
+reads it back empty** — concretely, `lbug 0.17.1` reading certain real v40
+cognitive stores as `total = 0` with no error and no quarantine artifact. Left
+unchecked, the store would be checkpointed (upgrading v40→v41 over an empty graph)
+and the data would be **permanently lost**. The gate will make this **fail-closed**.
+
+### Where it runs
+
+Inside `open_with_recovery`, **immediately after a successful strict open and node
+count, before any write path** — before auto-checkpoint, before an explicit
+`checkpoint()`, and before any `rebuild_after_corruption`. No v41 write can occur
+until the gate passes.
+
+### The two independent signals it compares
+
+The gate cannot trust the catalog read as its own baseline (that read is the
+suspect). It will compare two **independent** signals:
+
+1. **Committed-footprint probe** — durable, file-level evidence of whether the
+   store *should* hold data, read **without** going through the catalog rows that
+   the bug zeroes out:
+
+   | `CommittedFootprint` | Meaning |
+   | --- | --- |
+   | `Empty` | No durable evidence of committed data (file at/below the fresh-store baseline). A legitimately new/empty store. |
+   | `NonEmpty { bytes, .. }` | A material on-disk footprint (e.g. a ~31 MB single-file store) written by a previous process. |
+
+2. **Node count** — `count_all_nodes()` sums the **unfiltered** `count(n)` of every
+   node table. That query never names `_deleted`, so it stays correct even on the
+   #107 legacy schema; a query that fails collapses to `0`, and the gate treats
+   **`0` over a material footprint** (genuinely-empty *or* unreadable) as a parity
+   failure — a populated store whose count cannot be confirmed is as dangerous as
+   one that reads `0`.
+
+   > A typed `NodeCount` was considered but **not** needed: the footprint probe
+   > already distinguishes "fresh/empty" (which never trips) from "material"
+   > (where any `0` trips), so `count_all_nodes() -> usize` is sufficient.
+
+### The decision and its effect
+
+| Footprint | Count | Result |
+| --- | --- | --- |
+| `Empty` | any | `Clean` — fresh/empty store, nothing to protect. |
+| `NonEmpty` | `Counted(n>0)` | `Clean` — populated store read back populated. |
+| `NonEmpty` | `Counted(0)` / `ConfirmedEmpty` / `Unreadable` | **`SuspectedDataLoss`** — the gate trips. |
+
+On `SuspectedDataLoss` the gate **fails closed**:
+
+- **Writes nothing** — no auto-checkpoint, no `checkpoint()`, no
+  `rebuild_after_corruption`. The on-disk v40 bytes are exactly as opened, so a
+  0.15.x binary can still read them. *This is the property that prevents the loss.*
+- **Quarantines nothing** — the bytes are fine; the reader is the problem. No
+  `*.corrupt-*` artifact is produced and nothing is moved aside.
+- **Returns a sealed store** — `open_with_recovery` returns
+  `Ok((store, WalRecovery { outcome: SuspectedDataLoss, recovered_records: 0,
+  quarantined_wal: None }))`, and the returned `store` refuses to write:
+  `checkpoint()` is a hard error and auto-checkpoint is disabled.
+- **Fails closed at the consumer entry point** —
+  `CognitiveMemory::open_persistent` maps the outcome to
+  `MemoryError::SuspectedDataLoss { footprint_bytes, read_count }` and never
+  returns a usable handle.
+
+The gate emits a single `error!` log (naming the footprint and the read count) and
+emits **no node properties** — no memory content is logged.
+
+> **No false positives on fresh stores.** A genuinely new/empty store probes
+> `CommittedFootprint::Empty` and therefore opens `Clean`; the gate only trips when
+> a *materially populated* footprint reads back empty.
+
 ---
 
 ## `WalRecoveryOutcome` reference
@@ -246,12 +365,15 @@ daemon that `exit(1)`s forever.
 
 | Variant | Meaning | `recovered_records` | `quarantined_wal` |
 | --- | --- | --- | --- |
-| `Clean` | WAL replayed cleanly (or no recovery needed). No artifact written, no warning. | `0` | `None` |
+| `Clean` | WAL replayed cleanly (or no recovery needed) **and the #107 empty-read gate passed**. No artifact written, no warning. | `0` | `None` |
 | `RecoveredPrefix` | A corrupt WAL tail was quarantined; the good prefix was replayed and checkpointed into the main DB. | nodes after replay | `Some(<wal>.corrupt-<ts>)` |
 | `CheckpointOnly` | The WAL was unusable even in resilient mode; it was quarantined and the store opened from the last good checkpoint only. | nodes at last checkpoint | `Some(<wal>.corrupt-<ts>)` |
 | `RebuiltAfterCorruption` | The catalog / main DB itself was corrupt and unopenable even with the WAL gone (the #95 mode). The whole database was quarantined and a **fresh empty** database opened. | **`0`** | `Some(<db_path>.corrupt-<ts>)` |
+| `SuspectedDataLoss` *(#107, landed)* | A materially-populated on-disk footprint read back **empty** (caught by the read-only peek). The store is **sealed** (refuses to checkpoint), **nothing is written or quarantined**, and the bytes are left intact for rollback. | **`0`** | `None` |
 
-`WalRecovery::recovered()` returns `true` for every variant except `Clean`.
+All five variants are implemented today.
+`WalRecovery::recovered()` returns `true` for every variant except `Clean`
+(including `SuspectedDataLoss`).
 
 ```rust
 use amplihack_memory::graph::{LbugGraphStore, WalRecoveryOutcome};
@@ -274,13 +396,26 @@ match recovery.outcome {
             "catalog was corrupt; rebuilt from empty — investigate the quarantine",
         );
     }
+    WalRecoveryOutcome::SuspectedDataLoss => {
+        // A populated store read back EMPTY (#107). NOTHING was written or
+        // quarantined; the on-disk bytes are intact and still readable by the
+        // writer's engine. The `store` handle is sealed: checkpoint() will error.
+        // Do NOT proceed to write — roll back, or deploy an engine that reads the
+        // store correctly. (CognitiveMemory::open_persistent turns this into a
+        // hard MemoryError::SuspectedDataLoss instead.)
+        tracing::error!(
+            "store opened but read EMPTY despite a populated footprint — refusing \
+             to checkpoint; the v40 bytes are preserved for rollback",
+        );
+    }
 }
 ```
 
 > **Field naming note.** The path field is historically named `quarantined_wal`
 > for backward compatibility. For `RebuiltAfterCorruption` it holds the
-> moved-aside **database** path (`<db_path>.corrupt-<ts>`), not a WAL. The field
-> always means "where the corrupt artifact was moved aside".
+> moved-aside **database** path (`<db_path>.corrupt-<ts>`), not a WAL. For
+> `SuspectedDataLoss` it is `None` (nothing is quarantined). The field always
+> means "where the corrupt artifact was moved aside", or `None` when none was.
 
 ---
 
@@ -383,45 +518,74 @@ All items below are gated behind the `persistent` feature.
 
 #### `enum WalRecoveryOutcome`
 
-`Clean | RecoveredPrefix | CheckpointOnly | RebuiltAfterCorruption`. See the
-[outcome reference](#walrecoveryoutcome-reference). Derives `Debug, Clone, Copy,
-PartialEq, Eq`.
+`Clean | RecoveredPrefix | CheckpointOnly | RebuiltAfterCorruption |
+SuspectedDataLoss` (the #107 variant, **landed**). See the
+[outcome reference](#walrecoveryoutcome-reference). Derives
+`Debug, Clone, Copy, PartialEq, Eq`; `SuspectedDataLoss` was additive — match
+sites in this crate already carry `_ =>` arms.
 
 #### `struct WalRecovery`
 
 | Field / method | Type | Description |
 | --- | --- | --- |
 | `outcome` | `WalRecoveryOutcome` | how the store was opened |
-| `recovered_records` | `usize` | graph nodes present after recovery (`0` for `Clean` and `RebuiltAfterCorruption`) |
-| `quarantined_wal` | `Option<PathBuf>` | where the corrupt artifact (WAL or DB) was moved aside |
+| `recovered_records` | `usize` | graph nodes present after recovery (`0` for `Clean`, `RebuiltAfterCorruption`, and `SuspectedDataLoss`) |
+| `quarantined_wal` | `Option<PathBuf>` | where the corrupt artifact (WAL or DB) was moved aside (`None` for `Clean` and `SuspectedDataLoss`) |
 | `recovered()` | `fn(&self) -> bool` | `true` for any non-`Clean` outcome |
 
 Derives `Debug, Clone`.
+
+#### `enum MemoryError` (the `SuspectedDataLoss` variant)
+
+**Landed (#107) in `src/errors.rs`.** `MemoryError` (re-exported at the crate
+root, `amplihack_memory::MemoryError`) carries a fail-closed **struct** variant
+returned by `CognitiveMemory::open_persistent` when the
+[empty-read gate](#the-empty-read-parity-gate-107) trips:
+
+```rust
+MemoryError::SuspectedDataLoss {
+    /// On-disk committed footprint (bytes) the store was found to hold.
+    footprint_bytes: u64,
+    /// Node count the (suspect) read path returned — the value the gate rejected.
+    read_count: usize,
+}
+```
+
+`open_persistent` returns this instead of a usable handle, so a consumer cannot
+accidentally run on (or checkpoint) a store that read empty.
 
 ### `impl LbugGraphStore`
 
 | Method | Signature | Description |
 | --- | --- | --- |
-| `open` | `fn open(db_path: &Path, store_id: Option<&str>) -> Result<Self>` | **Strict** open. Errors on a corrupt WAL **or** corrupt catalog. Never rebuilds. |
-| `open_with_recovery` | `fn open_with_recovery(db_path: &Path, store_id: Option<&str>) -> Result<(Self, WalRecovery)>` | **Resilient** open. Recovers a corrupt WAL and **rebuilds** on catalog corruption. Only errors if a fresh DB cannot be created. |
-| `checkpoint` | `fn checkpoint(&self) -> Result<()>` | Force a `CHECKPOINT` + durability barrier so a clean reopen needs no WAL replay. |
+| `open` | `fn open(db_path: &Path, store_id: Option<&str>) -> Result<Self>` | **Strict** open. Errors on a corrupt WAL **or** corrupt catalog. Never rebuilds, never runs the empty-read gate. |
+| `open_with_recovery` | `fn open_with_recovery(db_path: &Path, store_id: Option<&str>) -> Result<(Self, WalRecovery)>` | **Resilient** open. Runs the **empty-read gate** (read-only peek) *first* — returning `SuspectedDataLoss` + a sealed store if a populated store reads empty — then recovers a corrupt WAL and **rebuilds** on catalog corruption. Only errors if a fresh DB cannot be created. |
+| `checkpoint` | `fn checkpoint(&self) -> Result<()>` | Force a `CHECKPOINT` + durability barrier. A **hard error on a `SuspectedDataLoss`-sealed store** (refuses to upgrade a store that read empty). |
 | `buffer_pool_bytes` | `fn buffer_pool_bytes(&self) -> u64` | Effective buffer-pool cap this store opened with. |
 | `max_db_bytes` | `fn max_db_bytes(&self) -> u64` | Effective max DB size this store opened with. |
 | `last_checkpoint_error` | `fn last_checkpoint_error(&self) -> Option<String>` | Most recent checkpoint error, or `None` after a successful checkpoint. |
 | `db_path` | `fn db_path(&self) -> &Path` | The on-disk database path. |
 
+> **Internal (`pub(crate)`) helpers behind the gate.** `count_all_nodes() -> usize`
+> sums the unfiltered `count(n)`; `committed_footprint(db_path) -> CommittedFootprint`
+> (`Empty` / `NonEmpty { bytes }`) is the independent on-disk probe; `tombstone_filter`
+> gates the `_deleted` predicate on the actual schema; `seal()` marks a store
+> checkpoint-refusing. All are crate-internal; callers observe the gate only through
+> `WalRecoveryOutcome::SuspectedDataLoss` / `MemoryError::SuspectedDataLoss`.
+
 ### `impl CognitiveMemory` (the recommended entry point)
 
 | Method | Signature | Description |
 | --- | --- | --- |
-| `open_persistent` | `fn open_persistent(path, agent_name) -> Result<Self>` | Opens the LadybugDB-backed store via `open_persistent_with_recovery` (self-healing). |
-| `open_persistent_with_recovery` | `fn open_persistent_with_recovery(path, agent_name) -> Result<Self>` | Same as above; explicit name. Logs a structured `warn!` whenever recovery (any non-`Clean` outcome) ran. |
+| `open_persistent` | `fn open_persistent(path, agent_name) -> Result<Self>` | Opens the LadybugDB-backed store via `open_persistent_with_recovery` (self-healing). **Fails closed with `MemoryError::SuspectedDataLoss` when the empty-read gate trips.** |
+| `open_persistent_with_recovery` | `fn open_persistent_with_recovery(path, agent_name) -> Result<Self>` | Same as above; explicit name. Logs a structured `warn!`/`error!` whenever recovery (any non-`Clean` outcome) ran, and converts a `SuspectedDataLoss` outcome into the hard error. |
 | `checkpoint` | `fn checkpoint(&self) -> Result<()>` | Forces the backend WAL into the main DB (no-op for the in-memory backend). |
 
 `open_persistent` returns `MemoryError::Storage` only if the database cannot be
 opened **even after** quarantining a corrupt WAL/catalog and creating a fresh one
 (e.g. an unwritable parent directory) — not for ordinary corruption, which now
-self-heals.
+self-heals. It returns `MemoryError::SuspectedDataLoss` when a populated store
+reads empty — a deliberate, fail-closed refusal, **not** a self-heal.
 
 ---
 
@@ -456,6 +620,15 @@ fn run(db_path: &Path) -> amplihack_memory::Result<()> {
     if recovery.outcome == WalRecoveryOutcome::RebuiltAfterCorruption {
         // The previous database was unsalvageable in-process and was preserved
         // at recovery.quarantined_wal. Trigger any rehydration you need here.
+    }
+    if recovery.outcome == WalRecoveryOutcome::SuspectedDataLoss {
+        // #107: a populated store read back EMPTY. The store is SEALED — calling
+        // store.checkpoint() below would return Err — and the v40 bytes are
+        // intact. Do NOT write. Abort and roll back / deploy a correct engine.
+        // (Most callers use CognitiveMemory, which turns this into a hard error.)
+        return Err(amplihack_memory::MemoryError::Storage(
+            "store read empty despite a populated footprint; refusing to write".into(),
+        ));
     }
 
     // 3. ... writes happen via the GraphStore / CognitiveMemory API ...
@@ -516,9 +689,50 @@ fails; it has no dedicated test and is currently exercised only indirectly. The
 checkpoint-health getters (`last_checkpoint_error()`, `buffer_pool_bytes()`,
 `max_db_bytes()`) are likewise not yet covered by a direct test.
 
+### Reproducing the empty-read gate (#107, the landed tests)
+
+> **✅ Landed.** These tests are in the tree and **GREEN**, `v40`-prefixed under
+> `--features persistent` so they join the existing
+> [CI data-loss gate](lbug_0_17_upgrade.md#testing):
+
+- **Legacy-schema read parity** (`v40_legacy_store_missing_tombstone_column_reads_all_items`,
+  `v40_legacy_store_cognitive_statistics_reports_full_total`) — a store whose tables
+  lack `_deleted` must read back every item, not a silent empty. These reproduce the
+  actual #107 root cause and pass with the read-path fix.
+- **Real-store parity** (`v40_real_store_parity_preserves_all_items`) — env-gated on
+  `AMPLIHACK_V40_REAL_STORE_COPY`; opens a *copy* of a real v40 store and asserts the
+  read count equals a tolerant trusted baseline (relative parity, no magic literal).
+  Verified manually: the lib reads `total = 2813` (matching 0.15.4) where the unfixed
+  path read `0`.
+- **Gate trips without rebuild** (`v40_empty_read_gate_trips_and_seals_without_checkpoint`)
+  — a populated-footprint store that reads empty must return
+  `WalRecoveryOutcome::SuspectedDataLoss`, run **no** checkpoint, leave the store
+  **not** upgraded to v41, write **no** `*.corrupt-*` artifact, and leave the bytes
+  byte-identical (the gate peeks **read-only**). Holds **regardless of the engine** —
+  it is the durable proof of the safety property.
+- **No false positive on a fresh store** — a genuinely empty/new store (≤32 KiB)
+  probes `CommittedFootprint::Empty` and opens `Clean`, never `SuspectedDataLoss`.
+
 ---
 
 ## Operational runbook
+
+**Symptom: logs show `SuspectedDataLoss`, or `open_persistent` returns
+`MemoryError::SuspectedDataLoss { footprint_bytes, read_count }`.**
+The store **opened but read empty** despite a populated on-disk footprint (the
+#107 silent empty-read). **Nothing was written, checkpointed, or quarantined** —
+the on-disk bytes are intact and still readable by the engine that wrote them.
+**Do not** retry with `--force`, delete the store, or run a binary that checkpoints
+it. Instead:
+
+1. **Roll back** to the engine/binary that reads the store correctly (the
+   writer's version), or deploy a build carrying the lib read-path fix (the #107
+   fix is lib-side; see [`lbug_0_17_upgrade.md`](lbug_0_17_upgrade.md#root-cause-corrected-the-_deleted-tombstone-filter-on-a-legacy-schema)).
+2. **Validate on a copy** (`cp -a <store> /tmp/copy && open /tmp/copy`) and confirm
+   the count matches a trusted baseline before pointing any writer at the original.
+
+This is a **fail-closed** state by design: the gate chose "refuse and preserve"
+over "run empty and lose data", because the bytes are recoverable.
 
 **Symptom: logs show `RebuiltAfterCorruption`.**
 The catalog was corrupt and the store rebuilt itself from empty. The consumer is
@@ -561,25 +775,41 @@ ls -lh ./data/*.corrupt-*
 
 ## Compatibility & guarantees
 
-- **API additions only.** The new surface — `RebuiltAfterCorruption`, the env
-  constants, and the `buffer_pool_bytes()` / `max_db_bytes()` /
-  `last_checkpoint_error()` getters — is purely additive. Existing signatures
-  (`open`, `open_with_recovery`, `checkpoint`, `WalRecovery` fields) are
-  unchanged, including the historical `quarantined_wal` field name.
+- **API additions only.** The implemented additions — `RebuiltAfterCorruption`, the
+  env constants, and the `buffer_pool_bytes()` / `max_db_bytes()` /
+  `last_checkpoint_error()` getters — are purely additive; existing signatures
+  (`open`, `open_with_recovery`, `checkpoint`, `WalRecovery` fields) are unchanged,
+  including the historical `quarantined_wal` field name. The #107 surface
+  (`WalRecoveryOutcome::SuspectedDataLoss`, `MemoryError::SuspectedDataLoss`,
+  `count_all_nodes() -> usize`, the `committed_footprint` probe) is likewise
+  additive — match sites already carry `_ =>` arms.
 - **Strict mode is unchanged.** `LbugGraphStore::open()` still errors on a corrupt
   WAL or catalog and never rebuilds — use it when you *want* to detect corruption
-  (tests, repair tooling).
+  (tests, repair tooling). It does **not** run the empty-read gate (the gate is a
+  resilient-path behaviour).
 - **No data is ever deleted.** Every corrupt WAL or database is moved aside to a
-  timestamped sibling first.
+  timestamped sibling first. The empty-read gate goes further: on a suspected
+  empty read it moves **nothing** and writes **nothing** (it peeks read-only),
+  leaving the bytes exactly as found.
+- **The empty-read gate is fail-closed, not fail-open.** Unlike catalog
+  recovery (which favours availability and rebuilds-from-empty), the #107 gate
+  **refuses** to proceed when a populated store reads empty — because there the
+  bytes are intact and "run empty + checkpoint" would convert a recoverable state
+  into permanent loss. Treating a `0` count over a material footprint as suspect
+  ensures a *failed* read is never mistaken for an empty store.
 - **Default behaviour is safer, not different.** With no env vars set, the store
-  uses a 1 GiB pool / 16 GiB max DB (up from 128 MiB / 1 GiB) and self-heals
-  catalog corruption — strictly more robust than before, with the same on-disk
-  format.
+  uses a 1 GiB pool / 16 GiB max DB (up from 128 MiB / 1 GiB), self-heals catalog
+  corruption, and refuses to checkpoint a store that read empty — strictly more
+  robust than before, with the same on-disk format.
 
 ### See also
 
+- [`docs/lbug_0_17_upgrade.md`](lbug_0_17_upgrade.md) — the engine upgrade, the
+  #107 root cause, the production-scale fixture, and the cross-repo engine fix +
+  Simard safe-update parity gate.
 - [`README.md` → Durability & crash recovery](../README.md) — the at-a-glance
   summary.
 - [`CHANGELOG.md`](../../../CHANGELOG.md) — the `[Unreleased]` entries for #95
-  (configurable limits + catalog recovery) and #88 (corrupt-WAL recovery).
+  (configurable limits + catalog recovery) and #88 (corrupt-WAL recovery). The #107
+  empty-read parity gate will add its entry when it lands.
 - Module docs on `crate::graph::lbug_store` — the rustdoc that mirrors this page.
