@@ -33,6 +33,24 @@ pub enum MemoryError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    /// A store with a material on-disk footprint read back empty (or unreadable)
+    /// — the #107 silent empty-read signature. The store-open path fails closed
+    /// with this rather than returning a usable handle over an apparently-empty
+    /// graph (which a consumer could then checkpoint and upgrade to v41, making
+    /// the loss permanent). `footprint_bytes` is the committed on-disk size that
+    /// proves the store *should* be populated; `read_count` is what the read path
+    /// actually returned (typically `0`).
+    #[error(
+        "suspected data loss: {read_count} nodes read from a populated \
+         {footprint_bytes}-byte store (store left intact, not checkpointed)"
+    )]
+    SuspectedDataLoss {
+        /// Committed on-disk footprint (bytes) of the store that read back empty.
+        footprint_bytes: u64,
+        /// Node count the read path returned (the empty/suspect value).
+        read_count: usize,
+    },
+
     /// Generic internal error.
     #[error("{0}")]
     Internal(String),
@@ -91,5 +109,23 @@ mod tests {
     fn test_display_internal() {
         let e = MemoryError::Internal("something broke".into());
         assert_eq!(e.to_string(), "something broke");
+    }
+
+    #[test]
+    fn test_display_suspected_data_loss() {
+        // #107: the fail-closed empty-read error must name both the on-disk
+        // footprint (proof the store should be populated) and the empty count it
+        // read back, so operators can see the silent-empty signature at a glance.
+        let e = MemoryError::SuspectedDataLoss {
+            footprint_bytes: 30_961_664,
+            read_count: 0,
+        };
+        let s = e.to_string();
+        assert!(s.contains("suspected data loss"), "got: {s}");
+        assert!(
+            s.contains("30961664"),
+            "footprint must be surfaced, got: {s}"
+        );
+        assert!(s.contains('0'), "read count must be surfaced, got: {s}");
     }
 }

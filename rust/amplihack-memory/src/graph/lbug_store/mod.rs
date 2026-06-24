@@ -125,6 +125,17 @@ pub enum WalRecoveryOutcome {
     /// database was opened at `db_path` so the store self-heals instead of
     /// failing forever. `recovered_records` is `0`.
     RebuiltAfterCorruption,
+    /// The store opened without engine error but a materially non-empty store
+    /// read back **empty** — the #107 silent empty-read signature. The gate
+    /// **writes nothing**: it does not checkpoint, does not upgrade the on-disk
+    /// format, does not rebuild, and writes no `*.corrupt-*` artifact, so the
+    /// store bytes are left exactly as opened (and remain readable by the prior
+    /// engine line for rollback). The returned store is **sealed**:
+    /// [`checkpoint`](LbugGraphStore::checkpoint) is a hard error and
+    /// auto-checkpoint is disabled, so a caller cannot accidentally upgrade an
+    /// apparently-empty store. Distinct from both [`Clean`](Self::Clean) and
+    /// [`RebuiltAfterCorruption`](Self::RebuiltAfterCorruption).
+    SuspectedDataLoss,
 }
 
 /// Structured report describing a recovery open. Surfaced via a `warn!` log and
@@ -190,6 +201,12 @@ pub struct LbugGraphStore {
     pub(crate) buffer_pool_bytes: u64,
     /// Effective max database size (bytes) this store was opened with.
     pub(crate) max_db_bytes: u64,
+    /// #107 empty-read safety gate: set when a store with a material on-disk
+    /// footprint read back empty. A **sealed** store refuses every checkpoint
+    /// (`checkpoint`, the trait method, `do_checkpoint`, auto-checkpoint, and the
+    /// drop checkpoint) so an apparently-empty store can never be upgraded to v41
+    /// — the on-disk bytes are left intact for a prior-engine rollback.
+    pub(crate) sealed: Cell<bool>,
 }
 
 // SAFETY: lbug::Database is internally synchronized (it declares Send + Sync).
@@ -256,14 +273,24 @@ impl LbugGraphStore {
     ) -> crate::Result<(Self, WalRecovery)> {
         Self::prepare_parent(db_path)?;
 
+        // #107 empty-read safety gate — a READ-ONLY peek run *before* any
+        // read-write open. A read-only open cannot checkpoint, upgrade v40→v41,
+        // or rewrite the file (a read-write open mutates the file on drop even
+        // with no writes), so if the peek finds a populated store reading back
+        // empty we seal and return it without ever touching the bytes — the v40
+        // store stays readable by a 0.15.x binary for rollback.
+        if let Some(sealed) = Self::peek_empty_read_gate(db_path, store_id) {
+            return Ok(sealed);
+        }
+
         // 1. Fast path: strict open. A corrupt WAL surfaces as Err (lbug/cxx
         //    converts the C++ replay assertion into a Rust error rather than
         //    aborting); catch_unwind additionally contains any panic.
         match try_open_database(db_path, true) {
-            Ok(db) => Ok((
-                Self::from_parts(db, db_path, store_id),
-                WalRecovery::clean(),
-            )),
+            Ok(db) => {
+                let store = Self::from_parts(db, db_path, store_id);
+                Ok((store, WalRecovery::clean()))
+            }
             Err(strict_err) => {
                 let wal = wal_path_for(db_path);
                 if !wal.exists() {
@@ -452,6 +479,7 @@ impl LbugGraphStore {
             last_checkpoint_error: RefCell::new(None),
             buffer_pool_bytes,
             max_db_bytes,
+            sealed: Cell::new(false),
         }
     }
 
@@ -516,6 +544,17 @@ impl LbugGraphStore {
     /// [`last_checkpoint_error`](Self::last_checkpoint_error) (store-health
     /// signal); a subsequent successful checkpoint clears it.
     pub(crate) fn do_checkpoint(&self) -> crate::Result<()> {
+        // #107: a sealed store (the gate tripped on a suspected empty read) must
+        // never checkpoint — that is exactly the v40→v41 upgrade that would make
+        // an apparently-empty store permanently unreadable by a 0.15.x binary.
+        if self.sealed.get() {
+            return Err(MemoryError::Storage(
+                "store sealed by the #107 empty-read gate; refusing to checkpoint \
+                 (a checkpoint would upgrade an apparently-empty store to v41 and \
+                 make the suspected data loss permanent)"
+                    .to_string(),
+            ));
+        }
         if let Err(e) = self.execute("CHECKPOINT") {
             *self.last_checkpoint_error.borrow_mut() = Some(e.to_string());
             return Err(e);
@@ -577,6 +616,78 @@ impl LbugGraphStore {
             }
         }
         total
+    }
+
+    /// #107 empty-read safety gate — a **read-only peek** run before any
+    /// read-write open (see [`open_with_recovery`](Self::open_with_recovery)).
+    ///
+    /// Decides, *without trusting the suspect read as its own baseline*, whether
+    /// a store is the silent empty-read: it compares the freshly-read node count
+    /// against an **independent on-disk signal**, the committed-footprint probe
+    /// ([`committed_footprint`]). The decision:
+    ///
+    /// | Committed footprint | Node count | Result |
+    /// | --- | --- | --- |
+    /// | `Empty` | anything | `None` — fresh/empty store; proceed to a normal open. |
+    /// | `NonEmpty` | `> 0` | `None` — populated store that read populated; proceed. |
+    /// | `NonEmpty` | `0` (or unreadable) | `Some(sealed, SuspectedDataLoss)` — trip. |
+    ///
+    /// The peek opens **read-only**, so it can never checkpoint, upgrade v40→v41,
+    /// rebuild, or rewrite the file. On a trip it returns a **sealed** store
+    /// (checkpoint refused, auto-checkpoint off, drop checkpoint suppressed) and
+    /// `WalRecoveryOutcome::SuspectedDataLoss`; **nothing is written** and no
+    /// `*.corrupt-*` artifact is created, so the on-disk (v40) bytes stay exactly
+    /// as they are for a prior-engine rollback. A read-only open that fails (e.g.
+    /// a pending WAL needs replay) returns `None` so the normal recovery open
+    /// handles it.
+    fn peek_empty_read_gate(db_path: &Path, store_id: Option<&str>) -> Option<(Self, WalRecovery)> {
+        let bytes = match committed_footprint(db_path) {
+            CommittedFootprint::Empty => return None,
+            CommittedFootprint::NonEmpty { bytes } => bytes,
+        };
+
+        // Open read-only so this peek cannot mutate a single byte of the store.
+        let db = try_open_database_read_only(db_path).ok()?;
+        let store = Self::from_parts(db, db_path, store_id);
+        // The peek handle must never write, whatever happens to it.
+        store.seal();
+
+        // `count_all_nodes` uses unfiltered `count(n)` (it never names `_deleted`)
+        // so it stays trustworthy even when the labeled read path is broken; a
+        // `0` here over a material footprint is the catastrophic catalog-empty
+        // signature. The test seam forces this observation deterministically.
+        let read_count = store.count_all_nodes();
+        let observed_empty = read_count == 0 || force_empty_read_for_test();
+        if !observed_empty {
+            // Healthy: drop the read-only peek (sealed, so its drop writes
+            // nothing) and let the caller do a normal read-write open.
+            return None;
+        }
+
+        warn!(
+            db_path = %db_path.display(),
+            footprint_bytes = bytes,
+            read_count,
+            "lbug_store: #107 empty-read gate TRIPPED — a {bytes}-byte store read back \
+             empty; returning a SEALED, read-only handle (no checkpoint, no v41 upgrade, \
+             no rebuild) so the on-disk bytes stay intact for rollback"
+        );
+        Some((
+            store,
+            WalRecovery {
+                outcome: WalRecoveryOutcome::SuspectedDataLoss,
+                recovered_records: 0,
+                quarantined_wal: None,
+            },
+        ))
+    }
+
+    /// Seal the store after the #107 gate trips: refuse every checkpoint and
+    /// disable count-based auto-checkpoint, so an apparently-empty store can
+    /// never be upgraded to v41 (which would make the loss permanent).
+    pub(crate) fn seal(&self) {
+        self.sealed.set(true);
+        self.checkpoint_interval.set(0);
     }
 
     // -- connection / execution helpers --------------------------------------
@@ -707,6 +818,40 @@ impl LbugGraphStore {
             }
         }
         cols
+    }
+
+    /// `true` if `table`'s on-disk schema carries the soft-delete tombstone
+    /// column ([`DELETED_COL`]).
+    ///
+    /// Consults the node-table column cache populated by
+    /// [`ensure_schema_loaded`](Self::ensure_schema_loaded); for tables absent
+    /// from that cache (e.g. rel tables) it introspects the catalog directly.
+    /// Callers should have run `ensure_schema_loaded` first so the cache — and
+    /// any `_deleted` back-fill — is up to date.
+    pub(crate) fn table_has_deleted_column(&self, table: &str) -> bool {
+        if let Some(cols) = self.node_table_columns.borrow().get(table) {
+            return cols.contains(DELETED_COL);
+        }
+        self.introspect_table_columns(table).contains(DELETED_COL)
+    }
+
+    /// The live-row tombstone predicate ([`not_deleted`]) for a **labeled** read
+    /// of `table`, or `None` when `table`'s schema lacks [`DELETED_COL`].
+    ///
+    /// #107 (silent empty-read): lbug 0.17.1 strictly binds a labeled
+    /// `MATCH (n:Label)` against the table schema, so emitting
+    /// `(n._deleted IS NULL OR n._deleted = '')` against a legacy table that
+    /// predates the soft-delete column is a hard binder error
+    /// (`Cannot find property _deleted`) — which the read helpers swallow to an
+    /// empty result, silently dropping every row over a fully-populated store.
+    /// Gating the predicate on the actual on-disk schema keeps a labeled read
+    /// correct whether or not the back-fill
+    /// ([`ensure_soft_delete_column`](Self::ensure_soft_delete_column)) has added
+    /// the column. (lbug 0.15.4 tolerated the missing property as `NULL`, which
+    /// is why the same store read correctly there.)
+    pub(crate) fn tombstone_filter(&self, table: &str, alias: &str) -> Option<String> {
+        self.table_has_deleted_column(table)
+            .then(|| not_deleted(alias))
     }
 
     /// Ensure the reserved soft-delete tombstone column ([`DELETED_COL`]) exists
@@ -856,6 +1001,14 @@ impl Drop for LbugGraphStore {
     /// without an unbounded WAL to replay. Best-effort and silent on error —
     /// LadybugDB also force-checkpoints on its own drop as a backstop.
     fn drop(&mut self) {
+        // #107: a sealed store must never checkpoint on drop either — that would
+        // upgrade an apparently-empty store to v41 and destroy the rollback path.
+        if self.sealed.get() {
+            debug!(
+                "lbug_store: skipping drop checkpoint — store sealed by the #107 empty-read gate"
+            );
+            return;
+        }
         if let Err(e) = self.execute("CHECKPOINT") {
             debug!("lbug_store: checkpoint on drop failed (engine will retry): {e}");
         }
@@ -887,6 +1040,56 @@ pub(crate) const DELETED_MARK: &str = "1";
 /// ones, and never hides a live row.
 pub(crate) fn not_deleted(alias: &str) -> String {
     format!("({alias}.{DELETED_COL} IS NULL OR {alias}.{DELETED_COL} = '')")
+}
+
+/// On-disk footprint threshold (bytes) below which a store is treated as
+/// fresh/empty by the [`committed_footprint`] probe.
+///
+/// Empirically (lbug 0.17.1, this crate's `SystemConfig`) a checkpointed store
+/// measures ~16 KiB empty (no tables), ~48 KiB with one node, and ~132 KiB with
+/// ten nodes; the live production store is ~31 MB. 32 KiB sits above the
+/// empty/cognitive-empty baseline and below a single-node store, so a genuinely
+/// new store is `Empty` while any store that has ever committed a row is
+/// `NonEmpty`.
+pub(crate) const EMPTY_STORE_FOOTPRINT_THRESHOLD: u64 = 32 * 1024;
+
+/// Independent on-disk evidence of whether a store *should* be populated, used
+/// by the #107 empty-read gate ([`LbugGraphStore::empty_read_gate`]) so the
+/// decision does not rely on the (suspect) catalog read as its own baseline.
+///
+/// It reads the durable database file size — not the catalog rows the bug zeroes
+/// out — so it stays trustworthy even when the read path is broken.
+pub(crate) enum CommittedFootprint {
+    /// No durable evidence of committed data (size at/near the fresh-store
+    /// baseline). A legitimately new or empty store.
+    Empty,
+    /// A material committed footprint (the store was written with real data by a
+    /// previous process).
+    NonEmpty {
+        /// The committed on-disk size in bytes.
+        bytes: u64,
+    },
+}
+
+/// Probe the committed on-disk footprint of the single-file store at `db_path`.
+pub(crate) fn committed_footprint(db_path: &Path) -> CommittedFootprint {
+    let bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+    if bytes > EMPTY_STORE_FOOTPRINT_THRESHOLD {
+        CommittedFootprint::NonEmpty { bytes }
+    } else {
+        CommittedFootprint::Empty
+    }
+}
+
+/// Whether tests have forced the #107 gate to observe the post-open read as
+/// empty (see [`test_seam`]). Always `false` outside tests.
+#[cfg(test)]
+fn force_empty_read_for_test() -> bool {
+    test_seam::force_empty_read()
+}
+#[cfg(not(test))]
+fn force_empty_read_for_test() -> bool {
+    false
 }
 
 /// The system configuration used for every open.
@@ -977,6 +1180,35 @@ fn log_effective_limits_once(buffer_pool: u64, max_db: u64) {
 /// error to a `String`.
 fn open_database(db_path: &Path, strict: bool) -> std::result::Result<Database, String> {
     Database::new(db_path, system_config(strict)).map_err(|e| e.to_string())
+}
+
+/// System configuration for the #107 read-only empty-read peek. Read-only so the
+/// peek cannot mutate the store; auto-checkpoint disabled belt-and-suspenders.
+fn read_only_system_config() -> SystemConfig {
+    let buffer_env = std::env::var(ENV_BUFFER_POOL_BYTES).ok();
+    let max_db_env = std::env::var(ENV_MAX_DB_BYTES).ok();
+    let (buffer_pool, max_db) = effective_limits(buffer_env.as_deref(), max_db_env.as_deref());
+    SystemConfig::default()
+        .max_db_size(max_db)
+        .buffer_pool_size(buffer_pool)
+        .auto_checkpoint(false)
+        .read_only(true)
+        .throw_on_wal_replay_failure(true)
+}
+
+/// Open a [`Database`] **read-only**, containing any panic like
+/// [`try_open_database`]. Used by the #107 empty-read peek so the gate never
+/// mutates the store it is inspecting.
+fn try_open_database_read_only(db_path: &Path) -> std::result::Result<Database, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Database::new(db_path, read_only_system_config()).map_err(|e| e.to_string())
+    })) {
+        Ok(res) => res,
+        Err(panic) => Err(format!(
+            "panic during read-only open: {}",
+            panic_message(panic)
+        )),
+    }
 }
 
 /// Open a [`Database`], additionally containing any panic (a corrupt WAL surfaces
@@ -1289,4 +1521,39 @@ fn open_and_fsync(path: &Path) -> crate::Result<()> {
 
 fn is_not_found(err: &MemoryError) -> bool {
     matches!(err, MemoryError::Storage(reason) if reason.contains("No such file or directory"))
+}
+
+/// Test-only seam for the #107 empty-read safety gate.
+///
+/// Lets a test force the store-open path to *observe* a populated store as if it
+/// had read back empty, so the gate's fail-closed behaviour
+/// ([`WalRecoveryOutcome::SuspectedDataLoss`]) can be exercised deterministically
+/// without depending on a specific broken engine build. The gate (in
+/// `open_with_recovery`) will consult [`test_seam::force_empty_read`] when
+/// deciding whether the post-open node count should be treated as empty.
+///
+/// Defined at the end of the module so it does not trip
+/// `clippy::items_after_test_module` (the lint flags real items declared after an
+/// inline `#[cfg(test)]` module).
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCE_EMPTY_READ: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Force (or stop forcing) the open path to treat the store as read-empty.
+    ///
+    /// Thread-local so a test that flips it does **not** pollute the #107 gate of
+    /// other tests running in parallel (the gate runs on the same thread as the
+    /// `open_with_recovery` call that observes it).
+    pub(crate) fn set_force_empty_read(on: bool) {
+        FORCE_EMPTY_READ.with(|c| c.set(on));
+    }
+
+    /// Whether the open path should treat the post-open read as empty.
+    pub(crate) fn force_empty_read() -> bool {
+        FORCE_EMPTY_READ.with(|c| c.get())
+    }
 }

@@ -1914,3 +1914,369 @@ fn v40_fixture_on_disk_is_v40_and_upgrades_after_checkpoint() {
     let store = LbugGraphStore::open(&db, Some("fixture")).expect("upgraded store must reopen");
     assert_eq!(store.count_all_nodes(), FIXTURE_NODE_COUNT + 1);
 }
+
+// ===========================================================================
+// #107: the "silent empty-read" data-loss bug (RED before fix / GREEN after).
+//
+// ROOT CAUSE (confirmed empirically on a COPY of the real ~/.simard/cognitive
+// v40 store AND reproduced synthetically below): a real v40 store's node tables
+// were written by an older lib whose `CREATE NODE TABLE` did NOT include the
+// `_deleted` tombstone column (it was added in the #99/#100 soft-delete era).
+// Every labeled read in this crate appends `not_deleted("n")` ==
+// `(n._deleted IS NULL OR n._deleted = '')`. lbug 0.17.1 STRICTLY binds a
+// labeled `MATCH (n:Label)` against the table schema, so referencing the absent
+// `_deleted` is a hard `Binder exception: Cannot find property _deleted`. The
+// read helper swallows the error (`Err(_) => Vec::new()`), so the read returns
+// EMPTY with no error surfaced — `get_statistics()` then reports `total = 0`
+// over a fully-populated store. (lbug 0.15.4 tolerated the missing property as
+// NULL, which is why the same store read correctly there.) The bug is therefore
+// a LIB-SIDE binder/schema issue, not an engine catalog-reconstruction bug, and
+// it is scale-independent — it reproduces with a handful of nodes, so no
+// production-scale / git-LFS fixture is required.
+//
+// These tests are named with the `v40_` prefix so the CI "Data-loss gate" step
+// (`cargo test ... graph::lbug_store::tests::v40`) treats them as blocking.
+// ===========================================================================
+
+/// The six cognitive node-type tables that `CognitiveMemory::get_statistics`
+/// sums, with a distinct deterministic seed count each. Mirrors the real store's
+/// catalog shape (multiple node tables) at small scale.
+const LEGACY_STAT_TABLES: &[(&str, usize)] = &[
+    ("SensoryMemory", 3),
+    ("WorkingMemory", 5),
+    ("EpisodicMemory", 11),
+    ("SemanticMemory", 7),
+    ("ProceduralMemory", 2),
+    ("ProspectiveMemory", 4),
+];
+
+/// The agent the legacy rows belong to (matches the live store's `agent_id`).
+const LEGACY_AGENT: &str = "simard";
+
+fn legacy_total() -> usize {
+    LEGACY_STAT_TABLES.iter().map(|(_, n)| n).sum()
+}
+
+/// Seed a store the way a *legacy* (pre-soft-delete) writer did: node tables
+/// created WITHOUT the `_deleted` tombstone column, populated via raw Cypher so
+/// the current lib's column-adding `add_node` path is bypassed. This is the
+/// on-disk shape that triggers #107 under lbug 0.17.1.
+fn seed_legacy_store_without_tombstone(store: &LbugGraphStore) {
+    for (table, n) in LEGACY_STAT_TABLES {
+        store
+            .execute(&format!(
+                "CREATE NODE TABLE IF NOT EXISTS {table}(node_id STRING, agent_id STRING, \
+                 graph_origin STRING, content STRING, PRIMARY KEY(node_id))"
+            ))
+            .unwrap();
+        for i in 0..*n {
+            store
+                .execute(&format!(
+                    "CREATE (n:{table} {{node_id:'{table}_{i}', agent_id:'{LEGACY_AGENT}', \
+                     graph_origin:'cognitive-{LEGACY_AGENT}', content:'c{i}'}})"
+                ))
+                .unwrap();
+        }
+    }
+    // Guard: the seeded tables really lack `_deleted` (otherwise the fixture
+    // would not reproduce #107). A `_deleted`-referencing read must error here.
+    let probe = store.query_rows(&format!(
+        "MATCH (n:EpisodicMemory) WHERE {} RETURN count(n)",
+        super::not_deleted("n")
+    ));
+    assert!(
+        probe.is_err(),
+        "fixture invariant: a legacy table must lack `_deleted` so the \
+         not_deleted filter errors (this is what makes the store read empty)"
+    );
+    store
+        .checkpoint()
+        .expect("seed checkpoint must commit the legacy rows");
+}
+
+/// Tolerant per-type, per-agent node count that does NOT reference `_deleted` —
+/// the count a correct reader yields. Used as the parity baseline so the tests
+/// never hardcode a magic number (see docs: "2813 vs 2831, relative parity").
+fn trusted_agent_stat_count(store: &LbugGraphStore, agent: &str) -> usize {
+    LEGACY_STAT_TABLES
+        .iter()
+        .map(|(table, _)| {
+            store
+                .query_rows(&format!(
+                    "MATCH (n:{table}) WHERE n.agent_id = '{agent}' RETURN count(n)"
+                ))
+                .ok()
+                .and_then(|rows| rows.into_iter().next())
+                .and_then(|row| row.into_iter().next())
+                .map(|v| super::value_as_usize(&v))
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// #107 REGRESSION (store level). A legacy store whose node tables predate the
+/// `_deleted` column must read back EVERY item through the lib's labeled,
+/// `_deleted`-filtered read path — never silently empty.
+///
+/// RED on the current code (lbug 0.17.1 binder-errors on the missing `_deleted`
+/// column and the lib swallows it to an empty Vec, so each `query_nodes` reads
+/// 0). GREEN once the read path tolerates a missing tombstone column.
+#[test]
+fn v40_legacy_store_missing_tombstone_column_reads_all_items() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("graph.ladybug");
+    let store = LbugGraphStore::open(&db, Some(LEGACY_AGENT)).unwrap();
+    seed_legacy_store_without_tombstone(&store);
+
+    // Control: the rows are physically present (unfiltered `count(n)`, which
+    // never references `_deleted`, already reads them today).
+    assert_eq!(
+        store.count_all_nodes(),
+        legacy_total(),
+        "control: every legacy row must be physically present on disk"
+    );
+
+    // The actual bug surface: the labeled, filtered read path.
+    let filter = props(&[("agent_id", LEGACY_AGENT)]);
+    let mut filtered_total = 0usize;
+    for (table, expected) in LEGACY_STAT_TABLES {
+        let got = store.query_nodes(table, Some(&filter), usize::MAX).len();
+        assert_eq!(
+            got, *expected,
+            "#107: query_nodes({table}) read {got}, expected {expected} — a legacy \
+             table without `_deleted` must not read empty"
+        );
+        filtered_total += got;
+    }
+    assert_eq!(
+        filtered_total,
+        legacy_total(),
+        "#107: the filtered read path must preserve every item"
+    );
+}
+
+/// #107 REGRESSION (cognitive / public-API level). Reproduces the exact reported
+/// symptom — `CognitiveMemory::get_statistics().total == 0` over a populated
+/// store — deterministically and without the real store.
+///
+/// RED on the current code (total reads 0); GREEN once the read path tolerates a
+/// missing tombstone column.
+#[test]
+fn v40_legacy_store_cognitive_statistics_reports_full_total() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("cognitive");
+    {
+        let store = LbugGraphStore::open(&db, Some(LEGACY_AGENT)).unwrap();
+        seed_legacy_store_without_tombstone(&store);
+        // dropping the store checkpoints + closes, leaving a clean db file
+    }
+
+    let cm = crate::CognitiveMemory::open_persistent(&db, LEGACY_AGENT)
+        .expect("a populated legacy store must open");
+    let stats = cm.get_statistics();
+    let total = stats.get("total").copied().unwrap_or(0);
+    assert_eq!(
+        total,
+        legacy_total(),
+        "#107: get_statistics().total read {total}, expected {} — the silent \
+         empty-read reproduced end-to-end through the public API",
+        legacy_total()
+    );
+}
+
+/// #107 REGRESSION (production-scale, empirical). Opens a COPY of a real v40
+/// store and asserts the lib read path matches a tolerant trusted baseline.
+///
+/// Env-gated: set `AMPLIHACK_V40_REAL_STORE_COPY` to the path of a *copy* of a
+/// real v40 store (e.g. `cp -a ~/.simard/cognitive.v40.bak /tmp/x/cognitive`);
+/// NEVER point it at the live store. Skipped (passes trivially) when unset, so
+/// CI — which has no real store — is unaffected; the synthetic tests above are
+/// the deterministic CI guards. RED on the current code (lib path reads 0).
+#[test]
+fn v40_real_store_parity_preserves_all_items() {
+    let src = match std::env::var("AMPLIHACK_V40_REAL_STORE_COPY") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!(
+                "skipping v40_real_store_parity_preserves_all_items: set \
+                 AMPLIHACK_V40_REAL_STORE_COPY to a COPY of a real v40 store"
+            );
+            return;
+        }
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("cognitive");
+    fs::copy(&src, &db).expect("copy the real store — never open the original");
+
+    let (store, _report) =
+        LbugGraphStore::open_with_recovery(&db, Some(LEGACY_AGENT)).expect("real store must open");
+
+    // Trusted baseline: tolerant counts that do not reference `_deleted`.
+    let trusted = trusted_agent_stat_count(&store, LEGACY_AGENT);
+    assert!(
+        trusted > 0,
+        "the real store must be populated; trusted baseline was 0 (wrong store?)"
+    );
+
+    // The lib's labeled, filtered read path must match the trusted baseline.
+    let filter = props(&[("agent_id", LEGACY_AGENT)]);
+    let actual: usize = LEGACY_STAT_TABLES
+        .iter()
+        .map(|(table, _)| store.query_nodes(table, Some(&filter), usize::MAX).len())
+        .sum();
+    assert_eq!(
+        actual, trusted,
+        "#107 (real store): the lib read path returned {actual}, trusted baseline \
+         was {trusted}; 0 here is the silent empty-read that would let a daemon \
+         checkpoint an apparently-empty store and destroy memory"
+    );
+}
+
+/// #107 SAFETY GATE (defense-in-depth, engine-independent). A store with a
+/// material on-disk footprint that reads back empty must trip
+/// `WalRecoveryOutcome::SuspectedDataLoss`: the returned store is SEALED
+/// (`checkpoint()` is refused so it can never be upgraded to v41 while empty),
+/// no quarantine artifact is written, and the on-disk bytes are untouched so a
+/// prior-engine rollback stays possible.
+///
+/// Uses the `test_seam` to force the open path to observe an empty read without
+/// depending on a specific broken engine build. RED until the gate is wired into
+/// `open_with_recovery` (the implementation step).
+#[test]
+fn v40_empty_read_gate_trips_and_seals_without_checkpoint() {
+    use super::test_seam::{force_empty_read, set_force_empty_read};
+
+    // The seam round-trips (and is exercised here so it is never dead code).
+    set_force_empty_read(true);
+    assert!(
+        force_empty_read(),
+        "force-empty seam must report the forced state"
+    );
+
+    // A populated, healthy, checkpointed store with a material footprint.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("graph.ladybug");
+    {
+        let mut store = LbugGraphStore::open(&db, Some("gate")).unwrap();
+        for i in 0..10 {
+            let id = format!("g{i}");
+            store
+                .add_node(
+                    "Fact",
+                    props(&[("node_id", &id), ("agent_id", "gate")]),
+                    Some(&id),
+                )
+                .unwrap();
+        }
+        store.checkpoint().unwrap();
+        store.close();
+    }
+    let before = fs::read(&db).expect("read seeded store bytes");
+
+    // Force the open path to observe the populated store as read-empty.
+    set_force_empty_read(true);
+    let (store, report) =
+        LbugGraphStore::open_with_recovery(&db, Some("gate")).expect("open must not error");
+    set_force_empty_read(false);
+
+    assert_eq!(
+        report.outcome,
+        WalRecoveryOutcome::SuspectedDataLoss,
+        "#107 gate: a populated store that reads empty must trip SuspectedDataLoss, \
+         got {:?}",
+        report.outcome
+    );
+    assert!(
+        report.recovered(),
+        "#107 gate: SuspectedDataLoss must count as a non-Clean recovery outcome"
+    );
+
+    // The store must be SEALED: a checkpoint would upgrade an apparently-empty
+    // store to v41 and make the loss permanent, so it must be refused.
+    assert!(
+        store.checkpoint().is_err(),
+        "#107 gate: a tripped store must refuse checkpoint (no silent v41 upgrade)"
+    );
+
+    // Nothing was written: bytes byte-identical, no `*.corrupt-*` artifact.
+    drop(store);
+    let after = fs::read(&db).expect("read store bytes after gated open");
+    assert_eq!(
+        before, after,
+        "#107 gate: the on-disk store must be byte-identical (no checkpoint, \
+         no upgrade, no rebuild)"
+    );
+    let stray: Vec<String> = fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".corrupt-"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "#107 gate: no quarantine artifact may be written, found {stray:?}"
+    );
+}
+
+/// #107 FAIL-CLOSED (public entry point). When the empty-read gate trips, the
+/// recommended entry point `CognitiveMemory::open_persistent` must return a hard
+/// `MemoryError::SuspectedDataLoss` carrying the on-disk footprint and the empty
+/// read count — never a usable (empty) handle a consumer could checkpoint.
+#[test]
+fn v40_open_persistent_fails_closed_on_empty_read() {
+    use super::test_seam::set_force_empty_read;
+
+    // A populated, healthy, checkpointed store with a material footprint.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("cognitive");
+    {
+        let mut store = LbugGraphStore::open(&db, Some("cognitive-gate")).unwrap();
+        for i in 0..10 {
+            let id = format!("g{i}");
+            store
+                .add_node(
+                    "Fact",
+                    props(&[("node_id", &id), ("agent_id", "gate")]),
+                    Some(&id),
+                )
+                .unwrap();
+        }
+        store.checkpoint().unwrap();
+        store.close();
+    }
+    let before = fs::read(&db).expect("read seeded store bytes");
+
+    // Force the open path to observe the populated store as read-empty, then open
+    // through the public entry point.
+    set_force_empty_read(true);
+    let result = crate::CognitiveMemory::open_persistent(&db, "gate");
+    set_force_empty_read(false);
+
+    match result {
+        Err(crate::MemoryError::SuspectedDataLoss {
+            footprint_bytes,
+            read_count,
+        }) => {
+            assert!(
+                footprint_bytes > 0,
+                "#107 fail-closed: footprint must be surfaced, got {footprint_bytes}"
+            );
+            assert_eq!(
+                read_count, 0,
+                "#107 fail-closed: the suspect (empty) read count must be surfaced"
+            );
+        }
+        Ok(_) => panic!(
+            "#107 fail-closed: open_persistent must NOT return a usable handle over an \
+             apparently-empty populated store"
+        ),
+        Err(other) => panic!("#107 fail-closed: expected SuspectedDataLoss, got {other:?}"),
+    }
+
+    // The store was left intact (no checkpoint, no v41 upgrade, no rebuild).
+    let after = fs::read(&db).expect("read store bytes after fail-closed open");
+    assert_eq!(
+        before, after,
+        "#107 fail-closed: the on-disk store must be byte-identical"
+    );
+}

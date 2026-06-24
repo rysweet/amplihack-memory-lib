@@ -147,8 +147,18 @@ impl LbugGraphStore {
         limit: usize,
     ) -> Vec<GraphNode> {
         let mut parts = where_parts.to_vec();
-        parts.push(not_deleted("n"));
-        let where_clause = format!(" WHERE {}", parts.join(" AND "));
+        // #107: only filter tombstones when the table actually carries the
+        // `_deleted` column. A legacy table that predates soft-delete would make
+        // lbug 0.17.1 binder-error on the missing property, and the swallowed
+        // error would silently read the populated store back as empty.
+        if let Some(filter) = self.tombstone_filter(node_type, "n") {
+            parts.push(filter);
+        }
+        let where_clause = if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", parts.join(" AND "))
+        };
         let cypher = format!(
             "MATCH (n:{node_type}){where_clause} RETURN n{}",
             limit_clause(limit)
@@ -163,10 +173,13 @@ impl LbugGraphStore {
         if !is_valid_identifier(table) {
             return None;
         }
+        let mut where_parts = vec![format!("n.node_id = '{}'", escape_cypher(node_id))];
+        if let Some(filter) = self.tombstone_filter(table, "n") {
+            where_parts.push(filter);
+        }
         let cypher = format!(
-            "MATCH (n:{table}) WHERE n.node_id = '{}' AND {} RETURN n LIMIT 1",
-            escape_cypher(node_id),
-            not_deleted("n")
+            "MATCH (n:{table}) WHERE {} RETURN n LIMIT 1",
+            where_parts.join(" AND ")
         );
         let rows = self.query_rows(&cypher).ok()?;
         self.collect_nodes(rows, table).into_iter().next()
@@ -231,17 +244,30 @@ impl LbugGraphStore {
     ) -> Vec<(GraphEdge, GraphNode)> {
         let lc = limit_clause(limit);
         let escaped = escape_cypher(node_id);
+        // #107: gate the labeled rel tombstone filter on the rel table actually
+        // carrying `_deleted` (a legacy rel table without it would binder-error
+        // under lbug 0.17.1 and silently read zero edges). The `a`/`b` endpoints
+        // are unlabeled, which lbug binds leniently, so their filter stays.
+        let r_filter = self.tombstone_filter(rel_type, "r");
         let cypher = if direction == "outgoing" {
+            let mut wp = vec![format!("a.node_id = '{escaped}'")];
+            if let Some(f) = &r_filter {
+                wp.push(f.clone());
+            }
+            wp.push(not_deleted("b"));
             format!(
-                "MATCH (a)-[r:{rel_type}]->(b) WHERE a.node_id = '{escaped}' AND {} AND {} RETURN r, b{lc}",
-                not_deleted("r"),
-                not_deleted("b")
+                "MATCH (a)-[r:{rel_type}]->(b) WHERE {} RETURN r, b{lc}",
+                wp.join(" AND ")
             )
         } else {
+            let mut wp = vec![format!("b.node_id = '{escaped}'")];
+            if let Some(f) = &r_filter {
+                wp.push(f.clone());
+            }
+            wp.push(not_deleted("a"));
             format!(
-                "MATCH (a)-[r:{rel_type}]->(b) WHERE b.node_id = '{escaped}' AND {} AND {} RETURN r, a{lc}",
-                not_deleted("r"),
-                not_deleted("a")
+                "MATCH (a)-[r:{rel_type}]->(b) WHERE {} RETURN r, a{lc}",
+                wp.join(" AND ")
             )
         };
 
@@ -474,6 +500,10 @@ impl GraphStore for LbugGraphStore {
         if !is_valid_identifier(node_type) {
             return Vec::new();
         }
+        // #107: populate the column cache from the on-disk catalog (and back-fill
+        // a missing `_deleted` column) before the labeled, tombstone-filtered
+        // read so a legacy store does not read back empty.
+        self.ensure_schema_loaded();
         let _guard = self.acquire_lock();
 
         let mut where_parts: Vec<String> = Vec::new();
@@ -499,6 +529,9 @@ impl GraphStore for LbugGraphStore {
                 return Vec::new();
             }
         }
+        // #107: same as query_nodes — load the schema (and back-fill `_deleted`)
+        // so the labeled, tombstone-filtered read does not silently read empty.
+        self.ensure_schema_loaded();
         let _guard = self.acquire_lock();
 
         let mut where_parts: Vec<String> = Vec::new();
