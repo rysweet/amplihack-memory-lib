@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::backends::base::MemoryBackend;
     use crate::backends::sqlite_backend::{escape_fts5_query, SqliteBackend};

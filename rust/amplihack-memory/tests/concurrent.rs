@@ -494,7 +494,7 @@ fn test_concurrent_sqlite_backend() {
     let b = backend.lock().unwrap();
     let stats = b.get_statistics().unwrap();
     assert_eq!(
-        stats.total_experiences as usize,
+        stats.total_experiences,
         threads * ops,
         "expected {} total experiences, got {}",
         threads * ops,
