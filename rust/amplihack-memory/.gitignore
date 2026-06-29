@@ -1,2 +1,5 @@
 /target/
-Cargo.lock
+# Cargo.lock is intentionally committed (overriding the library-crate default):
+# the CI supply-chain gate (cargo-audit + cargo-deny) must audit a deterministic
+# dependency graph, so the resolved versions are pinned here for reproducible,
+# auditable builds.

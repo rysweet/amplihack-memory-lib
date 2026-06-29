@@ -4,14 +4,17 @@ on:
   push:
     branches: [main]
 
-permissions:
-  contents: write
+# Least-privilege default; the tag job opts into contents: write below
+# because it pushes a new release tag to the repository.
+permissions: {}
 
 jobs:
   tag:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
