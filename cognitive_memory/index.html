@@ -18,14 +18,14 @@
         <link rel="prev" href="../hierarchical_memory/">
       
       
-        <link rel="next" href="../kuzu_backend/">
+        <link rel="next" href="../fact_lifecycle/">
       
       
         
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.3">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
       
@@ -507,6 +507,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Statistics">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#fail-closed-statistics-rust" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fail-closed statistics (Rust)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -524,6 +541,33 @@
   
 </nav>
       
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../fact_lifecycle/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fact Lifecycle (Dedup/Supersession/Retention)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
     </li>
   
 
@@ -737,6 +781,23 @@
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Statistics">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#fail-closed-statistics-rust" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fail-closed statistics (Rust)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -1026,6 +1087,7 @@
 <li>Confidence scoring</li>
 <li>Tags and metadata</li>
 <li>Source provenance tracking</li>
+<li>Lifecycle management: deduplication, supersession, and retention (see <a href="../fact_lifecycle/">Fact Lifecycle</a>)</li>
 </ul>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># Store a fact</span>
 </span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="n">fid</span> <span class="o">=</span> <span class="n">cog</span><span class="o">.</span><span class="n">store_fact</span><span class="p">(</span>
@@ -1093,8 +1155,52 @@
 <td><code>datetime</code></td>
 <td>Creation time</td>
 </tr>
+<tr>
+<td><code>importance</code></td>
+<td><code>float</code></td>
+<td>Retention weight (defaults to <code>confidence</code>)</td>
+</tr>
+<tr>
+<td><code>usage_count</code></td>
+<td><code>int</code></td>
+<td>Times reused via dedup (default <code>0</code>)</td>
+</tr>
+<tr>
+<td><code>last_accessed_at</code></td>
+<td><code>datetime \| None</code></td>
+<td>Last dedup reuse time (default <code>None</code>)</td>
+</tr>
+<tr>
+<td><code>expires_at</code></td>
+<td><code>datetime \| None</code></td>
+<td>Optional absolute expiry (default <code>None</code>)</td>
+</tr>
+<tr>
+<td><code>archived</code></td>
+<td><code>bool</code></td>
+<td>Soft-deleted flag set on supersession or a retention pass; still returned by <code>get_all_facts</code> with <code>archived = true</code> until a later prune deletes it (default <code>False</code>)</td>
+</tr>
+<tr>
+<td><code>superseded_by</code></td>
+<td><code>str \| None</code></td>
+<td><code>node_id</code> of the replacing fact (default <code>None</code>)</td>
+</tr>
+<tr>
+<td><code>content_hash</code></td>
+<td><code>str</code></td>
+<td>Hex SHA-256 of <code>concept</code> + <code>content</code></td>
+</tr>
+<tr>
+<td><code>dedup_key</code></td>
+<td><code>str \| None</code></td>
+<td>Caller-supplied dedup identity (default <code>None</code>)</td>
+</tr>
 </tbody>
 </table>
+<p>The eight fields after <code>created_at</code> are additive and backward compatible: facts
+written by earlier versions default-populate them on read. See
+<a href="../fact_lifecycle/">Fact Lifecycle</a> for deduplication (<code>upsert_fact</code>),
+supersession (<code>supersede_fact</code>), and pruning (<code>prune_semantic_memory</code>).</p>
 <hr />
 <h3 id="5-procedural-memory">5. Procedural Memory<a class="headerlink" href="#5-procedural-memory" title="Permanent link">&para;</a></h3>
 <p><strong>Purpose:</strong> Reusable step-by-step procedures with usage tracking.</p>
@@ -1245,6 +1351,38 @@
 </span><span id="__span-7-9"><a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="c1">#     &quot;total&quot;: 193,</span>
 </span><span id="__span-7-10"><a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a><span class="c1"># }</span>
 </span></code></pre></div>
+<h3 id="fail-closed-statistics-rust">Fail-closed statistics (Rust)<a class="headerlink" href="#fail-closed-statistics-rust" title="Permanent link">&para;</a></h3>
+<p><code>get_statistics</code> / <code>get_memory_stats</code> count each memory type through the
+infallible <code>GraphStore::query_nodes</code>, which <strong>swallows a backend read error as
+an empty result</strong>. A transient read failure therefore surfaces as an
+indistinguishable all-zeros <code>Ok(...)</code> — a genuinely-empty store and a
+momentarily-unreadable one look identical.</p>
+<p>The Rust API adds fail-closed counterparts for callers that must tell those two
+cases apart (e.g. an auto-restore that would duplicate memories if it re-imported
+a snapshot over transiently-unreadable data — Simard #2561):</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Returns</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CognitiveMemory::try_get_memory_stats</code> / <code>try_get_statistics</code></td>
+<td><code>Result&lt;HashMap&lt;String, usize&gt;&gt;</code></td>
+<td>Counts per type + total; a real read error propagates as <code>Err</code>, a genuinely-empty store returns <code>Ok</code> with every count <code>0</code>.</td>
+</tr>
+<tr>
+<td><code>GraphStore::try_count_nodes</code></td>
+<td><code>Result&lt;usize&gt;</code></td>
+<td>Fallible per-type count. Default forwards to <code>query_nodes().len()</code>; the durable LadybugDB backend fails closed on a real read error, a sealed (#107 empty-read gate) store, or an unreadable catalog, while still reporting a genuinely-absent table as a confirmed <code>Ok(0)</code>.</td>
+</tr>
+</tbody>
+</table>
+<p>These are additive Rust-only surfaces; the Python bindings and the existing
+infallible methods are unchanged.</p>
 <hr />
 <h2 id="lifecycle">Lifecycle<a class="headerlink" href="#lifecycle" title="Permanent link">&para;</a></h2>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="c1"># Create</span>
