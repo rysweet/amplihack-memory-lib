@@ -545,15 +545,22 @@ impl LbugGraphStore {
     /// stripped ([`salvage_props`]) so `add_node`/`add_edge` re-derive them (the id
     /// is passed explicitly and `graph_origin` becomes this store's id). A row that
     /// fails to reload is logged rather than aborting the whole salvage.
-    pub(crate) fn reload_graph(&mut self, dump: &GraphDump) -> usize {
-        let mut reloaded = 0usize;
+    /// Reload a [`GraphDump`] into this (fresh) store, recreating every node and
+    /// then every edge. Returns `(nodes_reloaded, edges_reloaded)`. Reserved
+    /// columns are stripped ([`salvage_props`]) so `add_node`/`add_edge` re-derive
+    /// them (the id is passed explicitly and `graph_origin` becomes this store's
+    /// id). A row that fails to reload is logged rather than aborting the whole
+    /// salvage — the caller compares the returned counts against the dump to
+    /// surface any partial reload.
+    pub(crate) fn reload_graph(&mut self, dump: &GraphDump) -> (usize, usize) {
+        let mut nodes_reloaded = 0usize;
         for node in &dump.nodes {
             match self.add_node(
                 &node.node_type,
                 salvage_props(&node.properties),
                 Some(&node.node_id),
             ) {
-                Ok(_) => reloaded += 1,
+                Ok(_) => nodes_reloaded += 1,
                 Err(e) => warn!(
                     node_id = %node.node_id,
                     node_type = %node.node_type,
@@ -562,23 +569,25 @@ impl LbugGraphStore {
                 ),
             }
         }
+        let mut edges_reloaded = 0usize;
         for edge in &dump.edges {
-            if let Err(e) = self.add_edge(
+            match self.add_edge(
                 &edge.source_id,
                 &edge.target_id,
                 &edge.edge_type,
                 Some(salvage_props(&edge.properties)),
             ) {
-                warn!(
+                Ok(_) => edges_reloaded += 1,
+                Err(e) => warn!(
                     source = %edge.source_id,
                     target = %edge.target_id,
                     edge_type = %edge.edge_type,
                     error = %e,
                     "lbug_store: failed to reload a salvaged edge"
-                );
+                ),
             }
         }
-        reloaded
+        (nodes_reloaded, edges_reloaded)
     }
 
     /// Salvage a recovered graph into a fresh, clean database.
@@ -606,12 +615,13 @@ impl LbugGraphStore {
         prior_quarantine: Option<PathBuf>,
     ) -> crate::Result<(Self, WalRecovery)> {
         let dumped_nodes = dump.nodes.len();
+        let dumped_edges = dump.edges.len();
         let quarantine = quarantine_path(db_path);
         let moved = quarantine_db_artifacts(db_path, &quarantine)?;
 
         // Load the salvaged graph into a fresh database, then drop it so its clean
         // WAL is flushed before we re-open to verify durability.
-        let reloaded = {
+        let (nodes_reloaded, edges_reloaded) = {
             let db = open_database(db_path, true).map_err(|e| {
                 MemoryError::Storage(format!(
                     "failed to open a fresh LadybugDB at {} while salvaging a recovered graph: {e}",
@@ -619,16 +629,7 @@ impl LbugGraphStore {
                 ))
             })?;
             let mut store = Self::from_parts(db, db_path, store_id);
-            let reloaded = store.reload_graph(&dump);
-            if reloaded < dumped_nodes {
-                warn!(
-                    db_path = %db_path.display(),
-                    dumped_nodes,
-                    reloaded,
-                    "lbug_store: salvage reload persisted fewer nodes than were dumped — \
-                     some records could not be reloaded (see per-record warnings above)"
-                );
-            }
+            let counts = store.reload_graph(&dump);
             // A fresh database has no corrupt WAL, so this checkpoint folds the
             // reload into the main file. Even if it fails, the reload is in the
             // fresh, clean WAL (flushed on the drop below) and replays cleanly on
@@ -641,7 +642,7 @@ impl LbugGraphStore {
                      fresh clean WAL and will be verified by the strict reopen below"
                 );
             }
-            reloaded
+            counts
         };
 
         // Verify durability the same way a later process would see it: a strict
@@ -655,22 +656,30 @@ impl LbugGraphStore {
         let store = Self::from_parts(db, db_path, store_id);
         let survived = store.count_all_nodes();
         let quarantined = moved.or(prior_quarantine);
-        if survived < dumped_nodes {
+        // `recovered_records` is the honest, strict-reopen-verified node count.
+        // A partial reload (nodes or edges) is preserved for availability but
+        // surfaced at error level with the expected vs surviving counts, never
+        // silently reported as a complete recovery.
+        if survived < dumped_nodes || edges_reloaded < dumped_edges {
             tracing::error!(
                 db_path = %db_path.display(),
                 dumped_nodes,
-                reloaded,
+                dumped_edges,
+                nodes_reloaded,
+                edges_reloaded,
                 survived,
                 quarantined = ?quarantined,
-                "lbug_store: salvage persisted fewer records than were recovered; the corrupt \
-                 original is preserved at the quarantine path for offline recovery"
+                "lbug_store: salvage recovered fewer records than were dumped (partial recovery); \
+                 the durable survivors are kept and the corrupt original is preserved at the \
+                 quarantine path for offline recovery of the remainder"
             );
         } else {
             warn!(
                 db_path = %db_path.display(),
                 recovered_records = survived,
                 dumped_nodes,
-                reloaded,
+                dumped_edges,
+                edges_reloaded,
                 quarantined = ?quarantined,
                 "lbug_store: salvaged the recovered graph into a fresh database after a failed \
                  checkpoint-after-recovery; the pre-corruption prefix is durable (verified by \
