@@ -223,13 +223,20 @@ open_with_recovery(db_path)
 │      ├─ 3. copy WAL aside (preserve the incident artifact first)
 │      │
 │      ├─ 4. resilient open (replay good prefix, ignore unreplayable tail)
-│      │     └─ Ok ─► checkpoint the prefix into the main DB ─► RecoveredPrefix
+│      │     └─ Ok ─► checkpoint the prefix into the main DB
+│      │              ├─ checkpoint Ok ......................► RecoveredPrefix
+│      │              └─ checkpoint FAILED (#2550) ─► salvage the recovered
+│      │                 graph into a FRESH database (dump → quarantine the
+│      │                 un-checkpointable original → reload → checkpoint) so the
+│      │                 prefix is durable ..................► RecoveredPrefix
 │      │
 │      ├─ 5. resilient open failed -> move WAL fully aside, retry strict
 │      │     └─ Ok ─► open from last good checkpoint only ─► CheckpointOnly
 │      │
 │      └─ 6. STILL failing with the WAL gone -> the catalog itself is corrupt
-│            └─ rebuild_after_corruption ─► RebuiltAfterCorruption
+│            └─ rebuild_after_corruption
+│               ├─ read-only salvage yields records (#2550) ► RecoveredPrefix
+│               └─ nothing readable ......................► RebuiltAfterCorruption
 │
 └─ only returns Err if even a FRESH empty database cannot be created
    (e.g. the parent directory is unwritable)
@@ -240,6 +247,24 @@ The crucial #95 change is the two paths into **`rebuild_after_corruption`**
 step 6 had no fallback, so a corrupt catalog propagated an error and crash-looped
 the consumer. Now both route through quarantine-and-rebuild, so a corrupt catalog
 self-heals whether or not a WAL was present.
+
+The **#2550** change closes a durable-recall data-loss gap on the *recovery*
+path itself. The verified incident: a WAL recovered its good prefix (step 4) but
+the checkpoint that folds the prefix into the main DB file **failed**, so the
+recovered records lived only in the now-quarantined WAL; a later open then read
+the pre-recovery (near-empty) main file and reset the store to empty —
+permanently dropping tens of thousands of memories. The fix makes recovery
+**durable-or-salvaged**: a failed checkpoint-after-recovery no longer returns a
+store whose records are not persisted. Instead the recovered graph (captured
+while the resilient handle is still open) is reloaded into a fresh, clean
+database — where a checkpoint succeeds — and the un-checkpointable original is
+quarantined (moved aside, never deleted). `rebuild_after_corruption` likewise now
+attempts a **read-only salvage** of any still-readable records before resetting to
+empty, so a store that still holds recoverable records is never reset. Both paths
+report `RecoveredPrefix` with the surviving record count, and the survivors are
+durable across a subsequent strict reopen (asserted by
+`recovery_is_durable_when_checkpoint_after_recovery_fails` and
+`open_with_recovery_preserves_every_precorruption_record`).
 
 The **#107** change (**landed**, step 0 in the diagram above) is the **empty-read
 gate run as a read-only peek *before* the read-write open**. A silent empty read
@@ -366,9 +391,9 @@ emits **no node properties** — no memory content is logged.
 | Variant | Meaning | `recovered_records` | `quarantined_wal` |
 | --- | --- | --- | --- |
 | `Clean` | WAL replayed cleanly (or no recovery needed) **and the #107 empty-read gate passed**. No artifact written, no warning. | `0` | `None` |
-| `RecoveredPrefix` | A corrupt WAL tail was quarantined; the good prefix was replayed and checkpointed into the main DB. | nodes after replay | `Some(<wal>.corrupt-<ts>)` |
+| `RecoveredPrefix` | A corrupt WAL tail was quarantined and the good prefix replayed. The prefix is folded into the main DB by a checkpoint; if that checkpoint **fails** (#2550), the recovered graph is instead salvaged into a fresh database so it is still durable. Also reported when a corrupt catalog's still-readable records are salvaged via a read-only open (#2550). | nodes after recovery/salvage | `Some(<wal>.corrupt-<ts>)` or, when salvaged into a fresh DB, `Some(<db_path>.corrupt-<ts>)` |
 | `CheckpointOnly` | The WAL was unusable even in resilient mode; it was quarantined and the store opened from the last good checkpoint only. | nodes at last checkpoint | `Some(<wal>.corrupt-<ts>)` |
-| `RebuiltAfterCorruption` | The catalog / main DB itself was corrupt and unopenable even with the WAL gone (the #95 mode). The whole database was quarantined and a **fresh empty** database opened. | **`0`** | `Some(<db_path>.corrupt-<ts>)` |
+| `RebuiltAfterCorruption` | The catalog / main DB itself was corrupt and unopenable even with the WAL gone (the #95 mode) **and** no records could be salvaged via a read-only open. The whole database was quarantined and a **fresh empty** database opened. | **`0`** | `Some(<db_path>.corrupt-<ts>)` |
 | `SuspectedDataLoss` *(#107, landed)* | A materially-populated on-disk footprint read back **empty** (caught by the read-only peek). The store is **sealed** (refuses to checkpoint), **nothing is written or quarantined**, and the bytes are left intact for rollback. | **`0`** | `None` |
 
 All five variants are implemented today.

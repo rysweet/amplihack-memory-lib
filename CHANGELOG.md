@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Critical durable-recall data loss on WAL recovery (#2550, Simard #2550):**
+  `LbugGraphStore::open_with_recovery` could permanently drop tens of thousands of
+  recovered memories. On a corrupt-WAL open it replayed the good prefix and
+  attempted a `CHECKPOINT` to fold it into the main DB file — but if that
+  checkpoint-after-recovery **failed** (the verified incident: "cannot open
+  `cognitive.wal(.checkpoint)` / error removing `cognitive.wal`"), the error was
+  swallowed and the recovered records lived only in the now-quarantined WAL. A
+  later open then read the pre-recovery (near-empty) main file and **reset the
+  store to empty** — with no restore path. **Fix — durable-or-salvaged recovery:**
+  a failed checkpoint-after-recovery no longer returns a store whose records are
+  not persisted. The recovered graph is captured (dumped) while the resilient
+  handle is still open and **salvaged into a fresh, clean database** (quarantine
+  the un-checkpointable original → reload nodes+edges → checkpoint), where the
+  checkpoint succeeds, so the pre-corruption prefix is durable across a strict
+  reopen. `rebuild_after_corruption` likewise now attempts a **read-only salvage**
+  of any still-readable records before resetting to empty, so a store that still
+  holds recoverable records is never reset. Both paths report `RecoveredPrefix`
+  with the surviving count. New hermetic regressions (no sleeps/network):
+  `open_with_recovery_preserves_every_precorruption_record` (a corrupt WAL tail is
+  recovered without an assertion/crash and every pre-corruption record survives +
+  is durable) and `recovery_is_durable_when_checkpoint_after_recovery_fails` (the
+  incident: a forced checkpoint-after-recovery failure salvages rather than resets
+  to empty, durable across reopen). Added as a blocking CI data-loss gate.
 - **Critical CSR corruption / native crash (#100):** the persistent store
   (`LbugGraphStore`) still `SIGSEGV`-crashed the consumer daemon during
   retention/dedup consolidation even after the #98/#99 `DETACH`-avoidance work.
