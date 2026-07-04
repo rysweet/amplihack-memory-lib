@@ -6,8 +6,8 @@ use lbug::Value;
 use tracing::warn;
 
 use super::{
-    escape_cypher, is_valid_identifier, not_deleted, validate_identifier, value_to_string,
-    LbugGraphStore, DELETED_COL, DELETED_MARK,
+    escape_cypher, is_valid_identifier, not_deleted, table_row_name_and_type, validate_identifier,
+    value_as_usize, value_to_string, LbugGraphStore, DELETED_COL, DELETED_MARK,
 };
 use crate::graph::protocol::GraphStore;
 use crate::graph::traversal::bfs_traverse;
@@ -167,6 +167,24 @@ impl LbugGraphStore {
             Ok(rows) => self.collect_nodes(rows, node_type),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// `Ok(true)` if `node_type` is a NODE table in the on-disk catalog,
+    /// **propagating** a catalog-read failure as `Err` (#2561).
+    ///
+    /// Used by [`try_count_nodes`](Self::try_count_nodes) to distinguish a
+    /// genuinely-absent table (confirmed empty) from an unreadable catalog: the
+    /// latter must fail closed, never be reported as "table absent".
+    fn table_is_node_table(&self, node_type: &str) -> crate::Result<bool> {
+        let rows = self.query_rows("CALL show_tables() RETURN *")?;
+        for row in rows {
+            if let Some((name, ttype)) = table_row_name_and_type(&row) {
+                if name == node_type && ttype.to_ascii_uppercase().contains("NODE") {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn get_node_from_table(&self, node_id: &str, table: &str) -> Option<GraphNode> {
@@ -511,6 +529,67 @@ impl GraphStore for LbugGraphStore {
             return Vec::new();
         }
         self.match_return_nodes(node_type, &where_parts, limit)
+    }
+
+    /// Error-propagating node count (#2561).
+    ///
+    /// Unlike [`query_nodes`](Self::query_nodes) / [`match_return_nodes`], which
+    /// swallow a query failure to an empty result, this **surfaces** a read
+    /// failure as `Err` so a consumer that self-heals an empty store can fail
+    /// closed instead of mistaking a transient read error for a genuinely empty
+    /// store (issue #2561, follow-up to #2550/#107).
+    ///
+    /// A node table that does not physically exist holds zero rows — a
+    /// *confirmed-empty* type — and yields `Ok(0)`. Crucially, that absence is
+    /// verified through an **error-propagating** catalog read
+    /// ([`table_is_node_table`](Self::table_is_node_table)): a failed catalog
+    /// introspection is never mistaken for "table absent" → "store empty", so
+    /// even a catalog-level read failure fails closed.
+    fn try_count_nodes(
+        &self,
+        node_type: &str,
+        filters: Option<&HashMap<String, String>>,
+    ) -> crate::Result<usize> {
+        if !is_valid_identifier(node_type) {
+            return Ok(0);
+        }
+        // #107: back-fill a legacy table's `_deleted` column (idempotent) and
+        // load the catalog so the labeled, tombstone-filtered count below binds,
+        // exactly as the read path does.
+        self.ensure_schema_loaded();
+        let _guard = self.acquire_lock();
+
+        // A genuinely-absent node table is confirmed-empty. Confirm its absence
+        // with an error-propagating catalog read so an unreadable catalog fails
+        // closed rather than masquerading as an empty store.
+        if !self.table_is_node_table(node_type)? {
+            return Ok(0);
+        }
+
+        let mut where_parts: Vec<String> = Vec::new();
+        if !append_equality_filters(&mut where_parts, filters) {
+            // An unsafe filter key yields no rows in the read path; mirror that
+            // (deterministic, not a read failure) rather than counting the table.
+            return Ok(0);
+        }
+        if let Some(filter) = self.tombstone_filter(node_type, "n") {
+            where_parts.push(filter);
+        }
+        let where_clause = if where_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_parts.join(" AND "))
+        };
+        let cypher = format!("MATCH (n:{node_type}){where_clause} RETURN count(n)");
+        // Unlike `match_return_nodes`, a query failure here is PROPAGATED: the
+        // table exists, so a failure is a genuine read error — never silently an
+        // empty store.
+        let rows = self.query_rows(&cypher)?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.first())
+            .map(value_as_usize)
+            .unwrap_or(0))
     }
 
     fn search_nodes(

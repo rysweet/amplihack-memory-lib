@@ -30,6 +30,35 @@ pub trait GraphStore {
         limit: usize,
     ) -> Vec<GraphNode>;
 
+    /// Count nodes of `node_type` matching optional equality filters,
+    /// **propagating read failures** instead of silently returning zero.
+    ///
+    /// [`query_nodes`](Self::query_nodes) returns `Vec<GraphNode>` with no error
+    /// channel, so a backend whose read transiently fails has to swallow the
+    /// failure to an empty result — indistinguishable from a genuinely empty
+    /// store. A consumer that self-heals an *empty* store therefore cannot tell
+    /// a **confirmed-empty** store (`Ok(0)`) from an **unreadable** one and may
+    /// act on a false "empty".
+    ///
+    /// This method closes that gap: a persistent backend whose reads can fail
+    /// (e.g. an lbug store hitting a transient/binder read error) overrides it to
+    /// surface the failure as `Err`, so the caller can fail closed. The default
+    /// delegates to `query_nodes(...).len()` and is therefore effectively
+    /// infallible for volatile backends (in-memory), which never read-fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend can encounter a read failure and one
+    /// occurs while counting. A genuinely-absent node type is **not** an error —
+    /// it is confirmed-empty (`Ok(0)`).
+    fn try_count_nodes(
+        &self,
+        node_type: &str,
+        filters: Option<&HashMap<String, String>>,
+    ) -> crate::Result<usize> {
+        Ok(self.query_nodes(node_type, filters, usize::MAX).len())
+    }
+
     /// Full-text keyword search across `text_fields` using CONTAINS.
     fn search_nodes(
         &self,

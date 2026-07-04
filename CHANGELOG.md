@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Error-propagating memory count to distinguish confirmed-empty from a
+  swallowed read failure (#2561, Simard #2561):** `CognitiveMemory::get_memory_stats`
+  counts via `GraphStore::query_nodes(...).len()`, and the lbug read path
+  (`match_return_nodes`) swallows a transient/binder query failure to an empty
+  result (`Err(_) => Vec::new()`). So a read failure surfaces to a consumer as a
+  legitimate all-zeros `Ok(...)` total rather than an error — indistinguishable
+  from a genuinely empty store. A consumer that self-heals an *empty* store
+  (Simard's daemon startup auto-restore) could therefore re-import a snapshot over
+  still-present-but-transiently-unreadable data and duplicate memories once reads
+  recover. **Fix:** new `GraphStore::try_count_nodes` (default delegates to
+  `query_nodes(...).len()`; the `LbugGraphStore` override propagates read failures
+  as `Err`, while a genuinely-absent node table stays confirmed-empty `Ok(0)` —
+  its absence verified through an error-propagating catalog read) and
+  `CognitiveMemory::try_get_memory_stats` (a `Result`-returning stats path built
+  on it). `Ok(stats)` with `total == 0` is now a *confirmed*-empty signal; any
+  read error propagates so the consumer can fail closed. Hermetic regressions
+  (no sleeps/network): `try_count_nodes_absent_table_is_confirmed_empty`,
+  `try_count_nodes_counts_populated_table_in_parity_with_query_nodes`,
+  `try_count_nodes_propagates_read_failure_where_query_nodes_swallows`,
+  `try_get_memory_stats_reports_confirmed_empty_and_populated_totals`, and
+  `try_get_memory_stats_propagates_read_failure_where_get_statistics_swallows`.
+
 ### Fixed
 - **Critical durable-recall data loss on WAL recovery (#2550, Simard #2550):**
   `LbugGraphStore::open_with_recovery` could permanently drop tens of thousands of

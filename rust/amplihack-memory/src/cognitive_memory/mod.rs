@@ -315,6 +315,53 @@ impl CognitiveMemory {
         self.get_memory_stats()
     }
 
+    /// Like [`get_memory_stats`](Self::get_memory_stats) but **propagates read
+    /// failures** instead of silently reporting `0` for an unreadable type
+    /// (issue #2561, follow-up to #2550/#107).
+    ///
+    /// `get_memory_stats` counts via
+    /// [`GraphStore::query_nodes`](crate::graph::GraphStore::query_nodes)`.len()`,
+    /// and the lbug read path swallows a transient/binder query failure to an
+    /// empty result — so a read error surfaces as a legitimate all-zeros
+    /// `total`. A consumer that self-heals an *empty* store (e.g. Simard's daemon
+    /// startup auto-restore) must distinguish a **confirmed-empty** store from an
+    /// **unreadable** one; otherwise it may re-import a snapshot over
+    /// still-present-but-transiently-unreadable data and duplicate it.
+    ///
+    /// This counts through
+    /// [`GraphStore::try_count_nodes`](crate::graph::GraphStore::try_count_nodes),
+    /// which returns `Err` on a genuine read failure. So `Ok(stats)` with
+    /// `total == 0` is a *confirmed*-empty signal the consumer can safely act on,
+    /// while any read error makes the caller fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError`](crate::MemoryError) if any per-type count read
+    /// fails.
+    pub fn try_get_memory_stats(&self) -> Result<HashMap<String, usize>> {
+        let tables = [
+            (MemoryCategory::Sensory, NT_SENSORY),
+            (MemoryCategory::Working, NT_WORKING),
+            (MemoryCategory::Episodic, NT_EPISODIC),
+            (MemoryCategory::Semantic, NT_SEMANTIC),
+            (MemoryCategory::Procedural, NT_PROCEDURAL),
+            (MemoryCategory::Prospective, NT_PROSPECTIVE),
+        ];
+
+        let mut stats = HashMap::new();
+        let mut total = 0usize;
+        let filter = agent_filter(&self.agent_name);
+
+        for (category, node_type) in &tables {
+            let count = self.graph.try_count_nodes(node_type, Some(&filter))?;
+            stats.insert(category.as_str().to_string(), count);
+            total += count;
+        }
+
+        stats.insert("total".to_string(), total);
+        Ok(stats)
+    }
+
     // ======================================================================
     // PROVENANCE (shared helpers)
     // ======================================================================

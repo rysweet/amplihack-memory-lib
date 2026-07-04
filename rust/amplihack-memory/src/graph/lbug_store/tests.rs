@@ -2477,3 +2477,232 @@ fn v40_open_persistent_fails_closed_on_empty_read() {
         "#107 fail-closed: the on-disk store must be byte-identical"
     );
 }
+
+// ===========================================================================
+// #2561: distinguish a CONFIRMED-EMPTY store from a SWALLOWED read failure.
+//
+// `query_nodes` / `match_return_nodes` swallow a query failure to an empty
+// result (`Err(_) => Vec::new()`), so a transient/binder read failure reads a
+// populated store back as empty and `get_memory_stats().total == 0`. The
+// error-propagating `try_count_nodes` / `try_get_memory_stats` surface that
+// failure as `Err` so a consumer (Simard's startup auto-restore) can fail
+// closed instead of restoring a snapshot over still-present-but-unreadable data.
+//
+// A `_deleted`-referencing read on a legacy table no longer errors (fixed by
+// #107), so these tests reproduce a read failure the way #107 did: a labeled
+// read that references a column the table does not carry binder-errors under
+// lbug 0.17.1 — a faithful, deterministic instance of "a query_rows error on an
+// existing table".
+// ===========================================================================
+
+/// #2561 (store level). A genuinely-absent node table is *confirmed empty*:
+/// `try_count_nodes` returns `Ok(0)`, never an error, so a fresh store's
+/// self-heal is not blocked.
+#[test]
+fn try_count_nodes_absent_table_is_confirmed_empty() {
+    let (_tmp, store) = open_temp();
+    let filter = props(&[("agent_id", "a")]);
+    // No tables created at all: absence is confirmed-empty, not a read failure.
+    assert_eq!(
+        store
+            .try_count_nodes("EpisodicMemory", Some(&filter))
+            .expect("absent table must be confirmed-empty Ok(0), not Err"),
+        0
+    );
+}
+
+/// #2561 (store level). A populated, well-formed table counts correctly through
+/// the error-propagating path, in parity with `query_nodes().len()`.
+#[test]
+fn try_count_nodes_counts_populated_table_in_parity_with_query_nodes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("graph.ladybug");
+    let store = LbugGraphStore::open(&db, Some("a")).unwrap();
+    for i in 0..5 {
+        store
+            .execute(
+                "CREATE NODE TABLE IF NOT EXISTS EpisodicMemory(node_id STRING, \
+                 agent_id STRING, graph_origin STRING, content STRING, PRIMARY KEY(node_id))",
+            )
+            .unwrap();
+        store
+            .execute(&format!(
+                "CREATE (n:EpisodicMemory {{node_id:'e{i}', agent_id:'a', \
+                 graph_origin:'cognitive-a', content:'c{i}'}})"
+            ))
+            .unwrap();
+    }
+    store.checkpoint().unwrap();
+
+    let filter = props(&[("agent_id", "a")]);
+    let counted = store
+        .try_count_nodes("EpisodicMemory", Some(&filter))
+        .expect("a populated, well-formed table must count without error");
+    assert_eq!(counted, 5, "try_count_nodes must count every live row");
+    assert_eq!(
+        counted,
+        store
+            .query_nodes("EpisodicMemory", Some(&filter), usize::MAX)
+            .len(),
+        "try_count_nodes must agree with query_nodes().len() on a healthy table"
+    );
+}
+
+/// #2561 (store level, THE regression). A read failure on an *existing* table
+/// must PROPAGATE from `try_count_nodes` as `Err`, where the legacy `query_nodes`
+/// path SWALLOWS the same failure to an empty result. This is the exact
+/// ambiguity that let a transient startup read make a populated store look empty.
+#[test]
+fn try_count_nodes_propagates_read_failure_where_query_nodes_swallows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("graph.ladybug");
+    let store = LbugGraphStore::open(&db, Some("a")).unwrap();
+
+    // A real, physically-present table with rows, but WITHOUT an `agent_id`
+    // column — so an agent-filtered labeled read binder-errors under lbug 0.17.1.
+    store
+        .execute(
+            "CREATE NODE TABLE IF NOT EXISTS EpisodicMemory(node_id STRING, content STRING, \
+             PRIMARY KEY(node_id))",
+        )
+        .unwrap();
+    store
+        .execute("CREATE (n:EpisodicMemory {node_id:'e0', content:'c'})")
+        .unwrap();
+    store.checkpoint().unwrap();
+
+    // Guard: the table is physically present (an unfiltered count reads it).
+    assert_eq!(store.count_all_nodes(), 1, "row must be physically present");
+
+    // Filtering on the absent `agent_id` binder-errors under lbug 0.17.1.
+    let filter = props(&[("agent_id", "a")]);
+
+    // Legacy read path SWALLOWS the error to an empty (0) result...
+    assert_eq!(
+        store
+            .query_nodes("EpisodicMemory", Some(&filter), usize::MAX)
+            .len(),
+        0,
+        "precondition: query_nodes swallows the read failure to empty"
+    );
+
+    // ...but the error-propagating count SURFACES it so the caller can fail closed.
+    assert!(
+        store
+            .try_count_nodes("EpisodicMemory", Some(&filter))
+            .is_err(),
+        "#2561: a read failure on an existing table must propagate as Err, not 0"
+    );
+}
+
+/// The six cognitive node-type tables `get_statistics` sums, with a distinct
+/// deterministic count each. (Local copy so this block is self-contained.)
+const STAT_2561_TABLES: &[(&str, usize)] = &[
+    ("SensoryMemory", 3),
+    ("WorkingMemory", 5),
+    ("EpisodicMemory", 11),
+    ("SemanticMemory", 7),
+    ("ProceduralMemory", 2),
+    ("ProspectiveMemory", 4),
+];
+
+/// #2561 (cognitive / public-API level). `try_get_memory_stats` reports the full
+/// total over a populated store and confirmed-empty (`Ok(0)`) over a fresh one —
+/// the happy paths a consumer relies on to act on a confirmed-empty signal.
+#[test]
+fn try_get_memory_stats_reports_confirmed_empty_and_populated_totals() {
+    // Populated store: every seeded row is counted (WITH agent_id column).
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("cognitive");
+    let expected: usize = STAT_2561_TABLES.iter().map(|(_, n)| n).sum();
+    {
+        let store = LbugGraphStore::open(&db, Some("simard")).unwrap();
+        for (table, n) in STAT_2561_TABLES {
+            store
+                .execute(&format!(
+                    "CREATE NODE TABLE IF NOT EXISTS {table}(node_id STRING, agent_id STRING, \
+                     graph_origin STRING, content STRING, PRIMARY KEY(node_id))"
+                ))
+                .unwrap();
+            for i in 0..*n {
+                store
+                    .execute(&format!(
+                        "CREATE (n:{table} {{node_id:'{table}_{i}', agent_id:'simard', \
+                         graph_origin:'cognitive-simard', content:'c{i}'}})"
+                    ))
+                    .unwrap();
+            }
+        }
+        store.checkpoint().unwrap();
+    }
+    let cm = crate::CognitiveMemory::open_persistent(&db, "simard")
+        .expect("a populated store must open");
+    let stats = cm
+        .try_get_memory_stats()
+        .expect("a healthy populated store must count without error");
+    assert_eq!(
+        stats.get("total").copied().unwrap_or(0),
+        expected,
+        "try_get_memory_stats must report the full total over a populated store"
+    );
+
+    // Fresh store: confirmed-empty is Ok(total == 0), never an error.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let db2 = tmp2.path().join("cognitive");
+    let cm2 =
+        crate::CognitiveMemory::open_persistent(&db2, "fresh").expect("a fresh store must open");
+    let stats2 = cm2
+        .try_get_memory_stats()
+        .expect("a fresh (confirmed-empty) store must not error");
+    assert_eq!(
+        stats2.get("total").copied().unwrap_or(usize::MAX),
+        0,
+        "a fresh store must be confirmed-empty (Ok total == 0)"
+    );
+}
+
+/// #2561 (cognitive / public-API level, THE regression). When a per-type read
+/// fails, `try_get_memory_stats` returns `Err` where `get_statistics` swallows it
+/// to a bogus all-zeros total. This is the ambiguity Simard's auto-restore must
+/// fail closed on.
+#[test]
+fn try_get_memory_stats_propagates_read_failure_where_get_statistics_swallows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("cognitive");
+    let store = LbugGraphStore::open(&db, Some("simard")).unwrap();
+    // Seed the six cognitive tables WITHOUT an `agent_id` column, so the
+    // agent-filtered per-type count binder-errors — the exact swallow-to-empty
+    // read the fix must surface.
+    for (table, n) in STAT_2561_TABLES {
+        store
+            .execute(&format!(
+                "CREATE NODE TABLE IF NOT EXISTS {table}(node_id STRING, content STRING, \
+                 PRIMARY KEY(node_id))"
+            ))
+            .unwrap();
+        for i in 0..*n {
+            store
+                .execute(&format!(
+                    "CREATE (n:{table} {{node_id:'{table}_{i}', content:'c{i}'}})"
+                ))
+                .unwrap();
+        }
+    }
+    store.checkpoint().unwrap();
+
+    let cm = crate::CognitiveMemory::with_store("simard", Box::new(store))
+        .expect("with_store must wrap the seeded store");
+
+    // `get_statistics` SWALLOWS the per-type binder error to a bogus zero total...
+    assert_eq!(
+        cm.get_statistics().get("total").copied(),
+        Some(0),
+        "precondition: get_statistics swallows the read failure to total == 0"
+    );
+
+    // ...but `try_get_memory_stats` SURFACES it so the consumer can fail closed.
+    assert!(
+        cm.try_get_memory_stats().is_err(),
+        "#2561: a swallowed read failure must propagate through try_get_memory_stats"
+    );
+}
