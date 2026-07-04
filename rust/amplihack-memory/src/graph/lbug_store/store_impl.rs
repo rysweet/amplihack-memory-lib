@@ -140,12 +140,46 @@ impl LbugGraphStore {
     /// Run `MATCH (n:node_type) WHERE ... RETURN n [LIMIT k]` and collect the
     /// nodes. A missing table (fresh/never-created type) simply yields no rows.
     /// Soft-deleted (tombstoned, #100) nodes are always filtered out.
+    ///
+    /// Infallible: a backend read error is swallowed to an empty result (the
+    /// historical read-path behaviour every consumer of the [`GraphStore`] read
+    /// methods relies on). The fail-closed count path uses
+    /// [`try_match_return_nodes`](Self::try_match_return_nodes) instead so it can
+    /// distinguish a genuine read error from a genuinely-empty table
+    /// (Simard #2561).
     fn match_return_nodes(
         &self,
         node_type: &str,
         where_parts: &[String],
         limit: usize,
     ) -> Vec<GraphNode> {
+        self.try_match_return_nodes(node_type, where_parts, limit)
+            .unwrap_or_default()
+    }
+
+    /// Fallible variant of [`match_return_nodes`](Self::match_return_nodes):
+    /// **propagate** a backend query failure as `Err` instead of swallowing it
+    /// to an empty result.
+    ///
+    /// This is the read primitive behind the fail-closed count
+    /// ([`try_count_nodes`](GraphStore::try_count_nodes)) so a transient read
+    /// error at startup is never mistaken for a genuinely-empty store (Simard
+    /// #2561). Only the query itself is fallible here — an empty (but readable)
+    /// table still yields `Ok(vec![])`.
+    fn try_match_return_nodes(
+        &self,
+        node_type: &str,
+        where_parts: &[String],
+        limit: usize,
+    ) -> crate::Result<Vec<GraphNode>> {
+        // Test seam (#2561): deterministically simulate a transient backend read
+        // failure so the fail-closed count path can be exercised without a
+        // specific broken engine build. No-op outside tests.
+        if super::force_read_error_for_test() {
+            return Err(MemoryError::Storage(
+                "forced read error (test seam)".to_string(),
+            ));
+        }
         let mut parts = where_parts.to_vec();
         // #107: only filter tombstones when the table actually carries the
         // `_deleted` column. A legacy table that predates soft-delete would make
@@ -163,10 +197,8 @@ impl LbugGraphStore {
             "MATCH (n:{node_type}){where_clause} RETURN n{}",
             limit_clause(limit)
         );
-        match self.query_rows(&cypher) {
-            Ok(rows) => self.collect_nodes(rows, node_type),
-            Err(_) => Vec::new(),
-        }
+        let rows = self.query_rows(&cypher)?;
+        Ok(self.collect_nodes(rows, node_type))
     }
 
     fn get_node_from_table(&self, node_id: &str, table: &str) -> Option<GraphNode> {
@@ -511,6 +543,56 @@ impl GraphStore for LbugGraphStore {
             return Vec::new();
         }
         self.match_return_nodes(node_type, &where_parts, limit)
+    }
+
+    fn try_count_nodes(
+        &self,
+        node_type: &str,
+        filters: Option<&HashMap<String, String>>,
+    ) -> crate::Result<usize> {
+        // An invalid identifier can never name a real table, so it is a
+        // confirmed zero for that type rather than a read error.
+        if !is_valid_identifier(node_type) {
+            return Ok(0);
+        }
+
+        // Fail closed on a suspected-empty store. A **sealed** store tripped the
+        // #107 empty-read gate — a material on-disk footprint that read back
+        // empty — so its "emptiness" is *suspected data loss*, not a confirmed
+        // empty store. Reporting it as a trustworthy `0` would let Simard's
+        // auto-restore (#2561) re-insert a snapshot over still-present but
+        // transiently-unreadable data. Surface it as an error instead.
+        if self.sealed.get() {
+            return Err(MemoryError::Storage(
+                "store sealed by the #107 empty-read safety gate; node count is not \
+                 trustworthy (suspected data loss, not a confirmed-empty store)"
+                    .to_string(),
+            ));
+        }
+
+        // #107: populate the catalog cache before the labeled, tombstone-filtered
+        // read. Use the *fallible* schema load so a catalog read failure is a
+        // propagated error rather than a silent "loaded, no tables" (which would
+        // masquerade as a confirmed-empty store below).
+        self.try_ensure_schema_loaded()?;
+        let _guard = self.acquire_lock();
+
+        // A genuinely-absent node-type table is a confirmed zero for that type
+        // (fresh/empty store), not a read error. `try_ensure_schema_loaded`
+        // proved the catalog is readable, so this distinction is trustworthy.
+        if !self.known_node_tables.borrow().contains(node_type) {
+            return Ok(0);
+        }
+
+        let mut where_parts: Vec<String> = Vec::new();
+        if !append_equality_filters(&mut where_parts, filters) {
+            return Ok(0);
+        }
+
+        // Existing table + readable catalog: any failure now is a genuine read
+        // error on a table that *should* be readable, so propagate it.
+        self.try_match_return_nodes(node_type, &where_parts, usize::MAX)
+            .map(|nodes| nodes.len())
     }
 
     fn search_nodes(

@@ -327,6 +327,26 @@ stats = cog.get_statistics()
 # }
 ```
 
+### Fail-closed statistics (Rust)
+
+`get_statistics` / `get_memory_stats` count each memory type through the
+infallible `GraphStore::query_nodes`, which **swallows a backend read error as
+an empty result**. A transient read failure therefore surfaces as an
+indistinguishable all-zeros `Ok(...)` — a genuinely-empty store and a
+momentarily-unreadable one look identical.
+
+The Rust API adds fail-closed counterparts for callers that must tell those two
+cases apart (e.g. an auto-restore that would duplicate memories if it re-imported
+a snapshot over transiently-unreadable data — Simard #2561):
+
+| Method | Returns | Behaviour |
+|--------|---------|-----------|
+| `CognitiveMemory::try_get_memory_stats` / `try_get_statistics` | `Result<HashMap<String, usize>>` | Counts per type + total; a real read error propagates as `Err`, a genuinely-empty store returns `Ok` with every count `0`. |
+| `GraphStore::try_count_nodes` | `Result<usize>` | Fallible per-type count. Default forwards to `query_nodes().len()`; the durable LadybugDB backend fails closed on a real read error, a sealed (#107 empty-read gate) store, or an unreadable catalog, while still reporting a genuinely-absent table as a confirmed `Ok(0)`. |
+
+These are additive Rust-only surfaces; the Python bindings and the existing
+infallible methods are unchanged.
+
 ---
 
 ## Lifecycle

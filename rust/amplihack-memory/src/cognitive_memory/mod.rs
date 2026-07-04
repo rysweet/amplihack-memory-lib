@@ -315,6 +315,49 @@ impl CognitiveMemory {
         self.get_memory_stats()
     }
 
+    /// Fail-closed counterpart of [`get_memory_stats`](Self::get_memory_stats).
+    ///
+    /// Counts each memory type through the fallible
+    /// [`GraphStore::try_count_nodes`](crate::graph::GraphStore::try_count_nodes)
+    /// so a **transient backend read failure propagates as `Err`** instead of
+    /// being swallowed to a misleading all-zeros `Ok` (as the infallible
+    /// `get_memory_stats` does via `query_nodes(...).len()`). A genuinely-empty
+    /// store still returns `Ok` with every count `0`.
+    ///
+    /// This is the signal a consumer needs to tell a **confirmed-empty** store
+    /// apart from a **transiently-unreadable** one before deciding whether to
+    /// auto-restore a snapshot — restoring over unreadable-but-present data would
+    /// duplicate memories once reads recover (Simard #2561).
+    pub fn try_get_memory_stats(&self) -> crate::Result<HashMap<String, usize>> {
+        let tables = [
+            (MemoryCategory::Sensory, NT_SENSORY),
+            (MemoryCategory::Working, NT_WORKING),
+            (MemoryCategory::Episodic, NT_EPISODIC),
+            (MemoryCategory::Semantic, NT_SEMANTIC),
+            (MemoryCategory::Procedural, NT_PROCEDURAL),
+            (MemoryCategory::Prospective, NT_PROSPECTIVE),
+        ];
+
+        let mut stats = HashMap::new();
+        let mut total = 0usize;
+        let filter = agent_filter(&self.agent_name);
+
+        for (category, node_type) in &tables {
+            let count = self.graph.try_count_nodes(node_type, Some(&filter))?;
+            stats.insert(category.as_str().to_string(), count);
+            total += count;
+        }
+
+        stats.insert("total".to_string(), total);
+        Ok(stats)
+    }
+
+    /// Fail-closed alias matching the [`get_statistics`](Self::get_statistics)
+    /// name — see [`try_get_memory_stats`](Self::try_get_memory_stats).
+    pub fn try_get_statistics(&self) -> crate::Result<HashMap<String, usize>> {
+        self.try_get_memory_stats()
+    }
+
     // ======================================================================
     // PROVENANCE (shared helpers)
     // ======================================================================
