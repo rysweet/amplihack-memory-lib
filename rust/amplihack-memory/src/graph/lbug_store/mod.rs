@@ -1044,13 +1044,18 @@ impl LbugGraphStore {
     pub(crate) fn ensure_schema_loaded(&self) {
         if let Err(e) = self.try_ensure_schema_loaded() {
             // Best-effort for the infallible read/update/delete paths: log and
-            // mark the schema loaded so those callers do not spin
-            // re-introspecting a catalog that is currently unreadable. The
-            // fail-closed count path (Simard #2561) calls
-            // `try_ensure_schema_loaded` directly so it can still surface this
-            // read error instead of mistaking it for a confirmed-empty store.
+            // move on. We deliberately do NOT latch `schema_loaded = true` here.
+            //
+            // Latching on failure would (a) poison the fail-closed count path
+            // (#2561) — `try_ensure_schema_loaded` would then short-circuit `Ok`
+            // over an empty cache, and `try_count_nodes` would read that empty
+            // cache as a *confirmed*-empty store — and (b) strand this handle as
+            // "loaded, no tables" for its whole lifetime after a merely-transient
+            // catalog failure. Leaving the flag unset lets the next read retry
+            // and self-heal once the catalog is readable again. (In the healthy
+            // case the first successful load latches the flag, so a warm store
+            // still introspects exactly once.)
             warn!("lbug_store: show_tables introspection failed: {e}");
-            self.schema_loaded.set(true);
         }
     }
 
@@ -1065,6 +1070,14 @@ impl LbugGraphStore {
     pub(crate) fn try_ensure_schema_loaded(&self) -> crate::Result<()> {
         if self.schema_loaded.get() {
             return Ok(());
+        }
+
+        // Test seam (#2561): simulate an unreadable catalog so the fail-closed
+        // count path can be exercised deterministically. No-op outside tests.
+        if force_read_error_for_test() {
+            return Err(MemoryError::Storage(
+                "forced catalog read error (test seam)".to_string(),
+            ));
         }
 
         let rows = self.query_rows("CALL show_tables() RETURN *")?;

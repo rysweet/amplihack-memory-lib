@@ -2562,19 +2562,80 @@ fn try_count_nodes_propagates_read_error_on_existing_table() {
     );
 }
 
-/// The confirmed-empty short-circuit (absent table) is reached BEFORE the
-/// fallible read primitive, so it never spuriously errors even under a forced
-/// read failure — a genuinely-fresh store still self-heals via auto-restore.
+/// After a SUCCESSFUL catalog load, a genuinely-absent node-type table is a
+/// confirmed zero — reached before the fallible read primitive, so even a forced
+/// *node*-read failure does not turn it into an `Err` (a genuinely-fresh type
+/// still self-heals via auto-restore).
 #[test]
-fn try_count_nodes_absent_table_is_confirmed_zero_even_under_forced_error() {
-    let (_tmp, store) = open_temp();
+fn try_count_nodes_absent_table_is_confirmed_zero_after_successful_schema_load() {
+    let (_tmp, mut store) = open_temp();
+    // Create some table so a successful catalog load happens and is cached.
+    store
+        .add_node(
+            "Thing",
+            props(&[("node_id", "n1"), ("agent_id", "a")]),
+            Some("n1"),
+        )
+        .unwrap();
+
+    // The catalog is now readable/loaded. A DIFFERENT, absent type is a confirmed
+    // zero — the short-circuit is hit before the fallible read primitive, so a
+    // forced node-read error does not apply.
     super::test_seam::set_force_read_error(true);
     let res = store.try_count_nodes("NeverCreatedType", None);
     super::test_seam::set_force_read_error(false);
     assert_eq!(
         res.unwrap(),
         0,
-        "#2561: an absent table is confirmed-empty and must not hit the read primitive"
+        "#2561: an absent table (readable catalog) is confirmed-empty, not an error"
+    );
+}
+
+/// An UNREADABLE catalog must fail closed: without a readable `show_tables` we
+/// cannot confirm the store is empty, so the count must `Err`, never a
+/// false-confirmed `Ok(0)`.
+#[test]
+fn try_count_nodes_fails_closed_when_catalog_unreadable_2561() {
+    let (_tmp, store) = open_temp();
+    // Fresh store: schema not yet loaded, so the count must read the catalog.
+    super::test_seam::set_force_read_error(true);
+    let res = store.try_count_nodes("SensoryMemory", None);
+    super::test_seam::set_force_read_error(false);
+    assert!(
+        res.is_err(),
+        "#2561: an unreadable catalog must fail closed, not confirm-empty"
+    );
+}
+
+/// REGRESSION: a transient catalog failure during a *prior infallible* read must
+/// not poison the fail-closed count. The infallible `ensure_schema_loaded` must
+/// NOT latch `schema_loaded = true` with empty caches on failure — otherwise the
+/// fallible count would short-circuit and read that empty cache as a
+/// *confirmed*-empty store (#2561).
+#[test]
+fn try_count_nodes_not_poisoned_by_prior_infallible_schema_load_failure_2561() {
+    let (_tmp, store) = open_temp();
+
+    // 1. A transient catalog failure during an INFALLIBLE read (which swallows).
+    super::test_seam::set_force_read_error(true);
+    let _ = store.query_nodes("SensoryMemory", None, usize::MAX);
+
+    // 2. While the failure persists, the fallible count must FAIL CLOSED — never
+    //    trust a latch poisoned by the failed infallible load.
+    let during = store.try_count_nodes("SensoryMemory", None);
+    super::test_seam::set_force_read_error(false);
+    assert!(
+        during.is_err(),
+        "#2561: the fallible count must not be poisoned into a false confirmed-empty \
+         by a prior failed infallible schema load"
+    );
+
+    // 3. Once the failure clears, the catalog loads and the genuinely-empty store
+    //    confirms empty.
+    assert_eq!(
+        store.try_count_nodes("SensoryMemory", None).unwrap(),
+        0,
+        "#2561: after the catalog is readable again, a genuinely-empty store confirms 0"
     );
 }
 
