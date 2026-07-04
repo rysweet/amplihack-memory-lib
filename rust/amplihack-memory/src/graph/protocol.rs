@@ -30,6 +30,28 @@ pub trait GraphStore {
         limit: usize,
     ) -> Vec<GraphNode>;
 
+    /// Fail-closed count of nodes of `node_type` matching optional equality
+    /// filters.
+    ///
+    /// Unlike [`query_nodes`](Self::query_nodes) — which swallows a backend read
+    /// error as an empty result — this **propagates** a genuine read failure as
+    /// `Err`, while still reporting a genuinely-empty store as `Ok(0)`. That lets
+    /// a consumer distinguish a **confirmed-empty** store from a **transient read
+    /// failure** (Simard #2561: an auto-restore that trusted a swallowed
+    /// all-zeros read could re-insert a snapshot on top of transiently-unreadable
+    /// data and duplicate memories once reads recover).
+    ///
+    /// The default forwards to `query_nodes(...).len()` for backends that cannot
+    /// fail (in-memory / test / composite stores); the durable LadybugDB backend
+    /// overrides it to fail closed on a real read error.
+    fn try_count_nodes(
+        &self,
+        node_type: &str,
+        filters: Option<&HashMap<String, String>>,
+    ) -> crate::Result<usize> {
+        Ok(self.query_nodes(node_type, filters, usize::MAX).len())
+    }
+
     /// Full-text keyword search across `text_fields` using CONTAINS.
     fn search_nodes(
         &self,

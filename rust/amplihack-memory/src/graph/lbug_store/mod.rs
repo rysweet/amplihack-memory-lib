@@ -1042,18 +1042,32 @@ impl LbugGraphStore {
     /// process become visible to read/update/delete paths without requiring a
     /// fresh `add_node` first.
     pub(crate) fn ensure_schema_loaded(&self) {
-        if self.schema_loaded.get() {
-            return;
+        if let Err(e) = self.try_ensure_schema_loaded() {
+            // Best-effort for the infallible read/update/delete paths: log and
+            // mark the schema loaded so those callers do not spin
+            // re-introspecting a catalog that is currently unreadable. The
+            // fail-closed count path (Simard #2561) calls
+            // `try_ensure_schema_loaded` directly so it can still surface this
+            // read error instead of mistaking it for a confirmed-empty store.
+            warn!("lbug_store: show_tables introspection failed: {e}");
+            self.schema_loaded.set(true);
         }
-        self.schema_loaded.set(true);
+    }
 
-        let rows = match self.query_rows("CALL show_tables() RETURN *") {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("lbug_store: show_tables introspection failed: {e}");
-                return;
-            }
-        };
+    /// Fallible variant of [`ensure_schema_loaded`](Self::ensure_schema_loaded).
+    ///
+    /// Populates the schema caches from the on-disk catalog, **propagating** a
+    /// catalog read failure instead of swallowing it. The schema is marked
+    /// loaded only on success, so a transient `show_tables` failure can be
+    /// retried on the next call (and stays visible to the fail-closed count
+    /// path, Simard #2561) rather than being permanently latched as
+    /// "loaded, no tables".
+    pub(crate) fn try_ensure_schema_loaded(&self) -> crate::Result<()> {
+        if self.schema_loaded.get() {
+            return Ok(());
+        }
+
+        let rows = self.query_rows("CALL show_tables() RETURN *")?;
 
         for row in rows {
             let (name, ttype) = match table_row_name_and_type(&row) {
@@ -1075,6 +1089,9 @@ impl LbugGraphStore {
                 self.node_table_columns.borrow_mut().insert(name, cols);
             }
         }
+
+        self.schema_loaded.set(true);
+        Ok(())
     }
 
     /// Return the user-defined column names of `table` from the catalog.
@@ -1436,6 +1453,22 @@ fn force_empty_read_for_test() -> bool {
 }
 #[cfg(not(test))]
 fn force_empty_read_for_test() -> bool {
+    false
+}
+
+/// Whether tests have forced the fail-closed count path to observe a genuine
+/// backend read error (see [`test_seam`]). Always `false` outside tests.
+///
+/// Lets a test exercise the #2561 fail-closed propagation deterministically —
+/// a transient read failure on an *existing, populated* table must surface as
+/// `Err`, not a swallowed empty — without depending on a specific broken engine
+/// build.
+#[cfg(test)]
+pub(crate) fn force_read_error_for_test() -> bool {
+    test_seam::force_read_error()
+}
+#[cfg(not(test))]
+pub(crate) fn force_read_error_for_test() -> bool {
     false
 }
 
@@ -1888,6 +1921,7 @@ pub(crate) mod test_seam {
 
     thread_local! {
         static FORCE_EMPTY_READ: Cell<bool> = const { Cell::new(false) };
+        static FORCE_READ_ERROR: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Force (or stop forcing) the open path to treat the store as read-empty.
@@ -1902,5 +1936,20 @@ pub(crate) mod test_seam {
     /// Whether the open path should treat the post-open read as empty.
     pub(crate) fn force_empty_read() -> bool {
         FORCE_EMPTY_READ.with(|c| c.get())
+    }
+
+    /// Force (or stop forcing) the fail-closed count read primitive
+    /// (`try_match_return_nodes`) to fail with a synthetic backend read error.
+    ///
+    /// Thread-local for the same parallel-isolation reason as
+    /// [`set_force_empty_read`]. Used by the #2561 fail-closed count tests to
+    /// simulate a transient read failure on an existing, populated table.
+    pub(crate) fn set_force_read_error(on: bool) {
+        FORCE_READ_ERROR.with(|c| c.set(on));
+    }
+
+    /// Whether the fail-closed count read primitive should fail.
+    pub(crate) fn force_read_error() -> bool {
+        FORCE_READ_ERROR.with(|c| c.get())
     }
 }

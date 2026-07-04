@@ -2477,3 +2477,164 @@ fn v40_open_persistent_fails_closed_on_empty_read() {
         "#107 fail-closed: the on-disk store must be byte-identical"
     );
 }
+
+// ===========================================================================
+// #2561: fail-closed node count. `try_count_nodes` / `try_get_statistics` must
+// distinguish a CONFIRMED-EMPTY store (Ok, zero) from a SWALLOWED / TRANSIENT
+// read failure (Err), so Simard's auto-restore never re-inserts a snapshot on
+// top of still-present-but-transiently-unreadable data.
+// ===========================================================================
+
+/// A fresh/empty store has no node-type table yet: that is a *confirmed* zero
+/// for the type (Ok(0)), not a read error.
+#[test]
+fn try_count_nodes_confirms_zero_on_empty_store() {
+    let (_tmp, store) = open_temp();
+    assert_eq!(
+        store.try_count_nodes("SensoryMemory", None).unwrap(),
+        0,
+        "#2561: an absent node-type table is a confirmed zero, not an error"
+    );
+}
+
+/// A populated table counts exactly through the fallible path.
+#[test]
+fn try_count_nodes_counts_populated_table() {
+    let (_tmp, mut store) = open_temp();
+    for i in 0..4 {
+        let id = format!("n{i}");
+        store
+            .add_node(
+                "Thing",
+                props(&[("node_id", &id), ("agent_id", "a")]),
+                Some(&id),
+            )
+            .unwrap();
+    }
+    let filter = props(&[("agent_id", "a")]);
+    assert_eq!(store.try_count_nodes("Thing", Some(&filter)).unwrap(), 4);
+}
+
+/// A SEALED store tripped the #107 empty-read gate — its "empty" is suspected
+/// data loss, not a confirmed-empty store — so the fallible count must fail
+/// closed rather than report a trustworthy `0`.
+#[test]
+fn try_count_nodes_fails_closed_on_sealed_store() {
+    let (_tmp, store) = open_temp();
+    store.seal();
+    assert!(
+        store.try_count_nodes("SensoryMemory", None).is_err(),
+        "#2561: a sealed (#107) store must fail closed, never report 0"
+    );
+}
+
+/// A transient backend read failure on an EXISTING table must propagate as
+/// `Err` — the core #2561 fix — while the infallible `query_nodes` keeps its
+/// historical swallow-to-empty behaviour unchanged.
+#[test]
+fn try_count_nodes_propagates_read_error_on_existing_table() {
+    let (_tmp, mut store) = open_temp();
+    store
+        .add_node(
+            "Thing",
+            props(&[("node_id", "n1"), ("agent_id", "a")]),
+            Some("n1"),
+        )
+        .unwrap();
+    let filter = props(&[("agent_id", "a")]);
+
+    // Baseline: the table exists and reads Ok.
+    assert_eq!(store.try_count_nodes("Thing", Some(&filter)).unwrap(), 1);
+
+    // Fail-closed: a read error on an existing table propagates (never swallowed).
+    super::test_seam::set_force_read_error(true);
+    let fallible = store.try_count_nodes("Thing", Some(&filter));
+    let swallowed = store.query_nodes("Thing", Some(&filter), usize::MAX);
+    super::test_seam::set_force_read_error(false);
+
+    assert!(
+        fallible.is_err(),
+        "#2561: a transient read error on an existing table must fail closed"
+    );
+    assert!(
+        swallowed.is_empty(),
+        "the infallible read path is intentionally unchanged (still swallows to empty)"
+    );
+}
+
+/// The confirmed-empty short-circuit (absent table) is reached BEFORE the
+/// fallible read primitive, so it never spuriously errors even under a forced
+/// read failure — a genuinely-fresh store still self-heals via auto-restore.
+#[test]
+fn try_count_nodes_absent_table_is_confirmed_zero_even_under_forced_error() {
+    let (_tmp, store) = open_temp();
+    super::test_seam::set_force_read_error(true);
+    let res = store.try_count_nodes("NeverCreatedType", None);
+    super::test_seam::set_force_read_error(false);
+    assert_eq!(
+        res.unwrap(),
+        0,
+        "#2561: an absent table is confirmed-empty and must not hit the read primitive"
+    );
+}
+
+/// End-to-end through the public `CognitiveMemory` API: a confirmed-empty store
+/// yields `Ok(total = 0)`; a populated store under a transient read failure
+/// yields `Err` instead of a swallowed all-zeros `Ok` (the exact #2561 signal
+/// Simard's auto-restore gates on).
+#[test]
+fn try_get_statistics_confirmed_empty_vs_read_error_2561() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Confirmed-empty: fallible stats succeed with total 0.
+    let empty_db = tmp.path().join("cognitive-empty");
+    let cm_empty = crate::CognitiveMemory::open_persistent(&empty_db, LEGACY_AGENT)
+        .expect("empty store must open");
+    let empty_stats = cm_empty
+        .try_get_statistics()
+        .expect("#2561: a confirmed-empty store must count Ok, not Err");
+    assert_eq!(
+        empty_stats.get("total").copied().unwrap_or(usize::MAX),
+        0,
+        "#2561: confirmed-empty store reports total 0"
+    );
+
+    // Populated store.
+    let full_db = tmp.path().join("cognitive-populated");
+    {
+        let store = LbugGraphStore::open(&full_db, Some(LEGACY_AGENT)).unwrap();
+        seed_legacy_store_without_tombstone(&store);
+    }
+    let cm_full = crate::CognitiveMemory::open_persistent(&full_db, LEGACY_AGENT)
+        .expect("populated store must open");
+
+    // Without a fault it reads the full total.
+    let ok_stats = cm_full
+        .try_get_statistics()
+        .expect("populated store reads Ok");
+    assert_eq!(
+        ok_stats.get("total").copied().unwrap(),
+        legacy_total(),
+        "#2561: populated store reports its full total"
+    );
+
+    // With a transient read fault it fails closed (does NOT report a swallowed 0).
+    super::test_seam::set_force_read_error(true);
+    let faulted = cm_full.try_get_statistics();
+    super::test_seam::set_force_read_error(false);
+    assert!(
+        faulted.is_err(),
+        "#2561: a transient read failure over a populated store must propagate as Err"
+    );
+
+    // Contrast: the infallible get_statistics keeps swallowing to all-zeros — the
+    // very behaviour that made the confirmed-empty vs read-failure cases
+    // indistinguishable before this fix.
+    super::test_seam::set_force_read_error(true);
+    let swallowed_total = cm_full.get_statistics().get("total").copied().unwrap();
+    super::test_seam::set_force_read_error(false);
+    assert_eq!(
+        swallowed_total, 0,
+        "the infallible path still swallows to 0 (documents why the fallible path is needed)"
+    );
+}
