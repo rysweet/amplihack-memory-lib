@@ -84,6 +84,48 @@ fn test_prospective_priority_ordering() {
     assert_eq!(triggered[0].priority, 10);
 }
 
+// -- get_all_prospective (Simard #2550): read-only enumeration of ALL statuses --
+
+#[test]
+fn test_get_all_prospective_returns_every_status_without_mutating() {
+    let mut cm = make_cm();
+    cm.store_prospective("goal A", "alphacond", "do A", 1)
+        .unwrap();
+    let id_b = cm
+        .store_prospective("goal B", "betacond", "do B", 9)
+        .unwrap();
+
+    // Fire B so it is "triggered" (not "pending") — get_all_prospective must
+    // still surface it, unlike check_triggers which only reads pending nodes.
+    // Distinct single-token triggers so keyword-overlap fires B only.
+    let fired = cm.check_triggers("betacond happening");
+    assert_eq!(fired.len(), 1);
+
+    let all = cm.get_all_prospective(usize::MAX);
+    assert_eq!(
+        all.len(),
+        2,
+        "must return prospective memories in every status"
+    );
+    // Priority-ordered (highest first).
+    assert_eq!(all[0].priority, 9);
+    assert_eq!(all[0].node_id, id_b);
+    assert_eq!(all[0].status, "triggered");
+    assert_eq!(all[1].status, "pending");
+
+    // Pure read: calling it does not change any status.
+    let again = cm.get_all_prospective(usize::MAX);
+    assert_eq!(again.len(), 2);
+    assert_eq!(again[0].status, "triggered");
+    assert_eq!(again[1].status, "pending");
+}
+
+#[test]
+fn test_get_all_prospective_empty_store() {
+    let cm = make_cm();
+    assert!(cm.get_all_prospective(usize::MAX).is_empty());
+}
+
 // -- Extended coverage: store_prospective --
 
 #[test]
