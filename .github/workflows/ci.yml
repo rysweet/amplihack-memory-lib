@@ -101,6 +101,16 @@ jobs:
         working-directory: rust/amplihack-memory
         run: cargo test --features persistent --lib graph::lbug_store::tests::v40
 
+      # #2550 data-loss gate — non-destructive corrupt-WAL open recovery. These
+      # deterministic (no sleeps/network/probabilistic-churn) regressions prove a
+      # corrupt WAL tail is recovered without an assertion/crash, the full
+      # pre-corruption prefix survives, and — critically — recovery stays durable
+      # across a strict reopen even when the checkpoint-after-recovery fails (the
+      # verified incident where recovered memories were reset to empty).
+      - name: Data-loss gate (corrupt-WAL non-destructive recovery, #2550)
+        working-directory: rust/amplihack-memory
+        run: cargo test --features persistent --lib -- graph::lbug_store::tests::open_with_recovery graph::lbug_store::tests::recovery_is_durable
+
       # The remaining persistent-feature suite includes the probabilistic
       # 400-round CSR delete+checkpoint churn (reproduces_issue_100_*), a native
       # stress test kept non-blocking to avoid CI flakiness from rare native

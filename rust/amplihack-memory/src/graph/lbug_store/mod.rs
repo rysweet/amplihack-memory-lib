@@ -37,14 +37,23 @@
 //!   (the failure mode that previously made the store permanently unopenable),
 //!   the corrupt WAL is quarantined to `<wal>.corrupt-<ts>`, a resilient open
 //!   replays the good prefix, and a `CHECKPOINT` folds the recovered records into
-//!   the main database file so a subsequent clean reopen needs no replay.
+//!   the main database file so a subsequent clean reopen needs no replay. If that
+//!   checkpoint-after-recovery itself **fails** (#2550 — the recovered records
+//!   would otherwise live only in the quarantined WAL and be reset to empty on a
+//!   later open), the recovered graph is **salvaged into a fresh database**: it is
+//!   dumped while the resilient handle is still open, the un-checkpointable
+//!   original is quarantined, and the records are reloaded and checkpointed into a
+//!   clean database so the pre-corruption prefix survives durably.
 //! * **Catalog / main-DB corruption recovery** — if the engine cannot open the
 //!   main database even with the WAL fully quarantined (a corrupt catalog / main
 //!   file, e.g. left by a failed CHECKPOINT — the cause of the #95 crash loop),
-//!   [`open_with_recovery`](LbugGraphStore::open_with_recovery) quarantines the
-//!   entire database to `<db_path>.corrupt-<ts>` (moved aside, never deleted) and
-//!   opens a fresh, empty database so the store self-heals instead of failing
-//!   forever. The strict [`open`](LbugGraphStore::open) stays strict and errors.
+//!   [`open_with_recovery`](LbugGraphStore::open_with_recovery) first attempts a
+//!   **read-only salvage** of any still-readable records (#2550 — never reset a
+//!   store that still holds recoverable records); it then quarantines the entire
+//!   database to `<db_path>.corrupt-<ts>` (moved aside, never deleted) and opens a
+//!   fresh database, reloading any salvaged records so the store self-heals
+//!   instead of failing forever. The strict [`open`](LbugGraphStore::open) stays
+//!   strict and errors.
 //! * **Configurable limits** — the LadybugDB buffer-pool cap and maximum
 //!   database size are read from `AMPLIHACK_MEMORY_BUFFER_POOL_BYTES` /
 //!   `AMPLIHACK_MEMORY_MAX_DB_BYTES` (with larger, safer defaults than the old
@@ -69,6 +78,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lbug::{Connection, Database, SystemConfig, Value};
 use tracing::{debug, info, warn};
 
+use crate::graph::protocol::GraphStore;
+use crate::graph::types::{Direction, GraphEdge, GraphNode};
 use crate::MemoryError;
 
 /// Number of mutating operations after which the store auto-checkpoints,
@@ -112,15 +123,20 @@ pub enum WalRecoveryOutcome {
     /// The write-ahead log replayed cleanly; no recovery was performed and no
     /// artifact was written.
     Clean,
-    /// A corrupt WAL tail was quarantined; the good prefix was replayed and
-    /// checkpointed into the main database file.
+    /// A corrupt WAL tail was quarantined; the good prefix was replayed and made
+    /// durable in the main database file. Normally the prefix is folded in by a
+    /// checkpoint; if that checkpoint-after-recovery fails (#2550) the recovered
+    /// graph is salvaged into a fresh database instead, and this outcome is also
+    /// reported when a corrupt catalog's still-readable records are salvaged via a
+    /// read-only open. In every case the reported records survive a strict reopen.
     RecoveredPrefix,
     /// The WAL was unusable even in resilient mode; it was quarantined and the
     /// store was opened from the last good checkpoint only.
     CheckpointOnly,
     /// The main database / catalog itself was corrupt and unopenable even with
     /// the WAL fully out of the way (the failure mode that previously
-    /// crash-looped consumers, #95). The corrupt database was quarantined to
+    /// crash-looped consumers, #95), **and** no records could be salvaged from it
+    /// via a read-only open (#2550). The corrupt database was quarantined to
     /// `<db_path>.corrupt-<ts>` (moved aside, never deleted) and a fresh, empty
     /// database was opened at `db_path` so the store self-heals instead of
     /// failing forever. `recovered_records` is `0`.
@@ -171,7 +187,7 @@ impl WalRecovery {
     }
 }
 
-/// LadybugDB-backed persistent [`GraphStore`](crate::graph::protocol::GraphStore).
+/// LadybugDB-backed persistent [`GraphStore`].
 pub struct LbugGraphStore {
     pub(crate) store_id: String,
     pub(crate) db_path: PathBuf,
@@ -334,24 +350,52 @@ impl LbugGraphStore {
         match try_open_database(db_path, false) {
             Ok(db) => {
                 let store = Self::from_parts(db, db_path, store_id);
-                // Fold the recovered prefix into the main DB so a later clean
-                // reopen needs no replay, then count what survived.
-                if let Err(e) = store.do_checkpoint() {
-                    warn!("lbug_store: checkpoint after recovery failed: {e}");
-                }
                 let recovered = store.count_all_nodes();
-                let report = WalRecovery {
-                    outcome: WalRecoveryOutcome::RecoveredPrefix,
-                    recovered_records: recovered,
-                    quarantined_wal: copied.clone(),
-                };
-                warn!(
-                    db_path = %db_path.display(),
-                    recovered_records = recovered,
-                    quarantined_wal = ?copied,
-                    "lbug_store: recovered from corrupt WAL (good prefix replayed + checkpointed)"
-                );
-                Ok((store, report))
+                // Fold the recovered prefix into the main DB so a later clean
+                // reopen needs no replay. A *failed* checkpoint here is the #2550
+                // data-loss trap: the recovered prefix would then live only in the
+                // quarantined/consumed WAL, and a later open would read the
+                // pre-recovery (near-empty) main file and could re-quarantine and
+                // reset the store to empty — permanently dropping the recovered
+                // memories. So on checkpoint failure we do NOT return a store whose
+                // records are not durably persisted: we salvage the recovered graph
+                // into a fresh, clean database where a checkpoint succeeds.
+                match store.recovery_checkpoint() {
+                    Ok(()) => {
+                        let report = WalRecovery {
+                            outcome: WalRecoveryOutcome::RecoveredPrefix,
+                            recovered_records: recovered,
+                            quarantined_wal: copied.clone(),
+                        };
+                        warn!(
+                            db_path = %db_path.display(),
+                            recovered_records = recovered,
+                            quarantined_wal = ?copied,
+                            "lbug_store: recovered from corrupt WAL (good prefix replayed + checkpointed)"
+                        );
+                        Ok((store, report))
+                    }
+                    Err(checkpoint_err) => {
+                        warn!(
+                            db_path = %db_path.display(),
+                            error = %checkpoint_err,
+                            recovered_records = recovered,
+                            "lbug_store: checkpoint after WAL recovery failed; salvaging the \
+                             recovered graph into a fresh database so the pre-corruption prefix \
+                             survives durably instead of being reset to empty on a later open"
+                        );
+                        // Capture the recovered graph while this resilient handle is
+                        // still open — it is the only live copy until we persist it.
+                        // Dump directly (rather than trusting the possibly-lossy
+                        // `count_all_nodes()` gate) so a transient count failure can
+                        // never misclassify a populated store as "nothing to salvage".
+                        // An empty dump salvages to a fresh empty DB (records = 0),
+                        // which also durably clears the corrupt WAL.
+                        let dump = store.dump_graph();
+                        drop(store);
+                        Self::salvage_rebuild(db_path, store_id, dump, copied)
+                    }
+                }
             }
             Err(resilient_err) => {
                 // 3. Hard fallback: even resilient replay failed. Move the WAL
@@ -414,10 +458,21 @@ impl LbugGraphStore {
         store_id: Option<&str>,
         prior_quarantine: Option<PathBuf>,
     ) -> crate::Result<(Self, WalRecovery)> {
+        // #2550: never reset a store that still holds recoverable records. Before
+        // quarantining and rebuilding empty, attempt a READ-ONLY salvage of the
+        // corrupt database (a read-only open cannot mutate or further corrupt it).
+        // If anything is still readable, route it through the verified
+        // salvage-rebuild path (quarantine the corrupt DB → reload → checkpoint →
+        // strict-reopen-verify) so a store that still holds records is never reset
+        // to empty and its durability is proven, not assumed.
+        if let Some(dump) = Self::read_only_dump(db_path) {
+            return Self::salvage_rebuild(db_path, store_id, dump, prior_quarantine);
+        }
+
+        // Nothing salvageable: quarantine the corrupt database and open a fresh,
+        // empty one so the store self-heals instead of crash-looping (#95).
         let quarantine = quarantine_path(db_path);
         let moved = quarantine_db_artifacts(db_path, &quarantine)?;
-
-        // db_path is now clear: a strict open creates a fresh, empty database.
         let db = open_database(db_path, true).map_err(|e| {
             MemoryError::Storage(format!(
                 "failed to open a fresh LadybugDB at {} after quarantining a corrupt catalog: {e}",
@@ -426,18 +481,238 @@ impl LbugGraphStore {
         })?;
         let store = Self::from_parts(db, db_path, store_id);
         let quarantined = moved.or(prior_quarantine);
-        let report = WalRecovery {
-            outcome: WalRecoveryOutcome::RebuiltAfterCorruption,
-            recovered_records: 0,
-            quarantined_wal: quarantined.clone(),
-        };
         warn!(
             db_path = %db_path.display(),
             quarantined_db = ?quarantined,
-            "lbug_store: main database/catalog was corrupt and unopenable; quarantined it and \
-             rebuilt a fresh empty database so the store self-heals instead of crash-looping"
+            "lbug_store: main database/catalog was corrupt and unopenable; quarantined it \
+             and rebuilt a fresh empty database so the store self-heals instead of \
+             crash-looping"
         );
+        let report = WalRecovery {
+            outcome: WalRecoveryOutcome::RebuiltAfterCorruption,
+            recovered_records: 0,
+            quarantined_wal: quarantined,
+        };
         Ok((store, report))
+    }
+
+    /// Checkpoint issued immediately after a resilient WAL replay, folding the
+    /// recovered prefix into the main database file.
+    ///
+    /// Extracted from [`recover`](Self::recover) so a test can deterministically
+    /// force *this* checkpoint to fail (reproducing the #2550
+    /// checkpoint-after-recovery failure) without perturbing any other checkpoint
+    /// — including the fresh-database checkpoint the salvage path relies on.
+    fn recovery_checkpoint(&self) -> crate::Result<()> {
+        #[cfg(test)]
+        if test_hooks::take_forced_recovery_checkpoint_failure() {
+            return Err(MemoryError::Storage(
+                "injected checkpoint-after-recovery failure (test): cannot open <db>.wal.checkpoint"
+                    .to_string(),
+            ));
+        }
+        self.do_checkpoint()
+    }
+
+    /// Read every live node and edge into memory so a recovered graph can be
+    /// salvaged into a fresh database (see [`salvage_rebuild`](Self::salvage_rebuild)).
+    ///
+    /// Tombstoned (soft-deleted) rows are excluded — the dump contains exactly the
+    /// live records a normal read would return. Edges are enumerated by walking
+    /// each node's *outgoing* relationships, which reuses the tombstone-aware
+    /// neighbour reader and visits every edge exactly once (each edge has a single
+    /// source node).
+    pub(crate) fn dump_graph(&self) -> GraphDump {
+        self.ensure_schema_loaded();
+        let tables: Vec<String> = self.known_node_tables.borrow().iter().cloned().collect();
+        let mut nodes: Vec<GraphNode> = Vec::new();
+        for table in &tables {
+            nodes.extend(self.query_nodes(table, None, usize::MAX));
+        }
+        let mut edges: Vec<GraphEdge> = Vec::new();
+        for node in &nodes {
+            for (edge, _neighbor) in
+                self.query_neighbors(&node.node_id, None, Direction::Outgoing, usize::MAX)
+            {
+                edges.push(edge);
+            }
+        }
+        GraphDump { nodes, edges }
+    }
+
+    /// Reload a [`GraphDump`] into this (fresh) store, recreating every node and
+    /// then every edge. Returns the number of nodes reloaded. Reserved columns are
+    /// stripped ([`salvage_props`]) so `add_node`/`add_edge` re-derive them (the id
+    /// is passed explicitly and `graph_origin` becomes this store's id). A row that
+    /// fails to reload is logged rather than aborting the whole salvage.
+    /// Reload a [`GraphDump`] into this (fresh) store, recreating every node and
+    /// then every edge. Returns `(nodes_reloaded, edges_reloaded)`. Reserved
+    /// columns are stripped ([`salvage_props`]) so `add_node`/`add_edge` re-derive
+    /// them (the id is passed explicitly and `graph_origin` becomes this store's
+    /// id). A row that fails to reload is logged rather than aborting the whole
+    /// salvage — the caller compares the returned counts against the dump to
+    /// surface any partial reload.
+    pub(crate) fn reload_graph(&mut self, dump: &GraphDump) -> (usize, usize) {
+        let mut nodes_reloaded = 0usize;
+        for node in &dump.nodes {
+            match self.add_node(
+                &node.node_type,
+                salvage_props(&node.properties),
+                Some(&node.node_id),
+            ) {
+                Ok(_) => nodes_reloaded += 1,
+                Err(e) => warn!(
+                    node_id = %node.node_id,
+                    node_type = %node.node_type,
+                    error = %e,
+                    "lbug_store: failed to reload a salvaged node"
+                ),
+            }
+        }
+        let mut edges_reloaded = 0usize;
+        for edge in &dump.edges {
+            match self.add_edge(
+                &edge.source_id,
+                &edge.target_id,
+                &edge.edge_type,
+                Some(salvage_props(&edge.properties)),
+            ) {
+                Ok(_) => edges_reloaded += 1,
+                Err(e) => warn!(
+                    source = %edge.source_id,
+                    target = %edge.target_id,
+                    edge_type = %edge.edge_type,
+                    error = %e,
+                    "lbug_store: failed to reload a salvaged edge"
+                ),
+            }
+        }
+        (nodes_reloaded, edges_reloaded)
+    }
+
+    /// Salvage a recovered graph into a fresh, clean database.
+    ///
+    /// Reached when a resilient WAL replay recovered records but the in-place
+    /// `CHECKPOINT` that would fold them into the main database file failed
+    /// (#2550: a failed checkpoint-after-recovery left the recovered prefix only
+    /// in the WAL, and a later open then reset the store to empty). The recovered
+    /// graph — captured into `dump` while the resilient store was still open — is
+    /// reloaded into a brand-new database at `db_path`, whose checkpoint succeeds
+    /// because it starts clean. The un-checkpointable original is quarantined to
+    /// `<db_path>.corrupt-<ts>` (moved aside, never deleted).
+    ///
+    /// Durability is **verified, not assumed**: the freshly-loaded database is
+    /// dropped (flushing its clean WAL) and then **strict-reopened**, and the
+    /// returned store is that strict-reopened handle. So the returned
+    /// `recovered_records` is a count read back through a clean strict open — the
+    /// same open a later process performs — which is exactly the durability
+    /// guarantee. A short reload (fewer records than dumped) is surfaced loudly
+    /// rather than silently reported as a clean recovery.
+    fn salvage_rebuild(
+        db_path: &Path,
+        store_id: Option<&str>,
+        dump: GraphDump,
+        prior_quarantine: Option<PathBuf>,
+    ) -> crate::Result<(Self, WalRecovery)> {
+        let dumped_nodes = dump.nodes.len();
+        let dumped_edges = dump.edges.len();
+        let quarantine = quarantine_path(db_path);
+        let moved = quarantine_db_artifacts(db_path, &quarantine)?;
+
+        // Load the salvaged graph into a fresh database, then drop it so its clean
+        // WAL is flushed before we re-open to verify durability.
+        let (nodes_reloaded, edges_reloaded) = {
+            let db = open_database(db_path, true).map_err(|e| {
+                MemoryError::Storage(format!(
+                    "failed to open a fresh LadybugDB at {} while salvaging a recovered graph: {e}",
+                    db_path.display()
+                ))
+            })?;
+            let mut store = Self::from_parts(db, db_path, store_id);
+            let counts = store.reload_graph(&dump);
+            // A fresh database has no corrupt WAL, so this checkpoint folds the
+            // reload into the main file. Even if it fails, the reload is in the
+            // fresh, clean WAL (flushed on the drop below) and replays cleanly on
+            // the strict reopen — which is what actually verifies durability.
+            if let Err(e) = store.checkpoint() {
+                warn!(
+                    db_path = %db_path.display(),
+                    error = %e,
+                    "lbug_store: checkpoint of the salvaged database failed; the reload is in the \
+                     fresh clean WAL and will be verified by the strict reopen below"
+                );
+            }
+            counts
+        };
+
+        // Verify durability the same way a later process would see it: a strict
+        // reopen (replays the fresh clean WAL, or none if the checkpoint succeeded).
+        let db = open_database(db_path, true).map_err(|e| {
+            MemoryError::Storage(format!(
+                "salvaged database at {} could not be strict-reopened to verify durability: {e}",
+                db_path.display()
+            ))
+        })?;
+        let store = Self::from_parts(db, db_path, store_id);
+        let survived = store.count_all_nodes();
+        let quarantined = moved.or(prior_quarantine);
+        // `recovered_records` is the honest, strict-reopen-verified node count.
+        // A partial reload (nodes or edges) is preserved for availability but
+        // surfaced at error level with the expected vs surviving counts, never
+        // silently reported as a complete recovery.
+        if survived < dumped_nodes || edges_reloaded < dumped_edges {
+            tracing::error!(
+                db_path = %db_path.display(),
+                dumped_nodes,
+                dumped_edges,
+                nodes_reloaded,
+                edges_reloaded,
+                survived,
+                quarantined = ?quarantined,
+                "lbug_store: salvage recovered fewer records than were dumped (partial recovery); \
+                 the durable survivors are kept and the corrupt original is preserved at the \
+                 quarantine path for offline recovery of the remainder"
+            );
+        } else {
+            warn!(
+                db_path = %db_path.display(),
+                recovered_records = survived,
+                dumped_nodes,
+                dumped_edges,
+                edges_reloaded,
+                quarantined = ?quarantined,
+                "lbug_store: salvaged the recovered graph into a fresh database after a failed \
+                 checkpoint-after-recovery; the pre-corruption prefix is durable (verified by \
+                 strict reopen)"
+            );
+        }
+        let report = WalRecovery {
+            outcome: WalRecoveryOutcome::RecoveredPrefix,
+            recovered_records: survived,
+            quarantined_wal: quarantined,
+        };
+        Ok((store, report))
+    }
+
+    /// Best-effort read-only salvage of a possibly-corrupt database: open it
+    /// **read-only** (which can never mutate or further corrupt it) and dump every
+    /// live node/edge. Returns `None` if even a read-only open fails or the store
+    /// is empty, in which case the caller rebuilds from empty.
+    fn read_only_dump(db_path: &Path) -> Option<GraphDump> {
+        let db = try_open_database_read_only(db_path).ok()?;
+        let store = Self::from_parts(db, db_path, None);
+        // Belt-and-suspenders: seal so the drop below never attempts a `CHECKPOINT`
+        // against the store we are only inspecting (the engine is opened read-only,
+        // but sealing matches the #107 read-only-peek pattern and guarantees no
+        // write is even attempted).
+        store.seal();
+        let dump = store.dump_graph();
+        drop(store);
+        if dump.nodes.is_empty() {
+            None
+        } else {
+            Some(dump)
+        }
     }
 
     /// Create the parent directory of `db_path` if needed.
@@ -1018,6 +1293,78 @@ impl Drop for LbugGraphStore {
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// An in-memory snapshot of every live node and edge in a store.
+///
+/// Captured by [`LbugGraphStore::dump_graph`] and replayed by
+/// [`LbugGraphStore::reload_graph`] to salvage a recovered graph into a fresh
+/// database when an in-place checkpoint fails (#2550), so the pre-corruption
+/// prefix is persisted durably instead of being reset to empty.
+pub(crate) struct GraphDump {
+    /// Every live node, with its type and (non-reserved) properties.
+    pub(crate) nodes: Vec<GraphNode>,
+    /// Every live edge, with its endpoints, type and (non-reserved) properties.
+    pub(crate) edges: Vec<GraphEdge>,
+}
+
+/// Strip reserved/internal columns from a salvaged node/edge property map so a
+/// reload via `add_node`/`add_edge` re-derives them: the id is passed explicitly,
+/// `graph_origin` is set to the destination store, and the tombstone column
+/// defaults to "live". Underscore-prefixed columns are engine/internal by
+/// convention and are never user data.
+///
+/// Note: salvage preserves node ids, node/edge types, endpoints, and all user
+/// properties (the durable-recall payload). It does **not** preserve edge ids
+/// (`add_edge` mints a fresh `edge_id`) or the original per-record `graph_origin`
+/// (reset to the destination store) — those are internal/federation metadata, not
+/// recall content.
+fn salvage_props(properties: &HashMap<String, String>) -> HashMap<String, String> {
+    properties
+        .iter()
+        .filter(|(k, _)| {
+            k.as_str() != "node_id"
+                && k.as_str() != "edge_id"
+                && k.as_str() != "graph_origin"
+                && !k.starts_with('_')
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Test-only deterministic fault injection for the recovery path.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Number of upcoming [`LbugGraphStore::recovery_checkpoint`] calls on this
+        /// thread that must be forced to fail. Thread-local so parallel tests do
+        /// not interfere; recovery runs synchronously on the caller's thread.
+        static FORCED_RECOVERY_CHECKPOINT_FAILURES: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Force the next `n` checkpoint-after-recovery attempts on this thread to
+    /// fail, reproducing the #2550 "checkpoint after recovery failed" incident
+    /// deterministically. Only the recovery in-place checkpoint consults this — the
+    /// salvage path's fresh-database checkpoint is unaffected.
+    pub(crate) fn force_recovery_checkpoint_failures(n: u32) {
+        FORCED_RECOVERY_CHECKPOINT_FAILURES.with(|c| c.set(n));
+    }
+
+    /// Returns `true` (and decrements the pending count) if a forced recovery
+    /// checkpoint failure is queued.
+    pub(crate) fn take_forced_recovery_checkpoint_failure() -> bool {
+        FORCED_RECOVERY_CHECKPOINT_FAILURES.with(|c| {
+            let n = c.get();
+            if n > 0 {
+                c.set(n - 1);
+                true
+            } else {
+                false
+            }
+        })
+    }
+}
 
 /// Reserved tombstone column used for soft deletes (#100).
 ///

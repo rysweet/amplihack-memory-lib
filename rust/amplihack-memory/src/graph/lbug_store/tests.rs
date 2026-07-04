@@ -422,6 +422,203 @@ fn open_with_recovery_survives_corrupt_wal_and_returns_checkpointed_records() {
     drop(crash);
 }
 
+/// #2550 regression — the objective's hermetic corrupt-WAL test: write a
+/// known-good WAL, corrupt only its tail bytes, reopen, and assert recovery
+/// completes without an assertion/crash and with **every pre-corruption record**
+/// (not just the checkpointed ones) intact and durable across a strict reopen.
+#[test]
+fn open_with_recovery_preserves_every_precorruption_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        // Keep everything in the WAL until we explicitly checkpoint.
+        store.set_checkpoint_interval(0);
+        // A durable, checkpointed prefix ...
+        add_things(&mut store, 0, 30);
+        // ... plus a canary carrying real content, to prove *content* survives, not
+        // just node ids.
+        store
+            .add_node(
+                "T",
+                props(&[
+                    ("node_id", "canary"),
+                    ("agent_id", "a"),
+                    ("payload", "keep-me"),
+                ]),
+                Some("canary"),
+            )
+            .unwrap();
+        store.checkpoint().unwrap();
+        // A larger batch that lives ONLY in the WAL (never checkpointed) — this is
+        // the "known-good WAL" whose tail we corrupt.
+        add_things(&mut store, 30, 40);
+        std::mem::forget(store); // unclean: no close, no final checkpoint
+    }
+
+    // Snapshot the on-disk files and corrupt only the WAL tail of the copy.
+    let (crash, crash_db) = crash_snapshot(path.parent().unwrap(), "graph.ladybug");
+    let crash_wal = wal_path_for(&crash_db);
+    assert!(crash_wal.exists(), "snapshot must include the WAL");
+    corrupt_wal_tail(&crash_wal);
+
+    // A strict open crashes on the corrupt WAL (the incident).
+    assert!(
+        LbugGraphStore::open(&crash_db, Some("s")).is_err(),
+        "strict open of a corrupt WAL should error"
+    );
+
+    // Recovery opens without crashing and replays the good prefix.
+    let (store, report) =
+        LbugGraphStore::open_with_recovery(&crash_db, Some("s")).expect("recovery must open");
+    assert!(report.recovered(), "report should flag that recovery ran");
+    // Only the corrupt tail record(s) may be lost; the whole pre-corruption prefix
+    // (30 checkpointed + canary + the WAL-only batch up to the corruption) must be
+    // intact — far more than the checkpointed prefix alone.
+    let recovered = store.count_all_nodes();
+    assert!(
+        recovered > 31,
+        "the WAL-only pre-corruption records must survive too, not just the 31 \
+         checkpointed ones; got {recovered}"
+    );
+    // Specific early/mid records — and the canary's content — must be present.
+    assert!(store.get_node("n0").is_some(), "first record must survive");
+    assert!(
+        store.get_node("canary").is_some(),
+        "checkpointed canary must survive"
+    );
+    assert_eq!(
+        store
+            .get_node("canary")
+            .unwrap()
+            .properties
+            .get("payload")
+            .map(String::as_str),
+        Some("keep-me"),
+        "record *content* (not just ids) must survive recovery"
+    );
+    drop(store);
+
+    // Durability: a STRICT reopen (no recovery) still sees the same records, so the
+    // recovered prefix was truly persisted, not left only in the consumed WAL.
+    let reopened =
+        LbugGraphStore::open(&crash_db, Some("s")).expect("clean strict reopen after recovery");
+    assert_eq!(
+        reopened.count_all_nodes(),
+        recovered,
+        "recovery must be durable across a strict reopen"
+    );
+    assert!(reopened.get_node("canary").is_some());
+
+    drop(crash);
+}
+
+/// #2550 regression — the exact incident: WAL recovery replays the good prefix
+/// but the checkpoint-after-recovery **fails**, so the recovered records live only
+/// in the (now-quarantined) WAL and a later open resets the store to empty.
+///
+/// With the fix, a failed checkpoint-after-recovery salvages the recovered graph
+/// into a fresh, clean database, so every pre-corruption record survives **and is
+/// durable across a strict reopen** — the store is never reset to empty.
+#[test]
+fn recovery_is_durable_when_checkpoint_after_recovery_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        store.set_checkpoint_interval(0);
+        add_things(&mut store, 0, 30);
+        store
+            .add_node(
+                "T",
+                props(&[
+                    ("node_id", "canary"),
+                    ("agent_id", "a"),
+                    ("payload", "keep-me"),
+                ]),
+                Some("canary"),
+            )
+            .unwrap();
+        store.checkpoint().unwrap();
+        add_things(&mut store, 30, 40); // WAL-only batch
+        std::mem::forget(store);
+    }
+
+    let (crash, crash_db) = crash_snapshot(path.parent().unwrap(), "graph.ladybug");
+    let crash_wal = wal_path_for(&crash_db);
+    corrupt_wal_tail(&crash_wal);
+
+    // Force the checkpoint-after-recovery to fail exactly once, reproducing the
+    // incident where the recovered prefix could not be folded into the main file.
+    super::test_hooks::force_recovery_checkpoint_failures(1);
+    let (store, report) =
+        LbugGraphStore::open_with_recovery(&crash_db, Some("s")).expect("recovery must open");
+    // Belt-and-suspenders: clear any residual injection for this thread.
+    super::test_hooks::force_recovery_checkpoint_failures(0);
+
+    // Recovery salvaged the prefix rather than resetting to empty.
+    assert_eq!(
+        report.outcome,
+        WalRecoveryOutcome::RecoveredPrefix,
+        "a failed checkpoint-after-recovery must salvage, not reset to empty"
+    );
+    let recovered = store.count_all_nodes();
+    assert!(
+        recovered > 31,
+        "salvage must preserve the WAL-only pre-corruption records too; got {recovered}"
+    );
+    assert!(store.get_node("n0").is_some());
+    assert_eq!(
+        store
+            .get_node("canary")
+            .unwrap()
+            .properties
+            .get("payload")
+            .map(String::as_str),
+        Some("keep-me"),
+        "salvaged record content must survive"
+    );
+    // The un-checkpointable original was quarantined (moved aside, never deleted).
+    let quarantine = report
+        .quarantined_wal
+        .as_ref()
+        .expect("a quarantine artifact");
+    assert!(
+        quarantine.exists(),
+        "quarantined artifact must be preserved at {quarantine:?}"
+    );
+    // The salvage path quarantines the whole DB (`<db>.corrupt-*`), distinct from
+    // the ordinary recovery path which only quarantines the WAL copy
+    // (`<db>.wal.corrupt-*`). Asserting the DB-level quarantine proves the salvage
+    // actually ran rather than the test passing via the ordinary path.
+    assert!(
+        quarantine
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("ladybug.corrupt-"),
+        "salvage must quarantine the whole database, was {quarantine:?}"
+    );
+    drop(store);
+
+    // The incident's actual failure was HERE: a later open reset the store to
+    // empty. With the salvage fix, a strict reopen still sees every record.
+    let reopened = LbugGraphStore::open(&crash_db, Some("s")).expect("strict reopen after salvage");
+    assert_eq!(
+        reopened.count_all_nodes(),
+        recovered,
+        "salvaged recovery must be durable across a reopen — never reset to empty"
+    );
+    assert!(
+        reopened.get_node("canary").is_some(),
+        "salvaged content must survive the reopen"
+    );
+
+    drop(crash);
+}
+
 #[test]
 fn open_with_recovery_is_a_noop_on_a_clean_store() {
     let tmp = tempfile::tempdir().unwrap();
