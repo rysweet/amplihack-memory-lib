@@ -46,6 +46,29 @@ impl CognitiveMemory {
         Ok(node_id)
     }
 
+    /// Return up to `limit` prospective memories for this agent, in every
+    /// status (`pending` / `triggered` / `resolved`), ordered by priority
+    /// (highest first).
+    ///
+    /// A **pure read** (`&self`): unlike [`check_triggers`](Self::check_triggers)
+    /// it neither filters by content nor mutates any node's status, so it is
+    /// safe to call from a backup / export path. Added for the Simard verified
+    /// snapshot (Simard issue #2550): a complete cognitive-memory backup must
+    /// enumerate every prospective memory so a restore round-trips them. The
+    /// prior snapshot captured only facts + procedures, which is exactly why a
+    /// corruption-reset dropped every prospective trigger with no way back.
+    pub fn get_all_prospective(&self, limit: usize) -> Vec<ProspectiveMemory> {
+        let filter = agent_filter(&self.agent_name);
+        let nodes = self.graph.query_nodes(NT_PROSPECTIVE, Some(&filter), limit);
+
+        let mut out: Vec<ProspectiveMemory> = nodes
+            .iter()
+            .map(|n| node_to_prospective(&n.properties))
+            .collect();
+        out.sort_by_key(|pm| std::cmp::Reverse(pm.priority));
+        out
+    }
+
     /// Check pending prospective memories against provided content.
     ///
     /// Uses a keyword-overlap heuristic: if any word from the
