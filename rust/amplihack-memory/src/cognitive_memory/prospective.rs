@@ -11,8 +11,18 @@ use super::converters::node_to_prospective;
 use super::types::{agent_filter, new_id, ts_now, NT_PROSPECTIVE};
 use super::CognitiveMemory;
 
+/// Default lifecycle status a freshly stored prospective memory carries.
+const DEFAULT_PROSPECTIVE_STATUS: &str = "pending";
+
 impl CognitiveMemory {
     /// Store a trigger-action pair for future evaluation.
+    ///
+    /// The memory starts in the [`DEFAULT_PROSPECTIVE_STATUS`] (`"pending"`)
+    /// status, so it is eligible to fire from
+    /// [`check_triggers`](Self::check_triggers). Use
+    /// [`store_prospective_with_status`](Self::store_prospective_with_status)
+    /// when a caller must persist an explicit status (e.g. a restore path that
+    /// round-trips a previously `resolved`/`triggered` memory).
     pub fn store_prospective(
         &mut self,
         description: &str,
@@ -20,8 +30,43 @@ impl CognitiveMemory {
         action_on_trigger: &str,
         priority: i32,
     ) -> Result<String> {
+        self.store_prospective_with_status(
+            description,
+            trigger_condition,
+            action_on_trigger,
+            priority,
+            DEFAULT_PROSPECTIVE_STATUS,
+        )
+    }
+
+    /// Store a trigger-action pair with an explicit lifecycle `status`
+    /// (`"pending"` / `"triggered"` / `"resolved"`).
+    ///
+    /// [`store_prospective`](Self::store_prospective) always starts a memory
+    /// `"pending"`. This variant lets a restore path preserve the original
+    /// status captured in a snapshot, so a `resolved`/`triggered` prospective
+    /// does **not** come back `"pending"` and re-fire from
+    /// [`check_triggers`](Self::check_triggers) after an import (Simard issue
+    /// #2562). An empty `status` is normalised to
+    /// [`DEFAULT_PROSPECTIVE_STATUS`] so a malformed snapshot cannot persist a
+    /// blank status that would silently never match either the pending or the
+    /// resolved paths.
+    pub fn store_prospective_with_status(
+        &mut self,
+        description: &str,
+        trigger_condition: &str,
+        action_on_trigger: &str,
+        priority: i32,
+        status: &str,
+    ) -> Result<String> {
         let node_id = new_id("pro");
         let now = ts_now();
+
+        let status = if status.is_empty() {
+            DEFAULT_PROSPECTIVE_STATUS
+        } else {
+            status
+        };
 
         let mut props = HashMap::new();
         props.insert("node_id".to_string(), node_id.clone());
@@ -35,7 +80,7 @@ impl CognitiveMemory {
             "action_on_trigger".to_string(),
             action_on_trigger.to_string(),
         );
-        props.insert("status".to_string(), "pending".to_string());
+        props.insert("status".to_string(), status.to_string());
         props.insert("priority".to_string(), priority.to_string());
         props.insert("created_at".to_string(), now.to_string());
 
