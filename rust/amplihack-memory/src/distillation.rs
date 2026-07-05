@@ -197,9 +197,13 @@ fn split_sentences(text: &str) -> Vec<String> {
         if !is_terminator(c) {
             continue;
         }
-        // Absorb any adjacent run of terminators.
+        // Absorb any adjacent run of terminators, preserving them so no
+        // characters are lost when the run is not a sentence boundary
+        // (e.g. stacked punctuation like "a.?b"); trailing runs before a real
+        // boundary are stripped later by `normalize_fact`.
         while let Some(&next) = chars.peek() {
             if is_terminator(next) {
+                current.push(next);
                 chars.next();
             } else {
                 break;
@@ -327,6 +331,16 @@ mod tests {
         assert_eq!(
             distill_episode("The value of pi is 3.14 here."),
             vec!["The value of pi is 3.14 here".to_string()]
+        );
+    }
+
+    #[test]
+    fn preserves_stacked_terminators_without_dropping_characters() {
+        // A terminator run not followed by whitespace is not a boundary and
+        // must not drop characters (regression for the "a.?b" -> "a.b" quirk).
+        assert_eq!(
+            distill_episode("The ratio a.?b held across the runs."),
+            vec!["The ratio a.?b held across the runs".to_string()]
         );
     }
 
