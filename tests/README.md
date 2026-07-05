@@ -323,13 +323,42 @@ def test_error():
 def test_retrieve():
 ```
 
+## Recall-Quality Benchmark (internal test infra)
+
+`test_recall_quality_benchmark.py` is a **durable recall-quality regression
+guard**, not a public API. It measures how well the existing recall/ranking path
+(`semantic_search.retrieve_relevant_experiences`) surfaces known-relevant
+experiences for a fixed, hand-labelled fixture corpus, using two standard
+information-retrieval metrics:
+
+- **precision@k** — fraction of the top-`k` results that are relevant (averaged
+  over queries).
+- **MRR** — mean reciprocal rank of the first relevant result.
+
+The corpus is deterministic (stable `experience_id`s and a single shared
+timestamp, so recency never affects relative ordering) and the ranking path is
+pure Python (no ML deps), so the metrics are byte-stable across runs. The tests
+assert the metrics never drop below recorded baselines, so any change that
+degrades recall ranking fails CI (the `python-tests` job).
+
+```bash
+# Run the regression tests
+pytest tests/test_recall_quality_benchmark.py -v
+
+# Print a standalone metrics report
+python tests/test_recall_quality_benchmark.py
+```
+
+The reusable entry points (`RECALL_BENCH_CORPUS`, `RECALL_BENCH_QUERIES`,
+`precision_at_k`, `reciprocal_rank`, `evaluate_recall`) can be imported by other
+harnesses.
+
 ## Resources
 
 - [pytest documentation](https://docs.pytest.org/)
 - [pytest fixtures](https://docs.pytest.org/en/stable/fixture.html)
 - [pytest parametrize](https://docs.pytest.org/en/stable/parametrize.html)
 - [Coverage.py](https://coverage.readthedocs.io/)
-
 ---
 
 **Last Updated**: 2026-02-14

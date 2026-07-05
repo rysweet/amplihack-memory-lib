@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Recall ranking: stop-word/punctuation-blind similarity tokenizer.**
+  `semantic_search.TFIDFSimilarity.calculate` (the base scorer behind
+  `retrieve_relevant_experiences` / `SemanticSearchEngine.search`) tokenized with a
+  bare `str.split()`, so stop words and punctuation counted toward Jaccard overlap.
+  Topically unrelated notes that merely shared question-scaffolding words ("how do
+  we …", "how to …") were scored as relevant and out-ranked genuinely relevant
+  experiences. It now reuses the content-aware `similarity._tokenize` (lowercase,
+  strip punctuation, drop stop words and short tokens), a single source of truth
+  for tokenization. On the new recall-quality benchmark corpus this raises
+  precision@3 from 0.2500 → 0.4583 and MRR from 0.4938 → 1.0000. Internal scorer
+  only (not part of the public API); all existing tests pass unchanged.
 - **Critical durable-recall data loss on WAL recovery (#2550, Simard #2550):**
   `LbugGraphStore::open_with_recovery` could permanently drop tens of thousands of
   recovered memories. On a corrupt-WAL open it replayed the good prefix and
@@ -113,6 +124,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpoint folds the survivors into the main database file.
 
 ### Added
+- **Durable recall-quality regression benchmark** (`tests/test_recall_quality_benchmark.py`).
+  Internal test infrastructure that guards the "recall quality" axis: a fixed,
+  hand-labelled fixture corpus of agent experiences with known query→relevant
+  results, plus a precision@k and MRR harness over the existing recall/ranking path
+  (`semantic_search.retrieve_relevant_experiences`). CI-gated (runs in the
+  `python-tests` job) — the metrics must never drop below the recorded baselines
+  (precision@3 ≥ 0.4583, MRR ≥ 1.0), so any future change that degrades recall
+  ranking fails CI. Deterministic (stable ids + shared timestamp; pure Python, no
+  ML deps).
 - `AMPLIHACK_MEMORY_BUFFER_POOL_BYTES` / `AMPLIHACK_MEMORY_MAX_DB_BYTES`
   environment overrides for the LadybugDB buffer-pool cap and max database size,
   plus `LbugGraphStore::buffer_pool_bytes()` / `max_db_bytes()` getters for the
