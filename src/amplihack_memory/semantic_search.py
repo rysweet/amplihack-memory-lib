@@ -3,6 +3,7 @@
 from datetime import datetime
 
 from .experience import Experience, ExperienceType
+from .similarity import _tokenize
 
 
 def calculate_relevance(experience: Experience, query: str) -> float:
@@ -48,7 +49,14 @@ class TFIDFSimilarity:
     def calculate(self, text1: str, text2: str) -> float:
         """Calculate similarity between two texts.
 
-        Uses simple word overlap as approximation.
+        Uses Jaccard word overlap after content-aware tokenization: text is
+        lowercased, punctuation is stripped, and stop words plus very short
+        tokens are removed (shared with :func:`amplihack_memory.similarity._tokenize`).
+
+        Ignoring stop words and punctuation prevents topically unrelated notes
+        that merely share question-scaffolding words ("how do we ...") from
+        being scored as relevant, which would otherwise demote genuinely
+        relevant experiences in the ranking.
 
         Args:
             text1: First text
@@ -60,9 +68,10 @@ class TFIDFSimilarity:
         if not text1 or not text2:
             return 0.0
 
-        # Normalize and tokenize
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
+        # Content-aware tokenization: lowercase, strip punctuation, drop stop
+        # words and short tokens (single source of truth: similarity._tokenize).
+        words1 = _tokenize(text1)
+        words2 = _tokenize(text2)
 
         if not words1 or not words2:
             return 0.0

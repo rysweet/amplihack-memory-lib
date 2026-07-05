@@ -1,0 +1,79 @@
+name: recall-quality-benchmark
+app_type: cli
+description: |
+  Verify the durable recall-quality regression benchmark
+  (tests/test_recall_quality_benchmark.py) is present, deterministic, and
+  actually enforces the recorded precision@k / MRR baselines over the existing
+  recall/ranking path (semantic_search.retrieve_relevant_experiences).
+
+  Behaviour is proven by the hermetic pytest suite this scenario drives (fixed
+  fixture corpus, stable experience ids, single shared timestamp; pure Python,
+  no ML deps, no network, no on-disk store — no destructive action against the
+  host). Each pytest step asserts a *positive* pass count ("N passed"), not just
+  a zero exit: a filter matching zero tests also exits 0, so a renamed/removed
+  test would pass the scenario vacuously — the pass-count assertion closes that
+  hollow-verification gap.
+agents:
+  - name: memory-cli
+    type: cli
+    command: uv
+
+steps:
+  # (1) The standalone metrics report runs cleanly (exercises the __main__
+  #     reporting path over the production recall/ranking path).
+  - action: run
+    params:
+      command: "uv run python tests/test_recall_quality_benchmark.py"
+      timeout: 120000
+  - action: validate_exit_code
+    params:
+      value: "0"
+      timeout: 5000
+
+  # (2) The full benchmark regression suite passes, and there are exactly the
+  #     expected four tests (well-formed corpus/labels, precision@3, MRR,
+  #     metric helpers). The pass-count assertion defeats hollow verification.
+  - action: run
+    params:
+      command: "uv run pytest tests/test_recall_quality_benchmark.py -q"
+      timeout: 120000
+  - action: wait_for_output
+    params:
+      value: "4 passed"
+      timeout: 10000
+  - action: validate_exit_code
+    params:
+      value: "0"
+      timeout: 5000
+
+  # (3) The two baseline-guard tests specifically pass (precision@3 >= baseline
+  #     and MRR >= baseline). Selecting them by name proves the guards are the
+  #     thing being enforced, not merely that some tests ran.
+  - action: run
+    params:
+      command: "uv run pytest tests/test_recall_quality_benchmark.py -q -k 'precision or mrr'"
+      timeout: 120000
+  - action: wait_for_output
+    params:
+      value: "2 passed"
+      timeout: 10000
+  - action: validate_exit_code
+    params:
+      value: "0"
+      timeout: 5000
+
+  # (4) The recall/ranking path the benchmark exercises still passes its own unit
+  #     suite after the TFIDFSimilarity tokenizer fix (no regression). 45 = the
+  #     semantic-search + similarity tests combined.
+  - action: run
+    params:
+      command: "uv run pytest tests/test_semantic_search.py tests/test_similarity.py -q"
+      timeout: 120000
+  - action: wait_for_output
+    params:
+      value: "45 passed"
+      timeout: 10000
+  - action: validate_exit_code
+    params:
+      value: "0"
+      timeout: 5000

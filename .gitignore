@@ -50,3 +50,7 @@ site/
 # OS
 .DS_Store
 Thumbs.db
+
+# gadugi-test (qa-scenarios) run artifacts
+outputs/
+logs/
