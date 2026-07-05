@@ -134,6 +134,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Automatic checkpointing every `AUTO_CHECKPOINT_WRITES` (128) writes and on
   `close` / `Drop`, bounding how much data an unclean shutdown can strand in the
   WAL.
+- **Deterministic episodic→semantic distillation heuristic + fact-yield
+  benchmark (#117):** new `distillation` module with `distill_episode` /
+  `distill_corpus` — a pure, dependency-free extractor that segments free-text
+  episodes into atomic semantic-fact candidates (sentence + conjunctive-clause
+  splitting, whitespace/punctuation normalisation, trivial-fragment filtering)
+  and exact-dedups them case-insensitively with insertion order preserved. Adds
+  a fixed `FACT_YIELD_BENCH_CORPUS` with `fact_yield` / `fact_yield_baseline`
+  helpers: the naive one-fact-per-episode baseline yields `FACT_YIELD_BASELINE`
+  (7) durable facts, while atomic segmentation yields `FACT_YIELD_IMPROVED` (13)
+  — an +86% measurable gain locked in by a regression test asserting the yield
+  never drops below the recorded baseline.
 
 ## [0.4.0] - 2026-03-13
 

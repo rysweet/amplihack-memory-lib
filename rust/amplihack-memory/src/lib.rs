@@ -59,6 +59,8 @@ pub mod cognitive_memory;
 pub mod connector;
 /// Contradiction detection between memory facts.
 pub mod contradiction;
+/// Deterministic episodic→semantic distillation heuristics and fact-yield benchmark.
+pub mod distillation;
 /// Named-entity extraction from free-text content.
 pub mod entity_extraction;
 /// Error types and the crate-wide `Result` alias.
@@ -108,6 +110,11 @@ pub use similarity::{
 
 /// Contradiction detection result types.
 pub use contradiction::{detect_contradiction, ContradictionResult};
+/// Deterministic distillation heuristics and the fact-yield benchmark.
+pub use distillation::{
+    distill_corpus, distill_episode, fact_yield, fact_yield_baseline, FACT_YIELD_BASELINE,
+    FACT_YIELD_BENCH_CORPUS, FACT_YIELD_IMPROVED,
+};
 /// Entity-name extraction from free-text.
 pub use entity_extraction::extract_entity_name;
 
