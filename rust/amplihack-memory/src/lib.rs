@@ -71,6 +71,8 @@ pub mod experience;
 pub mod graph;
 /// Hierarchical knowledge graph with classification and similarity linking.
 pub mod hierarchical_memory;
+/// Deterministic recall-quality measurement primitives (precision@k).
+pub mod measurement;
 /// Cognitive memory type definitions (sensory, working, episodic, etc.).
 pub mod memory_types;
 /// Pattern recognition engine for extracting recurring patterns from experiences.
