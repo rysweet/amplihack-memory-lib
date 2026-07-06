@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Creative-idea prospective memory type + typed memory links
+  (`creative_idea` module).** A first-class memory-model definition for
+  *creative ideas* — future-oriented candidate self-improvements stored as
+  prospective memories. Owns the lifecycle `CreativeIdeaStatus` state machine
+  (validated `can_transition_to`, terminal states, fail-closed `FromStr`) and
+  the typed `MemoryLink`/`MemoryLinkKind` edge taxonomy (`Semantic`,
+  `Episodic`, `Procedural`, `Goal`) linking an idea to its supporting cognitive
+  memory nodes, plus the stable `CREATIVE_IDEA_TRIGGER` prospective sentinel and
+  `CREATIVE_IDEA_PAYLOAD_VERSION`. Purely additive; layers on the existing
+  prospective primitive with no schema change so consumers orchestrate around
+  the library rather than re-deriving the lifecycle/link taxonomy.
+
 ### Fixed
 - **Recall ranking: stop-word/punctuation-blind similarity tokenizer.**
   `semantic_search.TFIDFSimilarity.calculate` (the base scorer behind
