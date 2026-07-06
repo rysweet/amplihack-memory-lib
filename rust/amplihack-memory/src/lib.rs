@@ -59,6 +59,8 @@ pub mod cognitive_memory;
 pub mod connector;
 /// Contradiction detection between memory facts.
 pub mod contradiction;
+/// Creative-idea prospective memory type: lifecycle state machine + typed links.
+pub mod creative_idea;
 /// Deterministic episodic→semantic distillation heuristics and fact-yield benchmark.
 pub mod distillation;
 /// Named-entity extraction from free-text content.
@@ -103,6 +105,12 @@ pub use experience::{Experience, ExperienceType};
 pub use memory_types::{
     ConsolidatedEpisode, EpisodicMemory, MemoryCategory, ProceduralMemory, ProspectiveMemory,
     SemanticFact, SensoryItem, WorkingMemorySlot,
+};
+
+/// Creative-idea prospective memory type: lifecycle + typed memory links.
+pub use creative_idea::{
+    CreativeIdeaStatus, MemoryLink, MemoryLinkKind, ParseCreativeIdeaError,
+    CREATIVE_IDEA_PAYLOAD_VERSION, CREATIVE_IDEA_TRIGGER,
 };
 
 /// Deterministic text-similarity scoring functions.
