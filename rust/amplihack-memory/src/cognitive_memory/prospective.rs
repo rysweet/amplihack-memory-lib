@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::memory_types::ProspectiveMemory;
 use crate::{MemoryError, Result};
 
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::converters::node_to_prospective;
 use super::types::{agent_filter, new_id, ts_now, NT_PROSPECTIVE};
@@ -57,16 +57,80 @@ impl CognitiveMemory {
     /// enumerate every prospective memory so a restore round-trips them. The
     /// prior snapshot captured only facts + procedures, which is exactly why a
     /// corruption-reset dropped every prospective trigger with no way back.
+    ///
+    /// When the store holds more than `limit` prospectives this returns the true
+    /// **top-`limit` by priority**: the ordering is pushed into the query so the
+    /// database sorts *before* it truncates (issue #124). The prior
+    /// implementation truncated to an arbitrary `limit` window first and sorted
+    /// in Rust afterwards, silently dropping lower-priority nodes.
+    ///
+    /// The `-> Vec` signature is frozen for backward compatibility, so this
+    /// cannot return `Err`. It is nonetheless **fail-closed**: on a genuine
+    /// backend read error it logs via `tracing::error!` (the error only — never
+    /// node payloads) and returns an empty `Vec`, rather than silently masking
+    /// the failure. A caller that must distinguish a confirmed-empty store from
+    /// an unreadable one should use [`get_prospective_by_trigger`](Self::get_prospective_by_trigger),
+    /// which propagates the error.
     pub fn get_all_prospective(&self, limit: usize) -> Vec<ProspectiveMemory> {
         let filter = agent_filter(&self.agent_name);
-        let nodes = self.graph.query_nodes(NT_PROSPECTIVE, Some(&filter), limit);
+        match self.graph.query_nodes_ordered(
+            NT_PROSPECTIVE,
+            Some(&filter),
+            "priority",
+            true,
+            true,
+            limit,
+        ) {
+            Ok(nodes) => sorted_prospectives(&nodes),
+            Err(e) => {
+                error!("get_all_prospective: prospective read failed: {e}");
+                Vec::new()
+            }
+        }
+    }
 
-        let mut out: Vec<ProspectiveMemory> = nodes
-            .iter()
-            .map(|n| node_to_prospective(&n.properties))
-            .collect();
-        out.sort_by_key(|pm| std::cmp::Reverse(pm.priority));
-        out
+    /// Return up to `limit` prospective memories for **this agent** whose
+    /// `trigger_condition` **equals** `trigger`, ordered by priority descending
+    /// (highest first), across every status (`pending` / `triggered` /
+    /// `resolved`).
+    ///
+    /// A **pure read** (`&self`): it neither mutates node status nor runs the
+    /// keyword-overlap heuristic used by [`check_triggers`](Self::check_triggers).
+    /// The match is an **exact-equality** filter on `trigger_condition` pushed
+    /// into the query, so the `LIMIT` bounds only *matching* nodes: a
+    /// sentinel-tagged prospective (e.g. a `"creative-idea-thread"` dashboard
+    /// node) is returned even when the store holds far more than `limit`
+    /// higher-priority nodes carrying other triggers.
+    ///
+    /// This is the fix for the issue #124 user-facing bug: a dashboard that
+    /// called `get_all_prospective(512)` and filtered by a sentinel in Rust
+    /// showed **zero** ideas in a large store, because the low-priority idea
+    /// nodes fell outside the arbitrary 512-row window. Filtering in the query
+    /// removes that window entirely.
+    ///
+    /// **Fail-closed:** a genuine backend read error is **propagated** as `Err`,
+    /// never masked as an empty `Ok(vec![])`. An empty `Ok(vec![])` therefore
+    /// means a *confirmed* absence of matching prospectives.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(MemoryError)` if the backend read fails.
+    pub fn get_prospective_by_trigger(
+        &self,
+        trigger: &str,
+        limit: usize,
+    ) -> Result<Vec<ProspectiveMemory>> {
+        let mut filter = agent_filter(&self.agent_name);
+        filter.insert("trigger_condition".to_string(), trigger.to_string());
+        let nodes = self.graph.query_nodes_ordered(
+            NT_PROSPECTIVE,
+            Some(&filter),
+            "priority",
+            true,
+            true,
+            limit,
+        )?;
+        Ok(sorted_prospectives(&nodes))
     }
 
     /// Check pending prospective memories against provided content.
@@ -132,4 +196,19 @@ impl CognitiveMemory {
             warn!("resolve_prospective: failed to update node {node_id}");
         }
     }
+}
+
+/// Map graph nodes to [`ProspectiveMemory`] and re-sort by priority descending.
+///
+/// The backend already ordered and truncated to the requested window; this
+/// final Rust sort makes the observable order identical across every backend
+/// (including the in-memory default), so callers see a single deterministic
+/// contract regardless of which store is underneath.
+fn sorted_prospectives(nodes: &[crate::graph::types::GraphNode]) -> Vec<ProspectiveMemory> {
+    let mut out: Vec<ProspectiveMemory> = nodes
+        .iter()
+        .map(|n| node_to_prospective(&n.properties))
+        .collect();
+    out.sort_by_key(|pm| std::cmp::Reverse(pm.priority));
+    out
 }

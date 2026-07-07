@@ -147,6 +147,78 @@ impl GraphStore for KuzuGraphStore {
         })
     }
 
+    fn query_nodes_ordered(
+        &self,
+        node_type: &str,
+        filters: Option<&HashMap<String, String>>,
+        order_by: &str,
+        numeric: bool,
+        descending: bool,
+        limit: usize,
+    ) -> crate::Result<Vec<GraphNode>> {
+        // `order_by` is spliced into the ORDER BY clause, so validate it before
+        // anything else — an invalid column is rejected, never executed.
+        validate_identifier(order_by)?;
+
+        // A genuinely-absent table (fresh/never-created type) is a confirmed
+        // empty for that type, not a read error.
+        if !is_valid_identifier(node_type) || !self.known_node_tables.contains(node_type) {
+            return Ok(Vec::new());
+        }
+
+        let _guard = self.acquire_lock();
+
+        Python::with_gil(|py| {
+            let mut where_parts: Vec<String> = Vec::new();
+            let params = PyDict::new_bound(py);
+
+            if let Some(f) = filters {
+                for (idx, (k, v)) in f.iter().enumerate() {
+                    if !is_valid_identifier(k) {
+                        return Err(crate::MemoryError::InvalidInput(format!(
+                            "invalid filter key {k:?}: must match [A-Za-z_][A-Za-z0-9_]*"
+                        )));
+                    }
+                    let pname = format!("f{idx}");
+                    where_parts.push(format!("n.{k} = ${pname}"));
+                    params
+                        .set_item(&pname, v)
+                        .map_err(|e| crate::MemoryError::Storage(format!("param error: {e}")))?;
+                }
+            }
+
+            let where_clause = if where_parts.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", where_parts.join(" AND "))
+            };
+            // Numeric ordering casts the string-stored value so `10` outranks `9`.
+            let order_expr = if numeric {
+                format!("CAST(n.{order_by} AS INT64)")
+            } else {
+                format!("n.{order_by}")
+            };
+            let dir = if descending { "DESC" } else { "ASC" };
+            // usize::MAX means "no cap"; omit LIMIT so it never overflows the
+            // engine's signed limit.
+            let limit_clause = if limit >= i64::MAX as usize {
+                String::new()
+            } else {
+                format!(" LIMIT {limit}")
+            };
+            // ORDER BY is applied before LIMIT, so the DB sorts *then* truncates.
+            let cypher = format!(
+                "MATCH (n:{node_type}){where_clause} \
+                 RETURN n ORDER BY {order_expr} {dir}{limit_clause}"
+            );
+
+            // Fail closed: propagate a genuine read error instead of swallowing
+            // it to an empty result.
+            let result = self.execute_cypher(py, &cypher, &params)?;
+            Ok(Self::collect_nodes(py, &result, node_type))
+        })
+    }
+
     fn search_nodes(
         &self,
         node_type: &str,
