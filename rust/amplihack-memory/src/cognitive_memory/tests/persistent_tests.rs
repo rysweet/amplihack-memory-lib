@@ -1208,3 +1208,107 @@ fn prune_archive_then_delete_persists_across_reopen() {
         "retained fact persists across reopen"
     );
 }
+
+// -- issue #124: ordered + trigger-scoped prospective recall on the durable
+//    LadybugDB backend. Exercises the real ORDER BY CAST(... AS INT64) DESC /
+//    trigger-filtered Cypher (not just the in-memory default impl). --
+
+/// The sentinel `trigger_condition` a dashboard filters on.
+const CREATIVE_SENTINEL: &str = "creative-idea-thread";
+
+#[test]
+fn persistent_get_prospective_by_trigger_surfaces_all_matches_in_large_store() {
+    let (_tmp, path) = temp_db();
+    let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+
+    // 600 HIGH-priority operational prospectives with an unrelated trigger that
+    // fill any priority-ordered top-512 window.
+    for i in 0..600 {
+        cm.store_prospective(
+            &format!("ops alert {i}"),
+            "deployment failed error",
+            "page on-call",
+            100,
+        )
+        .unwrap();
+    }
+    // 10 LOW-priority creative-idea prospectives carrying the sentinel.
+    for i in 0..10 {
+        cm.store_prospective(
+            &format!("idea {i}"),
+            CREATIVE_SENTINEL,
+            "surface in the ideas dashboard",
+            1,
+        )
+        .unwrap();
+    }
+
+    // The trigger filter is pushed into the Cypher WHERE, so the 512 limit bounds
+    // only matching nodes: all 10 ideas come back despite the 600 noisy nodes.
+    let ideas = cm
+        .get_prospective_by_trigger(CREATIVE_SENTINEL, 512)
+        .expect("durable trigger-scoped read must succeed");
+    assert_eq!(
+        ideas.len(),
+        10,
+        "every sentinel-tagged prospective must be returned from the durable store"
+    );
+    assert!(ideas
+        .iter()
+        .all(|p| p.trigger_condition == CREATIVE_SENTINEL));
+
+    // Contrast documenting the original bug: enumerate the top-512 by priority
+    // then filter in Rust surfaces ZERO ideas.
+    let leaked = cm
+        .get_all_prospective(512)
+        .into_iter()
+        .filter(|p| p.trigger_condition == CREATIVE_SENTINEL)
+        .count();
+    assert_eq!(
+        leaked, 0,
+        "enumerate-then-filter cannot surface low-priority matches on the durable store"
+    );
+
+    cm.close();
+}
+
+#[test]
+fn persistent_get_all_prospective_true_top_n_by_numeric_priority() {
+    let (_tmp, path) = temp_db();
+    let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+
+    // Insert ascending, with multi-digit values so numeric vs lexicographic
+    // ordering differs (10 must outrank 9 via CAST(... AS INT64), not "10" < "9").
+    cm.store_prospective("low", "t", "a", 2).unwrap();
+    cm.store_prospective("mid", "t", "a", 9).unwrap();
+    cm.store_prospective("high", "t", "a", 10).unwrap();
+    cm.store_prospective("top", "t", "a", 100).unwrap();
+
+    let top2 = cm.get_all_prospective(2);
+    assert_eq!(
+        top2.iter().map(|p| p.priority).collect::<Vec<_>>(),
+        vec![100, 10],
+        "durable store must sort numerically then truncate (true top-2)"
+    );
+
+    cm.close();
+}
+
+#[test]
+fn persistent_get_prospective_by_trigger_survives_reopen() {
+    let (_tmp, path) = temp_db();
+    let mut cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+    cm.store_prospective("idea", CREATIVE_SENTINEL, "act", 3)
+        .unwrap();
+    cm.store_prospective("noise", "other-trigger", "act", 99)
+        .unwrap();
+    cm.checkpoint().unwrap();
+    cm.close();
+
+    let cm = CognitiveMemory::open_persistent(&path, "agent").unwrap();
+    let ideas = cm
+        .get_prospective_by_trigger(CREATIVE_SENTINEL, 128)
+        .expect("read after reopen must succeed");
+    assert_eq!(ideas.len(), 1);
+    assert_eq!(ideas[0].trigger_condition, CREATIVE_SENTINEL);
+}

@@ -483,4 +483,93 @@ mod tests {
         let both = store.query_neighbors("a", None, Direction::Both, 10);
         assert_eq!(both.len(), 2);
     }
+
+    // -- query_nodes_ordered (issue #124): sort-then-truncate in the store --
+
+    fn add_priored(store: &mut InMemoryGraphStore, id: &str, priority: &str, trigger: &str) {
+        let mut props = HashMap::new();
+        props.insert("priority".into(), priority.into());
+        props.insert("trigger".into(), trigger.into());
+        store.add_node("P", props, Some(id)).unwrap();
+    }
+
+    #[test]
+    fn test_query_nodes_ordered_numeric_desc_sort_then_truncate() {
+        let mut store = InMemoryGraphStore::new(Some("test"));
+        add_priored(&mut store, "a", "2", "t");
+        add_priored(&mut store, "b", "9", "t");
+        add_priored(&mut store, "c", "10", "t");
+        add_priored(&mut store, "d", "100", "t");
+
+        let top2 = store
+            .query_nodes_ordered("P", None, "priority", true, true, 2)
+            .expect("ordered read must succeed");
+        let ids: Vec<&str> = top2.iter().map(|n| n.node_id.as_str()).collect();
+        // Numeric: 100 then 10 — NOT lexicographic ("10" < "9" < "2").
+        assert_eq!(ids, vec!["d", "c"]);
+    }
+
+    #[test]
+    fn test_query_nodes_ordered_ascending() {
+        let mut store = InMemoryGraphStore::new(Some("test"));
+        add_priored(&mut store, "a", "2", "t");
+        add_priored(&mut store, "b", "9", "t");
+        add_priored(&mut store, "c", "10", "t");
+
+        let bottom2 = store
+            .query_nodes_ordered("P", None, "priority", true, false, 2)
+            .expect("ordered read must succeed");
+        let ids: Vec<&str> = bottom2.iter().map(|n| n.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_query_nodes_ordered_filter_applies_before_limit() {
+        let mut store = InMemoryGraphStore::new(Some("test"));
+        // 20 high-priority nodes with trigger "x", 3 low-priority with "y".
+        for i in 0..20 {
+            add_priored(&mut store, &format!("x{i}"), "100", "x");
+        }
+        add_priored(&mut store, "y0", "1", "y");
+        add_priored(&mut store, "y1", "2", "y");
+        add_priored(&mut store, "y2", "3", "y");
+
+        let mut filter = HashMap::new();
+        filter.insert("trigger".to_string(), "y".to_string());
+        // A small limit must still return ALL matching "y" nodes, because the
+        // filter is applied before the limit — never the 20 "x" nodes.
+        let got = store
+            .query_nodes_ordered("P", Some(&filter), "priority", true, true, 5)
+            .expect("ordered read must succeed");
+        assert_eq!(got.len(), 3);
+        let ids: Vec<&str> = got.iter().map(|n| n.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["y2", "y1", "y0"]);
+    }
+
+    #[test]
+    fn test_query_nodes_ordered_missing_priority_sorts_last_desc() {
+        let mut store = InMemoryGraphStore::new(Some("test"));
+        add_priored(&mut store, "a", "5", "t");
+        // Node with no priority property at all.
+        let mut props = HashMap::new();
+        props.insert("trigger".into(), "t".into());
+        store.add_node("P", props, Some("b")).unwrap();
+
+        let ordered = store
+            .query_nodes_ordered("P", None, "priority", true, true, usize::MAX)
+            .expect("ordered read must succeed");
+        let ids: Vec<&str> = ordered.iter().map(|n| n.node_id.as_str()).collect();
+        // Missing/unparsable priority parses as i64::MIN — last for a DESC sort.
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_query_nodes_ordered_limit_zero_is_empty() {
+        let mut store = InMemoryGraphStore::new(Some("test"));
+        add_priored(&mut store, "a", "5", "t");
+        let got = store
+            .query_nodes_ordered("P", None, "priority", true, true, 0)
+            .expect("ordered read must succeed");
+        assert!(got.is_empty());
+    }
 }

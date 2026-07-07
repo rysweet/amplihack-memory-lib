@@ -215,6 +215,12 @@ let facts = memory.search_facts("cart", 10, 0.0);
 let fired = memory.check_triggers("no_activity detected on the checkout page");
 ```
 
+See [`docs/prospective_ordered_recall.md`](docs/prospective_ordered_recall.md)
+for ordered, trigger-filtered prospective recall — `get_all_prospective(limit)`
+returns the true top-`limit` by priority (the database sorts before it
+truncates), and `get_prospective_by_trigger(trigger, limit)` pushes the trigger
+filter into the query so the limit bounds only matching nodes.
+
 ### Persistent cognitive memory (`persistent` feature)
 
 `CognitiveMemory` talks to its storage exclusively through the `GraphStore`

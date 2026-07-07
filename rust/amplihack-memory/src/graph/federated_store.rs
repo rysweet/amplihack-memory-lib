@@ -5,7 +5,7 @@
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
-use super::protocol::GraphStore;
+use super::protocol::{sort_nodes_by, GraphStore};
 use super::traversal::bfs_traverse;
 use super::types::{Direction, GraphEdge, GraphNode, TraversalResult};
 
@@ -201,6 +201,34 @@ impl GraphStore for FederatedGraphStore {
         let hive = self.hive.query_nodes(node_type, filters, limit);
         let merged: Vec<GraphNode> = local.into_iter().chain(hive).collect();
         deduplicate_nodes(merged).into_iter().take(limit).collect()
+    }
+
+    fn query_nodes_ordered(
+        &self,
+        node_type: &str,
+        filters: Option<&HashMap<String, String>>,
+        order_by: &str,
+        numeric: bool,
+        descending: bool,
+        limit: usize,
+    ) -> crate::Result<Vec<GraphNode>> {
+        // Each member returns its own top-`limit` (ordered + truncated). The
+        // global top-`limit` is a subset of the union of the members' top-`limit`
+        // results, so merging then re-sorting globally before truncating yields
+        // the correct global order. Sorting per-shard and merely concatenating
+        // would re-introduce the truncation bug across shards — the re-sort must
+        // happen BEFORE the final truncate. A member read error propagates.
+        let local = self
+            .local
+            .query_nodes_ordered(node_type, filters, order_by, numeric, descending, limit)?;
+        let hive = self
+            .hive
+            .query_nodes_ordered(node_type, filters, order_by, numeric, descending, limit)?;
+        let merged: Vec<GraphNode> = local.into_iter().chain(hive).collect();
+        let mut deduped = deduplicate_nodes(merged);
+        sort_nodes_by(&mut deduped, order_by, numeric, descending);
+        deduped.truncate(limit);
+        Ok(deduped)
     }
 
     fn search_nodes(
@@ -534,5 +562,34 @@ mod tests {
             shared_count >= 1,
             "at least one 'shared' node should appear"
         );
+    }
+
+    // -- query_nodes_ordered (issue #124): global sort-then-truncate across members --
+
+    fn add_priored(store: &mut InMemoryGraphStore, id: &str, priority: i32) {
+        let mut props = HashMap::new();
+        props.insert("priority".into(), priority.to_string());
+        props.insert("content".into(), format!("node {id}"));
+        store.add_node("P", props, Some(id)).unwrap();
+    }
+
+    #[test]
+    fn test_federated_query_nodes_ordered_global_top_n() {
+        let mut local = InMemoryGraphStore::new(Some("local"));
+        let mut hive = InMemoryGraphStore::new(Some("hive"));
+        // The two globally-highest priorities are split across the members, so a
+        // correct result must re-sort the union before truncating — not just
+        // concatenate each member's local top-N.
+        add_priored(&mut local, "l-low", 1);
+        add_priored(&mut local, "l-high", 100);
+        add_priored(&mut hive, "h-mid", 50);
+        add_priored(&mut hive, "h-top", 200);
+
+        let fed = FederatedGraphStore::new(Box::new(local), Box::new(hive));
+        let top2 = fed
+            .query_nodes_ordered("P", None, "priority", true, true, 2)
+            .expect("federated ordered read must succeed");
+        let ids: Vec<&str> = top2.iter().map(|n| n.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["h-top", "l-high"]);
     }
 }

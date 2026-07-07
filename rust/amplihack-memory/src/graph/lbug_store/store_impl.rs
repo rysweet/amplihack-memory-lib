@@ -201,6 +201,54 @@ impl LbugGraphStore {
         Ok(self.collect_nodes(rows, node_type))
     }
 
+    /// Ordered, fallible variant of
+    /// [`try_match_return_nodes`](Self::try_match_return_nodes): inserts
+    /// `ORDER BY <expr> <dir>` before the limit clause so the engine sorts
+    /// *then* truncates (issue #124). `order_by` must already be a validated
+    /// identifier (the trait method checks it); `numeric` casts the value to
+    /// `INT64` so string-stored numbers like `priority` order numerically
+    /// (`10` outranks `9`). A backend read error propagates as `Err`.
+    fn try_match_return_nodes_ordered(
+        &self,
+        node_type: &str,
+        where_parts: &[String],
+        order_by: &str,
+        numeric: bool,
+        descending: bool,
+        limit: usize,
+    ) -> crate::Result<Vec<GraphNode>> {
+        // Same test seam as try_match_return_nodes (#2561): deterministically
+        // simulate a transient backend read failure. No-op outside tests.
+        if super::force_read_error_for_test() {
+            return Err(MemoryError::Storage(
+                "forced read error (test seam)".to_string(),
+            ));
+        }
+        let mut parts = where_parts.to_vec();
+        // #107: only filter tombstones when the table carries the `_deleted`
+        // column (a legacy table without it would binder-error otherwise).
+        if let Some(filter) = self.tombstone_filter(node_type, "n") {
+            parts.push(filter);
+        }
+        let where_clause = if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", parts.join(" AND "))
+        };
+        let order_expr = if numeric {
+            format!("CAST(n.{order_by} AS INT64)")
+        } else {
+            format!("n.{order_by}")
+        };
+        let dir = if descending { "DESC" } else { "ASC" };
+        let cypher = format!(
+            "MATCH (n:{node_type}){where_clause} RETURN n ORDER BY {order_expr} {dir}{}",
+            limit_clause(limit)
+        );
+        let rows = self.query_rows(&cypher)?;
+        Ok(self.collect_nodes(rows, node_type))
+    }
+
     fn get_node_from_table(&self, node_id: &str, table: &str) -> Option<GraphNode> {
         if !is_valid_identifier(table) {
             return None;
@@ -543,6 +591,48 @@ impl GraphStore for LbugGraphStore {
             return Vec::new();
         }
         self.match_return_nodes(node_type, &where_parts, limit)
+    }
+
+    fn query_nodes_ordered(
+        &self,
+        node_type: &str,
+        filters: Option<&HashMap<String, String>>,
+        order_by: &str,
+        numeric: bool,
+        descending: bool,
+        limit: usize,
+    ) -> crate::Result<Vec<GraphNode>> {
+        // `order_by` is spliced into ORDER BY, so validate it before anything.
+        validate_identifier(order_by)?;
+        if !is_valid_identifier(node_type) {
+            return Ok(Vec::new());
+        }
+        // #107: populate the catalog cache; propagate a catalog read failure so
+        // it is never mistaken for a confirmed-empty store.
+        self.try_ensure_schema_loaded()?;
+        let _guard = self.acquire_lock();
+
+        // A genuinely-absent node-type table is a confirmed empty for that type
+        // (fresh store), not a read error — mirror try_count_nodes so a
+        // never-created ProspectiveMemory table does not surface as an Err.
+        if !self.known_node_tables.borrow().contains(node_type) {
+            return Ok(Vec::new());
+        }
+
+        let mut where_parts: Vec<String> = Vec::new();
+        if !append_equality_filters(&mut where_parts, filters) {
+            return Err(MemoryError::InvalidInput(
+                "invalid filter key: must match [A-Za-z_][A-Za-z0-9_]*".to_string(),
+            ));
+        }
+        self.try_match_return_nodes_ordered(
+            node_type,
+            &where_parts,
+            order_by,
+            numeric,
+            descending,
+            limit,
+        )
     }
 
     fn try_count_nodes(

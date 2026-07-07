@@ -4,6 +4,47 @@ use std::collections::HashMap;
 
 use super::types::{Direction, GraphEdge, GraphNode, TraversalResult};
 
+/// Sort `nodes` in place by their `order_by` property, matching the ordering
+/// contract of [`GraphStore::query_nodes_ordered`]'s default implementation.
+///
+/// When `numeric`, each value is parsed as `i64` (a missing or unparsable value
+/// sorts as `i64::MIN`, i.e. last for a descending sort); otherwise the raw
+/// string value is compared lexicographically (missing → `""`). `descending`
+/// reverses the comparison. The sort is stable, so equal keys keep their input
+/// order. Shared with the federated backend's global re-sort so every layer
+/// orders identically.
+pub(crate) fn sort_nodes_by(
+    nodes: &mut [GraphNode],
+    order_by: &str,
+    numeric: bool,
+    descending: bool,
+) {
+    nodes.sort_by(|a, b| {
+        let ord = if numeric {
+            let pa = a
+                .properties
+                .get(order_by)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(i64::MIN);
+            let pb = b
+                .properties
+                .get(order_by)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(i64::MIN);
+            pa.cmp(&pb)
+        } else {
+            let pa = a.properties.get(order_by).map(String::as_str).unwrap_or("");
+            let pb = b.properties.get(order_by).map(String::as_str).unwrap_or("");
+            pa.cmp(pb)
+        };
+        if descending {
+            ord.reverse()
+        } else {
+            ord
+        }
+    });
+}
+
 /// Common interface for graph storage backends.
 pub trait GraphStore {
     /// Unique identifier for this store instance.
@@ -29,6 +70,57 @@ pub trait GraphStore {
         filters: Option<&HashMap<String, String>>,
         limit: usize,
     ) -> Vec<GraphNode>;
+
+    /// Ordered, filtered read: the backend orders matching rows by `order_by`
+    /// and **then** truncates to `limit`, so `LIMIT` always applies *after* the
+    /// sort.
+    ///
+    /// This is the primitive that fixes the prospective-memory truncation bug
+    /// (issue #124): [`query_nodes`](Self::query_nodes) emits a bare
+    /// `RETURN n LIMIT k` with no `ORDER BY`, so a large store truncates to an
+    /// arbitrary window *before* any priority sort, silently dropping
+    /// lower-priority rows. `query_nodes_ordered` pushes both the filter and the
+    /// ordering into the query so the top-`limit` result is deterministic.
+    ///
+    /// Unlike `query_nodes` — which is infallible and swallows a backend read
+    /// error as an empty result — this **propagates** a read failure (or an
+    /// invalid `order_by`) as `Err`, so a populated-but-unreadable store never
+    /// masquerades as an empty result (the issue #124 false-empty class).
+    ///
+    /// * `order_by` — property to order by. Must be a valid identifier
+    ///   (`^[A-Za-z_][A-Za-z0-9_]*$`); an invalid value is rejected with
+    ///   `Err(MemoryError::InvalidInput)` before any query runs, since it is
+    ///   spliced into the `ORDER BY` clause by the database backends.
+    /// * `numeric` — when `true`, order by the value parsed/cast as `INT64`
+    ///   (required for string-stored numbers like `priority`, so `10` outranks
+    ///   `9`); when `false`, order lexicographically.
+    /// * `descending` — `true` for `DESC` (highest first), `false` for `ASC`.
+    ///
+    /// The default implementation serves the in-memory / composite backends that
+    /// cannot fail on a read: it fetches all matching rows, sorts them in Rust
+    /// (parsing to `i64` when `numeric`, with a missing/unparsable value sorting
+    /// as `i64::MIN`), applies `descending`, then truncates to `limit`. The
+    /// durable database backends override it to push `ORDER BY … LIMIT` into
+    /// their query engine.
+    fn query_nodes_ordered(
+        &self,
+        node_type: &str,
+        filters: Option<&HashMap<String, String>>,
+        order_by: &str,
+        numeric: bool,
+        descending: bool,
+        limit: usize,
+    ) -> crate::Result<Vec<GraphNode>> {
+        if !crate::utils::is_valid_identifier(order_by) {
+            return Err(crate::MemoryError::InvalidInput(format!(
+                "invalid order_by column {order_by:?}: must match [A-Za-z_][A-Za-z0-9_]*"
+            )));
+        }
+        let mut nodes = self.query_nodes(node_type, filters, usize::MAX);
+        sort_nodes_by(&mut nodes, order_by, numeric, descending);
+        nodes.truncate(limit);
+        Ok(nodes)
+    }
 
     /// Fail-closed count of nodes of `node_type` matching optional equality
     /// filters.
