@@ -25,7 +25,12 @@ uuid = { version = "1", features = ["v4"] }
 ladybug-graph-rs = { path = "../../ladybug-graph-rs", optional = true }
 # Published LadybugDB (Kùzu) bindings used by the persistent GraphStore backend.
 # Same crate/version Simard depends on; only pulled in by the `persistent` feature.
-lbug = { version = "=0.17.1", optional = true }
+# Pinned to rysweet/ladybug-rust (fork of LadybugDB/ladybug-rust) whose build.rs
+# links only the self-contained liblbug.a in source-build mode (link_bundled_deps
+# stays false), fixing the crates.io 0.17.1 duplicate-symbol link failure AND the
+# libstdc++ std::format ABI SIGSEGV on newer hosts (Ubuntu 26.04). See
+# docs/lbug_libstdcxx_abi.md. Git dep propagates the fix transitively to Simard/Crocutus.
+lbug = { git = "https://github.com/rysweet/ladybug-rust", rev = "202352434642e683fdf008b68004d0645a57cd35", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
