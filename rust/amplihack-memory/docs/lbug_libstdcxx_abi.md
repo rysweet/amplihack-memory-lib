@@ -104,12 +104,18 @@ two *further* defects in lbug's from-source path. Both currently need a
 downstream workaround (applied by the platform installer); the durable engine
 fixes are tracked in issue #130.
 
-1. **Duplicate-symbol link failure.** `LBUG_BUILD_FROM_SOURCE=1 cargo build`
-   fails at link with rust-lld `duplicate symbol` errors for `utf8proc`/`antlr4`
-   symbols: lbug bundles those third-party objects *inside* `liblbug.a` **and**
-   also links them as separate `--whole-archive` libraries. The installer works
-   around it with `RUSTFLAGS=-Clink-arg=-Wl,--allow-multiple-definition`; without
-   it the from-source build does not link at all.
+1. **Duplicate-symbol link failure (RESOLVED via the fork pin).** The published
+   crates.io `lbug 0.17.1` `build.rs` links the bundled third-party objects
+   *twice* in source-build mode: once inside the self-contained `liblbug.a`
+   (which already carries the 5246 antlr4 / 174 re2 / 86 utf8proc symbols) and
+   again as separate `--whole-archive` libraries. So `LBUG_BUILD_FROM_SOURCE=1
+   cargo build` fails at link with rust-lld `duplicate symbol` errors. This is
+   fixed by pinning `lbug` to the `rysweet/ladybug-rust` fork, whose `build.rs`
+   keeps `link_bundled_deps=false` in the source path and links only the
+   self-contained `liblbug.a`. The link is clean; **no
+   `--allow-multiple-definition` (a silent-failure hazard) is needed.** Verified:
+   a from-source `--features persistent` build links cleanly and all
+   `graph::lbug_store::tests::open_with_recovery` tests pass.
 
 2. **Post-verdict static-teardown SIGSEGV.** A *clean from-source* binary still
    SIGSEGVs in C++ **global/static-destructor teardown** on normal process exit,
@@ -120,9 +126,11 @@ fixes are tracked in issue #130.
    affirmative verdict marker (fail-closed preserved) rather than the exit code
    alone.
 
-Until #130 lands, the from-source *cognitive-memory store* opens and runs
-cleanly (the centerpiece fix); these two items are build-link and
-process-teardown hygiene, worked around downstream.
+Both the from-source *cognitive-memory store* open (the centerpiece ABI fix)
+and the duplicate-symbol link failure are now resolved by the `rysweet/ladybug-rust`
+fork pin. Item 2 below (process-teardown SIGSEGV) remains a downstream
+guardrail-gate detail, keyed on the affirmative verdict marker (fail-closed
+preserved) rather than the exit code alone.
 
 ## Downstream
 
