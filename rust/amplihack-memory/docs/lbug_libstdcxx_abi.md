@@ -96,6 +96,34 @@ toolchain the installer already provisions and is correct for **any** host
 libstdc++. Source-build is the fix; a variant match is at best a
 non-relied-upon fallback.
 
+## Known from-source build issues in lbug 0.17.1 (tracked: #130)
+
+Building lbug 0.17.1 from source resolves the open-time `initBufferManager`/
+`std::vformat` SIGSEGV, but the end-to-end on host `dev` (Ubuntu 26.04) surfaced
+two *further* defects in lbug's from-source path. Both currently need a
+downstream workaround (applied by the platform installer); the durable engine
+fixes are tracked in issue #130.
+
+1. **Duplicate-symbol link failure.** `LBUG_BUILD_FROM_SOURCE=1 cargo build`
+   fails at link with rust-lld `duplicate symbol` errors for `utf8proc`/`antlr4`
+   symbols: lbug bundles those third-party objects *inside* `liblbug.a` **and**
+   also links them as separate `--whole-archive` libraries. The installer works
+   around it with `RUSTFLAGS=-Clink-arg=-Wl,--allow-multiple-definition`; without
+   it the from-source build does not link at all.
+
+2. **Post-verdict static-teardown SIGSEGV.** A *clean from-source* binary still
+   SIGSEGVs in C++ **global/static-destructor teardown** on normal process exit,
+   *after* program logic has returned success (reproduces on both prebuilt and
+   from-source, so it is not the open-time ABI mismatch). A fail-closed guardrail
+   gate that runs `<binary> check` would see exit 139 and false-fail a
+   proven-safe verdict; the installer's gate therefore keys on the explicit
+   affirmative verdict marker (fail-closed preserved) rather than the exit code
+   alone.
+
+Until #130 lands, the from-source *cognitive-memory store* opens and runs
+cleanly (the centerpiece fix); these two items are build-link and
+process-teardown hygiene, worked around downstream.
+
 ## Downstream
 
 Simard consumes this fix by **bumping its `amplihack-memory` pin** to the commit
