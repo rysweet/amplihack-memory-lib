@@ -433,6 +433,54 @@ impl LbugGraphStore {
             }
         }
     }
+
+    /// One typed `MATCH (a)-[r:rel_type]->(b)` scan returning every *live*
+    /// directed edge of `rel_type` as `(source, target)` node pairs.
+    ///
+    /// This is the bulk twin of [`query_neighbors_one_type`](Self::query_neighbors_one_type):
+    /// it uses the same single-rel-table typed scan (never the label-less
+    /// multi-rel-table path that SEGVs lbug, #100) and the same tombstone gates
+    /// (`r`, `a`, `b` all filtered to live rows), but anchors on no particular
+    /// node so it dumps the whole edge type in one query. `rel_type` must
+    /// already be a valid identifier (the caller checks).
+    fn bulk_edges_of_one_type(&self, rel_type: &str) -> Vec<(GraphNode, GraphNode)> {
+        let mut wp: Vec<String> = Vec::new();
+        // #107: only gate on the labeled rel tombstone column when the rel table
+        // actually carries it (a legacy table without `_deleted` would
+        // binder-error and silently read zero edges).
+        if let Some(f) = self.tombstone_filter(rel_type, "r") {
+            wp.push(f);
+        }
+        wp.push(not_deleted("a"));
+        wp.push(not_deleted("b"));
+        let cypher = format!(
+            "MATCH (a)-[r:{rel_type}]->(b) WHERE {} RETURN a, b",
+            wp.join(" AND ")
+        );
+
+        let rows = match self.query_rows(&cypher) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("bulk_edges_of_one_type({rel_type}) failed: {e}");
+                return Vec::new();
+            }
+        };
+
+        let mut pairs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut it = row.into_iter();
+            let src = match it.next() {
+                Some(Value::Node(nv)) => self.node_val_to_graph_node(&nv, ""),
+                _ => continue,
+            };
+            let tgt = match it.next() {
+                Some(Value::Node(nv)) => self.node_val_to_graph_node(&nv, ""),
+                _ => continue,
+            };
+            pairs.push((src, tgt));
+        }
+        pairs
+    }
 }
 
 impl GraphStore for LbugGraphStore {
@@ -957,6 +1005,36 @@ impl GraphStore for LbugGraphStore {
             results.truncate(limit);
         }
         results
+    }
+
+    /// Bulk adjacency scan for the ranked-recall graph-proximity fast path
+    /// (issue #40). Acquires the store lock **once** and issues a single typed
+    /// `MATCH (a)-[r:edge_type]->(b)` scan of the one rel table that holds this
+    /// edge type — no per-node fan-out — returning every live `(source, target)`
+    /// pair with tombstoned rows excluded. Tenant scoping is intentionally left
+    /// to the recall layer (re-applied on every endpoint and hop). An unknown
+    /// `edge_type`, an invalid identifier, or an empty catalog yields
+    /// `Some(vec![])` (the capability is supported; there simply are no such
+    /// edges) — never `None`, so the persistent daemon always takes the fast
+    /// path.
+    fn bulk_edges_of_type(&self, edge_type: &str) -> Option<Vec<(GraphNode, GraphNode)>> {
+        if !is_valid_identifier(edge_type) {
+            return Some(Vec::new());
+        }
+
+        self.ensure_schema_loaded();
+        let _guard = self.acquire_lock();
+
+        let has_rel = self
+            .known_rel_tables
+            .borrow()
+            .iter()
+            .any(|(rel, _, _)| rel == edge_type);
+        if !has_rel {
+            return Some(Vec::new());
+        }
+
+        Some(self.bulk_edges_of_one_type(edge_type))
     }
 
     fn delete_edge(&mut self, source_id: &str, target_id: &str, edge_type: &str) -> bool {
