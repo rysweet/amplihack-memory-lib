@@ -1812,9 +1812,13 @@ fn delete_edge_tombstones_only_that_edge() {
 const STORAGE_VERSION_V40: u64 = 40; // lbug 0.12 – 0.16.x
 const STORAGE_VERSION_V41: u64 = 41; // lbug 0.17.x
 
-/// The on-disk storage version the *current* engine upgrades a store to on its
-/// first checkpoint. The 0.15.4 → 0.17.1 migration targets v41.
-const CURRENT_ENGINE_STORAGE_VERSION: u64 = STORAGE_VERSION_V41;
+/// The minimum on-disk storage version the *current* engine upgrades a store to
+/// on its first checkpoint. crates.io lbug 0.17.1 targets v41; the
+/// rysweet/ladybug-rust fork engine (which fixes the from-source link + ABI, see
+/// docs/lbug_libstdcxx_abi.md) writes v42. The migration is forward-only, so the
+/// no-data-loss invariant is "upgraded off v40 to v41-or-newer", not one exact
+/// version.
+const MIN_UPGRADED_STORAGE_VERSION: u64 = STORAGE_VERSION_V41;
 
 /// Name of the committed fixture directory and the database file inside it.
 const V40_FIXTURE: &str = "v40_store";
@@ -2097,14 +2101,17 @@ fn v40_fixture_on_disk_is_v40_and_upgrades_after_checkpoint() {
     }
 
     // After the first checkpoint the on-disk store is the current engine's
-    // format. For the lbug 0.17.1 target that is v41 (forward-only). Under lbug
-    // 0.15.4 it stays v40 and this fails — the intended red signal.
+    // format. For crates.io lbug 0.17.1 that is v41; the rysweet/ladybug-rust
+    // fork engine writes v42. The migration is forward-only, so the invariant is
+    // "upgraded off v40 to v41-or-newer with all data intact" — not one exact
+    // version. Under lbug 0.15.4 it stays v40 and this fails — the intended red.
     let after = on_disk_storage_versions(&db);
     assert!(
-        after.contains(&CURRENT_ENGINE_STORAGE_VERSION),
-        "after a checkpoint the store must be storage format \
-         v{CURRENT_ENGINE_STORAGE_VERSION} (v40 -> v41 migration), saw {after:?}. \
-         If this fails on lbug 0.15.4 that is expected: the 0.17.1 engine bump turns it green."
+        !after.contains(&STORAGE_VERSION_V40)
+            && after.iter().any(|&v| v >= MIN_UPGRADED_STORAGE_VERSION),
+        "after a checkpoint the store must be upgraded off v40 to storage format \
+         v{MIN_UPGRADED_STORAGE_VERSION} or newer (forward-only migration), saw {after:?}. \
+         If this fails on lbug 0.15.4 that is expected: the 0.17.x+ engine bump turns it green."
     );
 
     // Sanity: the upgraded store still opens and retains all data (10 + 1).
