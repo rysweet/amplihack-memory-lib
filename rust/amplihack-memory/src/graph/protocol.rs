@@ -184,6 +184,36 @@ pub trait GraphStore {
         limit: usize,
     ) -> Vec<(GraphEdge, GraphNode)>;
 
+    /// Return every *live* directed edge of `edge_type` as `(source, target)`
+    /// node pairs, in one store-locked scan.
+    ///
+    /// This is the fast path for the ranked-recall graph-proximity term: instead
+    /// of issuing one [`query_neighbors`](Self::query_neighbors) call per
+    /// candidate node per hop (an N+1 fan-out that made Simard's OODA
+    /// prepare-context spin for ~11 min at ~7,590 facts, issue #40), the ranker
+    /// loads all edges of the two traversed types once and runs its bounded BFS
+    /// against an in-memory adjacency index built from the result.
+    ///
+    /// Returns `None` if the backend does not implement the fast bulk path; the
+    /// caller then falls back to the legacy per-node neighbour queries with
+    /// identical results (a performance-only fallback, never a correctness or
+    /// isolation downgrade). The provided default is `None`, so every existing
+    /// backend compiles and behaves unchanged until it opts in.
+    ///
+    /// Contract for overrides:
+    /// - Include only **live** edges: apply the same tombstone / not-deleted
+    ///   filter used elsewhere. Soft-deleted, superseded, or archived edges MUST
+    ///   NOT appear.
+    /// - Preserve direction: the pair is `(source, target)`, matching the
+    ///   directed semantics of the per-node neighbour queries it replaces.
+    /// - Do **not** apply tenant scoping here. Per-agent isolation is re-applied
+    ///   by the recall layer on every endpoint and every BFS hop.
+    /// - An `edge_type` with no matching edges is `Some(vec![])` (the capability
+    ///   is supported; there simply are no such edges), never `None`.
+    fn bulk_edges_of_type(&self, _edge_type: &str) -> Option<Vec<(GraphNode, GraphNode)>> {
+        None
+    }
+
     /// Delete a specific edge. Returns true if the edge existed.
     // FUTURE: migrate to Result<bool, MemoryError>
     #[must_use]

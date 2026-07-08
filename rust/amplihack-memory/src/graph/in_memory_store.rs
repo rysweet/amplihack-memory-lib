@@ -274,6 +274,30 @@ impl GraphStore for InMemoryGraphStore {
         results
     }
 
+    /// One-scan bulk adjacency: every live directed edge of `edge_type` as
+    /// `(source, target)` node pairs. Iterates the forward edge index (which
+    /// [`delete_edge`](Self::delete_edge) / [`delete_node`](Self::delete_node)
+    /// keep pruned, so tombstoned edges never surface) and resolves each
+    /// endpoint to its *current* node — so a live property change (e.g. a
+    /// re-tenanted `agent_id`) is reflected exactly as `query_neighbors` would.
+    fn bulk_edges_of_type(&self, edge_type: &str) -> Option<Vec<(GraphNode, GraphNode)>> {
+        let mut pairs = Vec::new();
+        for bucket in self.edges.values() {
+            for edge in bucket {
+                if edge.edge_type != edge_type {
+                    continue;
+                }
+                if let (Some(src), Some(tgt)) = (
+                    self.nodes.get(&edge.source_id),
+                    self.nodes.get(&edge.target_id),
+                ) {
+                    pairs.push((src.clone(), tgt.clone()));
+                }
+            }
+        }
+        Some(pairs)
+    }
+
     fn delete_edge(&mut self, source_id: &str, target_id: &str, edge_type: &str) -> bool {
         let removed = if let Some(bucket) = self.edges.get_mut(source_id) {
             let len_before = bucket.len();

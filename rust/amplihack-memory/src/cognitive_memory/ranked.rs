@@ -27,6 +27,8 @@ use super::types::{
 };
 use super::CognitiveMemory;
 
+use tracing::debug;
+
 /// Upper bound on graph-traversal depth, regardless of `max_graph_hops`.
 ///
 /// Caps neighbor fan-out (security R6/D5): a caller-supplied
@@ -213,6 +215,57 @@ fn node_text(node: &GraphNode) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-recall graph-adjacency index (issue #40)
+// ---------------------------------------------------------------------------
+
+/// Direction-aware in-memory adjacency for a single edge type.
+///
+/// `outgoing[src]` lists the target nodes of edges `src -> *`; `incoming[tgt]`
+/// lists the source nodes of edges `* -> tgt`. These are exactly the neighbour
+/// sets [`GraphStore::query_neighbors`](crate::graph::GraphStore::query_neighbors)
+/// returns for [`Direction::Outgoing`] / [`Direction::Incoming`], so the graph
+/// BFS reads identical results — without a per-node database round-trip.
+#[derive(Default)]
+struct EdgeAdjacency {
+    outgoing: HashMap<String, Vec<GraphNode>>,
+    incoming: HashMap<String, Vec<GraphNode>>,
+}
+
+/// Per-recall adjacency index over the traversed edge types, built once from a
+/// small constant number of bulk edge scans (one per distinct edge type).
+///
+/// Replaces the ranked-recall graph term's ~`3N` per-node `query_neighbors`
+/// fan-out (the Simard OODA prepare-context pathology, issue #40) with two
+/// store scans per recall while keeping the bounded BFS — and therefore the
+/// score, ordering, and reasons — byte-identical to the legacy per-node path.
+struct GraphAdjacencyIndex {
+    by_type: HashMap<String, EdgeAdjacency>,
+}
+
+impl GraphAdjacencyIndex {
+    /// Neighbours of `node_id` along `edge_type` in `direction`, in the same
+    /// order [`GraphStore::query_neighbors`](crate::graph::GraphStore::query_neighbors)
+    /// returns them (outgoing before incoming for [`Direction::Both`]).
+    fn neighbors(&self, node_id: &str, edge_type: &str, direction: Direction) -> Vec<GraphNode> {
+        let mut out = Vec::new();
+        let Some(adj) = self.by_type.get(edge_type) else {
+            return out;
+        };
+        if matches!(direction, Direction::Outgoing | Direction::Both) {
+            if let Some(v) = adj.outgoing.get(node_id) {
+                out.extend(v.iter().cloned());
+            }
+        }
+        if matches!(direction, Direction::Incoming | Direction::Both) {
+            if let Some(v) = adj.incoming.get(node_id) {
+                out.extend(v.iter().cloned());
+            }
+        }
+        out
+    }
+}
+
 impl CognitiveMemory {
     // ======================================================================
     // RANKED RECALL
@@ -250,6 +303,7 @@ impl CognitiveMemory {
             (ET_DERIVES_FROM, Direction::Outgoing),
             (ET_SIMILAR_TO, Direction::Both),
         ];
+        let index = self.build_graph_index(&traversals, &options);
 
         let mut scored: Vec<Scored<SemanticFact>> = Vec::new();
         for node in &nodes {
@@ -282,6 +336,7 @@ impl CognitiveMemory {
                 &fact.node_id,
                 &traversals,
                 &options,
+                index.as_ref(),
             );
             scored.push(Scored {
                 item: fact,
@@ -335,6 +390,7 @@ impl CognitiveMemory {
             (ET_DERIVES_FROM, Direction::Incoming),
             (ET_SIMILAR_TO, Direction::Both),
         ];
+        let index = self.build_graph_index(&traversals, &options);
 
         let mut scored: Vec<Scored<EpisodicMemory>> = Vec::new();
         for node in &nodes {
@@ -361,6 +417,7 @@ impl CognitiveMemory {
                 &episode.node_id,
                 &traversals,
                 &options,
+                index.as_ref(),
             );
             scored.push(Scored {
                 item: episode,
@@ -451,6 +508,7 @@ impl CognitiveMemory {
         node_id: &str,
         traversals: &[(&str, Direction)],
         options: &RecallOptions,
+        index: Option<&GraphAdjacencyIndex>,
     ) -> (f64, Vec<String>) {
         let w = &options.weights;
         let mut score = 0.0;
@@ -496,7 +554,7 @@ impl CognitiveMemory {
         // Graph proximity.
         if options.max_graph_hops > 0 {
             let (best, meta) =
-                self.best_edge_score(node_id, query, traversals, options.max_graph_hops);
+                self.best_edge_score(node_id, query, traversals, options.max_graph_hops, index);
             let graph_term = w.graph * best;
             if graph_term > 0.0 {
                 if let Some((label, hop)) = meta {
@@ -521,12 +579,19 @@ impl CognitiveMemory {
     /// and returning the maximum (with the edge label + hop of the winner for
     /// the reason string). Foreign-tenant neighbors are pruned entirely — they
     /// neither contribute a score nor are traversed through (security A3).
+    ///
+    /// When `index` is `Some`, each hop's neighbours are read from the per-recall
+    /// in-memory adjacency index (issue #40) instead of a per-node
+    /// `query_neighbors` round-trip; the walk, per-hop `/hop` discount, tenant
+    /// prune, and `best` selection are otherwise identical, so the returned score
+    /// is byte-identical to the legacy path.
     fn best_edge_score(
         &self,
         start_id: &str,
         query: &str,
         traversals: &[(&str, Direction)],
         max_hops: usize,
+        index: Option<&GraphAdjacencyIndex>,
     ) -> (f64, Option<(String, usize)>) {
         let hops = max_hops.min(MAX_GRAPH_HOPS);
         if hops == 0 {
@@ -543,10 +608,20 @@ impl CognitiveMemory {
             let mut next: Vec<String> = Vec::new();
             for nid in &frontier {
                 for (edge_type, direction) in traversals {
-                    for (_, neighbor) in
-                        self.graph
+                    let neighbors = match index {
+                        // Fast path: read the neighbour set from the pre-built
+                        // adjacency index (no database round-trip).
+                        Some(idx) => idx.neighbors(nid, edge_type, *direction),
+                        // Legacy path: one per-node neighbour scan, preserved for
+                        // backends without the bulk capability.
+                        None => self
+                            .graph
                             .query_neighbors(nid, Some(edge_type), *direction, usize::MAX)
-                    {
+                            .into_iter()
+                            .map(|(_, neighbor)| neighbor)
+                            .collect(),
+                    };
+                    for neighbor in neighbors {
                         if !visited.insert(neighbor.node_id.clone()) {
                             continue;
                         }
@@ -570,6 +645,68 @@ impl CognitiveMemory {
         }
 
         (best, best_meta)
+    }
+
+    /// Build the per-recall graph-adjacency index for `traversals`, or `None`
+    /// when the graph term is disabled (`max_graph_hops == 0`) or the backend
+    /// does not support the bulk-scan capability (all-or-nothing fold to the
+    /// legacy per-node path — the index and legacy path are never mixed within a
+    /// single recall).
+    ///
+    /// Issues exactly one [`bulk_edges_of_type`](crate::graph::GraphStore::bulk_edges_of_type)
+    /// scan per **distinct** edge type in `traversals` (two: `DERIVES_FROM` and
+    /// `SIMILAR_TO`), independent of the fact count — this is what removes the
+    /// ~`3N` per-node fan-out behind issue #40. Emits a single `graph_path`
+    /// tracing line (`indexed` | `legacy`, counts/labels only — never memory
+    /// content) so the active path is verifiable from a live log.
+    fn build_graph_index(
+        &self,
+        traversals: &[(&str, Direction)],
+        options: &RecallOptions,
+    ) -> Option<GraphAdjacencyIndex> {
+        if options.max_graph_hops == 0 {
+            return None;
+        }
+
+        let mut by_type: HashMap<String, EdgeAdjacency> = HashMap::new();
+        for (edge_type, _direction) in traversals {
+            if by_type.contains_key(*edge_type) {
+                continue; // one bulk scan per distinct edge type
+            }
+            // All-or-nothing: a `None` from any required edge type discards the
+            // partial index so the whole recall takes the legacy path.
+            let edges = match self.graph.bulk_edges_of_type(edge_type) {
+                Some(edges) => edges,
+                None => {
+                    debug!(
+                        target: "amplihack_memory::cognitive_memory",
+                        graph_path = "legacy",
+                        "ranked recall graph term: backend lacks bulk_edges_of_type"
+                    );
+                    return None;
+                }
+            };
+            let mut adj = EdgeAdjacency::default();
+            for (src, tgt) in edges {
+                adj.outgoing
+                    .entry(src.node_id.clone())
+                    .or_default()
+                    .push(tgt.clone());
+                adj.incoming
+                    .entry(tgt.node_id.clone())
+                    .or_default()
+                    .push(src);
+            }
+            by_type.insert((*edge_type).to_string(), adj);
+        }
+
+        debug!(
+            target: "amplihack_memory::cognitive_memory",
+            graph_path = "indexed",
+            edge_types = by_type.len(),
+            "ranked recall graph term: bulk adjacency index"
+        );
+        Some(GraphAdjacencyIndex { by_type })
     }
 
     /// Test-only seam: overwrite raw node properties through the backing
