@@ -648,7 +648,7 @@ version = "0.1.0"
 [[package]]
 name = "lbug"
 version = "0.17.1"
-source = "git+https://github.com/rysweet/ladybug-rust?rev=e3872c8f22562d55031726a304e99ef92d1e25ec#e3872c8f22562d55031726a304e99ef92d1e25ec"
+source = "git+https://github.com/rysweet/ladybug-rust?rev=5a2c107881879f4d1bb594b14967948870e65cdc#5a2c107881879f4d1bb594b14967948870e65cdc"
 dependencies = [
  "cmake",
  "cxx",
@@ -1467,7 +1467,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
