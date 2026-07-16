@@ -329,3 +329,97 @@ fn test_check_triggers_multiple_triggers() {
     assert_eq!(triggered[0].priority, 5);
     assert_eq!(triggered[1].priority, 2);
 }
+
+// -- store_prospective_with_status (Simard #2562): restore preserves status --
+
+/// A non-`pending` status supplied on insert is persisted verbatim, not
+/// forced back to `pending`. This is the primitive the Simard restore path
+/// (`import_full_snapshot`) needs so a snapshot's original status survives.
+#[test]
+fn test_store_prospective_with_status_persists_status() {
+    let mut cm = make_cm();
+    let id = cm
+        .store_prospective_with_status("done goal", "deploy", "act", 7, "resolved")
+        .unwrap();
+
+    let filter = agent_filter(&cm.agent_name);
+    let nodes = cm
+        .graph
+        .query_nodes(NT_PROSPECTIVE, Some(&filter), usize::MAX);
+    let node = nodes.iter().find(|n| n.node_id == id).unwrap();
+    assert_eq!(node.properties.get("status").unwrap(), "resolved");
+
+    // Surfaced by the export enumerator with the preserved status.
+    let all = cm.get_all_prospective(usize::MAX);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].status, "resolved");
+}
+
+/// An empty status is normalised to the default `pending` rather than
+/// persisting a blank status that would match neither the pending nor the
+/// resolved lifecycle paths.
+#[test]
+fn test_store_prospective_with_status_empty_defaults_to_pending() {
+    let mut cm = make_cm();
+    let id = cm
+        .store_prospective_with_status("g", "deploy", "act", 1, "")
+        .unwrap();
+
+    let filter = agent_filter(&cm.agent_name);
+    let nodes = cm
+        .graph
+        .query_nodes(NT_PROSPECTIVE, Some(&filter), usize::MAX);
+    let node = nodes.iter().find(|n| n.node_id == id).unwrap();
+    assert_eq!(node.properties.get("status").unwrap(), "pending");
+}
+
+/// End-to-end restore semantics for Simard #2562: a prospective memory that
+/// was `resolved` in the source store must (a) come back `resolved` after an
+/// export -> import round-trip, and (b) NOT re-fire from `check_triggers` even
+/// though its trigger keyword is present in the checked content. Before the
+/// fix the restore forced `pending`, so a completed goal re-fired.
+#[test]
+fn test_restore_roundtrip_preserves_status_and_does_not_refire() {
+    // Source store: create a prospective, then resolve it (status -> resolved).
+    let mut source = make_cm();
+    let id = source
+        .store_prospective("finished goal", "deploy production", "notify", 5)
+        .unwrap();
+    source.resolve_prospective(&id);
+
+    // Simulate the verified snapshot: enumerate every prospective (all statuses).
+    let snapshot = source.get_all_prospective(usize::MAX);
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].status, "resolved");
+
+    // Destination store (fresh agent): import the snapshot preserving status —
+    // exactly what remote_transfer::import_full_snapshot now does.
+    let mut dest = make_cm();
+    for pm in &snapshot {
+        dest.store_prospective_with_status(
+            &pm.description,
+            &pm.trigger_condition,
+            &pm.action_on_trigger,
+            pm.priority,
+            &pm.status,
+        )
+        .unwrap();
+    }
+
+    // (a) Status preserved on restore.
+    let restored = dest.get_all_prospective(usize::MAX);
+    assert_eq!(restored.len(), 1);
+    assert_eq!(
+        restored[0].status, "resolved",
+        "restored prospective must keep its resolved status, not come back pending"
+    );
+
+    // (b) The resolved memory must NOT re-fire, even though the content matches
+    // its trigger keywords. check_triggers only reads `pending` nodes, so a
+    // correctly-restored `resolved` item stays silent.
+    let fired = dest.check_triggers("deploy production is starting now");
+    assert!(
+        fired.is_empty(),
+        "a restored resolved prospective must not re-fire from check_triggers"
+    );
+}
