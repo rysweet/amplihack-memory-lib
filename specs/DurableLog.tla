@@ -18,8 +18,11 @@
 (*   engineer's death -- no consolidation race.                            *)
 (*                                                                         *)
 (*   We check:                                                             *)
-(*     PrefixConsistency (safety)  -- the store is always an in-order      *)
-(*       prefix of the durable log: no gaps, no duplicates == exactly-once.*)
+(*     PrefixConsistency (safety)  -- the materialized store is always an  *)
+(*       in-order prefix of the durable log: no gaps, no reorder, no       *)
+(*       duplicates == exactly-once apply.  This is falsifiable: a buggy   *)
+(*       applier that skipped, reordered, or replayed an entry would make  *)
+(*       `store` diverge from the log prefix and TLC would report it.      *)
 (*     NoLostAckedWrite (liveness) -- every appended (acked) write is       *)
 (*       eventually applied, EVEN IF the submitting engineer has died.     *)
 (***************************************************************************)
@@ -32,25 +35,27 @@ CONSTANTS Clients   \* the ephemeral engineer processes
 (*   "appended" - write is in the durable shared log (acked); may die now  *)
 (*   "dead"     - process exited                                           *)
 VARIABLES
-  log,         \* Seq(Clients): durable, append-only order of accepted writes
-  appliedIdx,  \* Nat: how many log entries the single applier has applied
-  pc           \* [Clients -> {"start","appended","dead"}]
+  log,    \* Seq(Clients): durable, append-only order of accepted writes
+  store,  \* Seq(Clients): what the single applier has actually materialized
+          \*   into the lbug store, in the order it applied them
+  pc      \* [Clients -> {"start","appended","dead"}]
 
-vars == <<log, appliedIdx, pc>>
+vars == <<log, store, pc>>
 
-(* Set of writes durably applied to the store (an in-order log prefix).     *)
-AppliedSet == { log[i] : i \in 1..appliedIdx }
+(* Set of writes durably applied to the store.                             *)
+AppliedSet == { store[i] : i \in 1..Len(store) }
 (* Set of writes that were durably acked (appended), regardless of author's *)
 (* liveness.                                                                *)
 AckedSet == { log[i] : i \in 1..Len(log) }
 
 TypeOK ==
-  /\ appliedIdx \in 0..Len(log)
+  /\ Len(store) \in 0..Len(log)
+  /\ \A i \in 1..Len(store) : store[i] \in Clients
   /\ pc \in [Clients -> {"start","appended","dead"}]
 
 Init ==
   /\ log = << >>
-  /\ appliedIdx = 0
+  /\ store = << >>
   /\ pc = [c \in Clients |-> "start"]
 
 (* Engineer durably submits its write: append to the shared log.  This is   *)
@@ -59,26 +64,26 @@ Submit(c) ==
   /\ pc[c] = "start"
   /\ log' = Append(log, c)
   /\ pc' = [pc EXCEPT ![c] = "appended"]
-  /\ UNCHANGED appliedIdx
+  /\ UNCHANGED store
 
 (* Engineer dies BEFORE durably appending: its write was never acked, so    *)
 (* losing it is correct (nothing promised).                                 *)
 CrashBeforeAck(c) ==
   /\ pc[c] = "start"
   /\ pc' = [pc EXCEPT ![c] = "dead"]
-  /\ UNCHANGED <<log, appliedIdx>>
+  /\ UNCHANGED <<log, store>>
 
 (* Engineer dies AFTER durably appending: the acked write MUST still be     *)
 (* applied.  This is the ephemeral-writer case design C must survive.       *)
 CrashAfterAck(c) ==
   /\ pc[c] = "appended"
   /\ pc' = [pc EXCEPT ![c] = "dead"]
-  /\ UNCHANGED <<log, appliedIdx>>
+  /\ UNCHANGED <<log, store>>
 
-(* The single fenced applier applies the next log entry, in order.          *)
+(* The single fenced applier materializes the next log entry, in order.     *)
 Apply ==
-  /\ appliedIdx < Len(log)
-  /\ appliedIdx' = appliedIdx + 1
+  /\ Len(store) < Len(log)
+  /\ store' = Append(store, log[Len(store) + 1])
   /\ UNCHANGED <<log, pc>>
 
 Next ==
@@ -91,10 +96,11 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Apply)
 
 (*-----------------------------  PROPERTIES  ------------------------------*)
 
-(* SAFETY: the store is exactly an in-order prefix of the durable log.      *)
-(* Because writes are applied strictly in order and only from the log,      *)
-(* there are no gaps and no duplicates -> exactly-once apply.               *)
-PrefixConsistency == appliedIdx <= Len(log)
+(* SAFETY: the materialized store is exactly an in-order prefix of the      *)
+(* durable log.  Equivalent to: no gaps, no reorder, no duplicates ->       *)
+(* exactly-once apply.  Falsifiable -- a broken applier makes store diverge *)
+(* from the log prefix of the same length.                                  *)
+PrefixConsistency == store = SubSeq(log, 1, Len(store))
 
 (* LIVENESS: every durably-acked write is eventually applied, regardless of *)
 (* whether its author is still alive.                                       *)

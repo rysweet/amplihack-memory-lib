@@ -47,7 +47,7 @@ SPEC_SHA256 = {
     "FencedApplier.tla": "88264a7425049a5f2bd3b44c5c48bc42f485b945171224eb8b1f727a1df0fb9d",
     "FencedApplier_unfenced.cfg": "f1e155e2a61b6e4a14bf50af6f43dbea2759944539119b1e73c9cb045cc542eb",
     "FencedApplier_fenced.cfg": "91dd5deb33bebf8bacfaa51a7a9f57c16c09ca824a6c24d1a945b71230817e8f",
-    "DurableLog.tla": "4669f58c84195fd237c71859af41961fa9e9354f0d0b89ecf2a43568cd44ba15",
+    "DurableLog.tla": "d433b5ca8f2a22ca1b036d8db7167b10c3e5605cb2efaa63e5e734db35cecca8",
     "DurableLog.cfg": "fda39894875039c8a7fc3210cf0a0c466bf71af3646b7d237845f7d8265a088a",
     "FederatedLoss.tla": "affc4191fb23e5dc6767c63240dcce946610e086037b8eadfcdb7f668ce4ef2c",
     "FederatedLoss.cfg": "4d6ca5c4333ad600eb3b8832b282abbd5205c68afda369b4609ec6d486426022",
@@ -167,18 +167,28 @@ class TestRunChecksScript:
             "positive checks must assert the literal 'No error has been found'"
         )
 
-    def test_negative_matcher_is_case_insensitive_violated(self):
-        """Negative checks must match both 'is violated' and 'were violated'."""
+    def test_negative_matcher_asserts_specific_violation_strings(self):
+        """Negative checks must assert the SPECIFIC violation each demonstrates.
+
+        A bare 'violated' grep lets an unrelated failure (e.g. a broken TypeOK)
+        masquerade as the intended demonstration and keep the gate green while
+        the design property is no longer actually exercised. Each negative check
+        must therefore assert the exact invariant/property TLC names.
+        """
         if not RUN_CHECKS.is_file():
             pytest.fail("specs/run-checks.sh must exist")
         content = _read(RUN_CHECKS)
-        assert re.search(r"violated", content, re.IGNORECASE), (
-            "negative checks must grep for 'violated'"
+        # The two rejected designs must each be pinned to their specific violation.
+        assert "Invariant NoSplitBrain is violated" in content, (
+            "unfenced check must assert the specific 'NoSplitBrain is violated'"
         )
-        # A case-insensitive grep is required so a PROPERTY ('were violated')
-        # and an INVARIANT ('is violated') are both matched.
-        assert re.search(r"grep[^\n|]*-[a-zA-Z]*i", content), (
-            "negative matcher must be case-insensitive (grep -i/-qi)"
+        assert "Temporal properties were violated" in content, (
+            "federated check must assert the specific 'Temporal properties were violated'"
+        )
+        # A fixed-string match (grep -F) is required so the specific expected
+        # string is asserted literally, not as a loose/partial pattern.
+        assert re.search(r"grep[^\n|]*-[a-zA-Z]*F", content), (
+            "negative matcher must assert its expected string with a fixed-string grep (-F)"
         )
 
     def test_pins_jar_by_sha256(self):

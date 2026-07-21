@@ -83,11 +83,12 @@ hazard. `Apply` is guarded by the epoch **iff** `Fencing = TRUE`.
 Models design C: engineers append to a durable shared log, a single applier
 consumes it in order.
 
-- Invariant **`PrefixConsistency`** (safety): the applied portion never runs
-  ahead of the durable log (`appliedIdx <= Len(log)`). Because `Apply` advances
-  one entry at a time, in order, over an append-only log, the store is therefore
-  always an in-order prefix of the log — no gaps, no duplicates (exactly-once
-  apply).
+- Invariant **`PrefixConsistency`** (safety): the materialized store is always
+  an in-order prefix of the durable log (`store = SubSeq(log, 1, Len(store))`).
+  The model tracks the applier's output as an explicit `store` sequence, so this
+  is **falsifiable**: an applier that skipped, reordered, or replayed an entry
+  makes `store` diverge from the log prefix and TLC reports it — no gaps, no
+  reorder, no duplicates (exactly-once apply).
 - Property **`NoLostAckedWrite`** (liveness): every appended (acked) write is
   eventually applied, **even if the submitting engineer has died**. Holds.
 
@@ -161,7 +162,10 @@ classpath (e.g. `alias tlc='java -cp /path/to/tla2tools.jar tlc2.TLC'`):
 
 Note that TLC prints `is violated` for an invariant (check 3) and `were
 violated` for a temporal property (check 4); the polarity logic in
-`run-checks.sh` matches either by looking for `violated` case-insensitively.
+`run-checks.sh` asserts the **specific** string each check must emit
+(`Invariant NoSplitBrain is violated` and `Temporal properties were violated`)
+via a fixed-string match, so an unrelated failure cannot masquerade as the
+intended demonstration and keep the gate green.
 
 ---
 

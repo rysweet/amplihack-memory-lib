@@ -40,9 +40,15 @@ POSITIVE_CHECKS=(
   "FencedApplier.tla FencedApplier_fenced.cfg"
   "DurableLog.tla DurableLog.cfg"
 )
+# Each negative entry is "<module.tla>|<config.cfg>|<expected violation string>".
+# The expected string is the SPECIFIC violation TLC must report — not a generic
+# "violated" — so that a future edit which breaks a DIFFERENT invariant (e.g.
+# TypeOK) can no longer masquerade as the intended demonstration and keep this
+# gate green while the design property it is meant to exercise is no longer
+# actually violated.
 NEGATIVE_CHECKS=(
-  "FencedApplier.tla FencedApplier_unfenced.cfg"
-  "FederatedLoss.tla FederatedLoss.cfg"
+  "FencedApplier.tla|FencedApplier_unfenced.cfg|Invariant NoSplitBrain is violated"
+  "FederatedLoss.tla|FederatedLoss.cfg|Temporal properties were violated"
 )
 
 log() { printf '%s\n' "$*" >&2; }
@@ -115,17 +121,18 @@ check_positive() {
 }
 
 check_negative() {
-  local module="$1" cfg="$2" output
+  local module="$1" cfg="$2" expected="$3" output
   log ""
-  log "=== NEGATIVE: tlc -deadlock -config $cfg $module (expect a violation) ==="
+  log "=== NEGATIVE: tlc -deadlock -config $cfg $module (expect: $expected) ==="
   output="$(run_tlc "$module" "$cfg")" || true
-  # Case-insensitive so both an INVARIANT ('is violated') and a PROPERTY
-  # ('were violated') are matched. A negative check PASSES iff its expected
-  # violation is present.
-  if grep -qi "violated" <<<"$output"; then
-    log "PASS: expected violation is present (intentional negative test)"
+  # A negative check PASSES iff its SPECIFIC expected violation string is
+  # present. Asserting the exact invariant/property named by TLC (rather than a
+  # bare "violated") prevents an unrelated failure from masking the loss of the
+  # scenario this check is meant to demonstrate.
+  if grep -qF "$expected" <<<"$output"; then
+    log "PASS: expected violation present ('$expected')"
   else
-    log "FAIL: expected a violation but none was found. TLC output:"
+    log "FAIL: expected violation '$expected' but it was not found. TLC output:"
     log "$output"
     FAILURES=$((FAILURES + 1))
   fi
@@ -140,8 +147,8 @@ main() {
     check_positive "$module" "$cfg"
   done
   for pair in "${NEGATIVE_CHECKS[@]}"; do
-    read -r module cfg <<<"$pair"
-    check_negative "$module" "$cfg"
+    IFS='|' read -r module cfg expected <<<"$pair"
+    check_negative "$module" "$cfg" "$expected"
   done
 
   log ""
