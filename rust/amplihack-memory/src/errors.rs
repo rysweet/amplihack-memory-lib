@@ -51,6 +51,39 @@ pub enum MemoryError {
         read_count: usize,
     },
 
+    /// The Design C applier's stamped lease epoch no longer matches the live
+    /// on-disk lease epoch at apply time — another process acquired the store
+    /// lease. The applier **fails closed** rather than mutating the store under a
+    /// stale epoch. This is the concrete `NoSplitBrain` guard from
+    /// `specs/FencedApplier.tla`. Fields are structural only (no user data): the
+    /// epoch the applier believed it held vs. the epoch actually live.
+    #[error("epoch fenced: stamped epoch {expected} but live lease epoch is {found}")]
+    EpochFenced {
+        /// The epoch this applier stamped when it acquired the lease.
+        expected: u64,
+        /// The epoch currently live in the on-disk lease.
+        found: u64,
+    },
+
+    /// A CRC mismatch on a **committed interior** record of the durable intent
+    /// log (i.e. not a torn tail). Such a record was acked, so it is **never**
+    /// skipped — skipping it would violate `PrefixConsistency`. Fields are
+    /// structural only: the segment index and byte offset of the bad frame.
+    #[error("intent-log corruption: bad crc at segment {segment} offset {offset}")]
+    LogCorruption {
+        /// Zero-based segment index containing the corrupt frame.
+        segment: u64,
+        /// Byte offset of the corrupt frame within its segment.
+        offset: u64,
+    },
+
+    /// A durable-log record of an unknown `WriteIntent` kind or version was
+    /// read. It is **never silently dropped** (dropping an acked intent would
+    /// break `NoLostAckedWrite`); the applier fails closed so an operator
+    /// deploys a newer daemon rather than losing the write.
+    #[error("unsupported intent kind or version in durable log")]
+    UnsupportedIntentVersion,
+
     /// Generic internal error.
     #[error("{0}")]
     Internal(String),

@@ -323,6 +323,27 @@ the version-independent CSR crash, the one-way v40→v41 storage upgrade, the
 additive Rust API delta, build/CI configuration, the optional patched engine,
 Simard coordination, and the live-store upgrade runbook.
 
+### Multi-writer coordination (Design C)
+
+`lbug` is single-process-exclusive for writes, but Simard has many processes — a
+long-lived daemon plus an unbounded population of ephemeral "engineer" workers —
+that all need to persist into **one** store. The `coord` module is a
+**transactionally-safe, multi-writer coordination layer** that makes this safe:
+writers **append** durable write-intents to an append-only, `fsync`-on-append
+shared log (the append is the durability ack, so a writer may die immediately
+after), a **single fenced applier** run by the daemon drains the log in order and
+applies each intent to `lbug` **exactly once**, and reads are served over a Unix
+domain socket from the single daemon-owned store. Ownership is decided by a
+**monotonic epoch fencing token**, never `kill(pid, 0)` — eliminating the
+split-brain hazard. Consumers link the writer/read client behind the `coord`
+feature **without** linking `lbug` at all, so an engineer *cannot* open the store
+directly. The design is **formally verified** — see [`specs/`](../../specs/README.md).
+
+See [`docs/coordination_layer.md`](docs/coordination_layer.md) for the full
+reference — the architecture, Cargo features, `CoordConfig` and on-disk layout,
+the `WriterClient` / `WriteIntent` / `Applier` / `IpcServer` API, the security
+model, worked tutorials, and the invariant → spec map.
+
 ### Automatic `SIMILAR_TO` linking between facts
 
 `CognitiveMemory` can automatically connect related semantic facts with

@@ -62,6 +62,23 @@ jobs:
         working-directory: rust/amplihack-memory
         run: cargo clippy --features python -- -D warnings
 
+      # Design C coordination layer (issue #137): clippy must be clean across the
+      # whole coord feature matrix — the consumer-only build (coord), the read
+      # client (coord,ipc), and the full daemon set (coord,ipc,persistent, which
+      # links the prebuilt lbug engine). `--tests` also lints the TDD contract
+      # test files that pin the layer's invariants.
+      - name: Clippy (coord feature)
+        working-directory: rust/amplihack-memory
+        run: cargo clippy --features coord --tests -- -D warnings
+
+      - name: Clippy (coord,ipc features)
+        working-directory: rust/amplihack-memory
+        run: cargo clippy --features coord,ipc --tests -- -D warnings
+
+      - name: Clippy (coord,ipc,persistent — full daemon set)
+        working-directory: rust/amplihack-memory
+        run: cargo clippy --features coord,ipc,persistent --tests -- -D warnings
+
       - name: Run tests
         working-directory: rust/amplihack-memory
         run: cargo test
@@ -119,6 +136,45 @@ jobs:
         working-directory: rust/amplihack-memory
         continue-on-error: true
         run: cargo test --features persistent
+
+      # Design C coordination layer (issue #137) — BLOCKING gates. Unlike the
+      # persistent suite above (non-blocking due to a rare native CSR-churn
+      # flake), these coord gates are deterministic and must pass. The coord-only
+      # runs need no C++ toolchain; the full-daemon run links the prebuilt lbug
+      # engine and exercises the applier + IPC read plane against a real store.
+      - name: Run tests (coord — consumer surface, no lbug)
+        working-directory: rust/amplihack-memory
+        run: cargo test --features coord
+
+      - name: Run tests (coord,ipc — read client)
+        working-directory: rust/amplihack-memory
+        run: cargo test --features coord,ipc
+
+      - name: Run tests (coord,ipc,persistent — durable log, fenced applier, IPC)
+        working-directory: rust/amplihack-memory
+        run: >-
+          cargo test --features coord,ipc,persistent
+          --test lease_epoch_fencing
+          --test durable_log
+          --test multi_process_concurrent_append
+          --test applier_exactly_once
+          --test writer_client
+          --test no_direct_open
+          --test ipc_transport
+
+      - name: Run tests (coord module unit tests, full daemon set)
+        working-directory: rust/amplihack-memory
+        run: "cargo test --features coord,ipc,persistent --lib coord::"
+
+      # The TLA+ model checks are the source of truth for the coordination
+      # design's invariants (NoSplitBrain, PrefixConsistency, NoLostAckedWrite).
+      # A single script runs all four checks and asserts each one's expected
+      # polarity (2 positive-clean, 2 negative-violated). BLOCKING.
+      - name: Install JRE for TLA+ model checking
+        run: sudo apt-get update && sudo apt-get install -y default-jre-headless
+
+      - name: TLA+ spec gate (specs/run-checks.sh)
+        run: bash specs/run-checks.sh
 
       - name: Build docs
         working-directory: rust/amplihack-memory
