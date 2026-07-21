@@ -241,3 +241,29 @@ jobs:
 
       - name: Run tests
         run: uv run pytest tests/ -x --tb=short
+
+  # Formal-methods gate: model-check the multi-writer coordination design
+  # (epoch fencing + durable shared log) for the lbug-backed store. This job
+  # fails if the safety invariant regresses — a positive check finding an error
+  # OR a negative check no longer demonstrating its intentional violation. All
+  # check/polarity logic lives in specs/run-checks.sh (single source of truth);
+  # the tla2tools.jar is pinned by URL + sha256 inside that script. See
+  # specs/README.md.
+  tla-model-check:
+    name: TLA+ Model Check (multi-writer coordination)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Run TLA+ model checks
+        run: bash specs/run-checks.sh

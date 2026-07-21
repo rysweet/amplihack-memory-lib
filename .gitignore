@@ -54,3 +54,8 @@ Thumbs.db
 # gadugi-test (qa-scenarios) run artifacts
 outputs/
 logs/
+
+# TLA+ model-check scratch (never commit — see specs/README.md)
+specs/states/
+specs/*.jar
+specs/*_TTrace_*

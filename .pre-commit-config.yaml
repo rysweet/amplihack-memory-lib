@@ -1,4 +1,8 @@
-exclude: '^\.claude/runtime/'
+# The specs/*.tla and *.cfg files are copied VERBATIM from a TLC-model-checked
+# source and pinned by sha256 (see specs/README.md + tests/test_tla_specs.py).
+# Mutating hooks (end-of-file-fixer / trailing-whitespace) must not rewrite them
+# or the byte-identity check breaks, so they are excluded alongside .claude/runtime/.
+exclude: '^(\.claude/runtime/|specs/.*\.(tla|cfg)$)'
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
