@@ -127,6 +127,10 @@ amplihack_memory/
         sqlite_backend.py    # SQLite fallback
 ```
 
+### Design
+
+- **[TLA+ specifications](specs/README.md)** -- Formally model-checked multi-writer coordination design (epoch fencing + durable shared log) for the lbug-backed store, enforced in CI.
+
 ## No Amplihack Dependencies
 
 This library is completely standalone. It requires only:
