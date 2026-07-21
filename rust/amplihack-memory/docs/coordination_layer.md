@@ -266,6 +266,13 @@ applied-index has been durably advanced past it (checkpoint → `fsync` →
 atomic-rename), the segment is safe to delete. Compaction never removes a segment
 that holds an un-applied record.
 
+> **Status.** Segmentation and rollover are implemented; *automatic* deletion of
+> fully-applied segments is deferred (segments currently accumulate). The rule
+> above defines exactly when a future compaction pass — or an operator — may
+> safely remove a segment. Accumulation is not a correctness issue: the reader
+> advances across segments and tolerates already-applied lower segments being
+> absent.
+
 ---
 
 ## Public API

@@ -243,6 +243,24 @@ impl SegmentedLog {
         })
     }
 
+    /// Open and exclusively `flock` the shared append lock file. The lock is
+    /// **not** ownership — it only serializes the append write syscall + offset
+    /// assignment (and torn-tail truncation) across processes. The returned
+    /// `File` must be kept alive alongside the guard for the lock to hold.
+    fn acquire_append_lock(&self) -> Result<(std::fs::File, FlockGuard)> {
+        let lock_path = self.config.intent_log_dir().join(".append.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|e| io_err("open-append-lock", e))?;
+        let guard = FlockGuard::acquire(lock_file.as_raw_fd())?;
+        Ok((lock_file, guard))
+    }
+
     /// Append an intent, returning its durable [`LogOffset`] only after the
     /// record is `fsync`'d (the ack). Multi-process concurrent-safe: the whole
     /// append runs under a brief exclusive `flock` on a lock file, so records
@@ -263,16 +281,7 @@ impl SegmentedLog {
         // Serialize all appends (across processes) with a brief flock. The lock
         // is NOT ownership — it only serializes the write syscall + offset
         // assignment so records never interleave.
-        let lock_path = self.config.intent_log_dir().join(".append.lock");
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&lock_path)
-            .map_err(|e| io_err("open-append-lock", e))?;
-        let _guard = FlockGuard::acquire(lock_file.as_raw_fd())?;
+        let (_lock_file, _guard) = self.acquire_append_lock()?;
 
         // Choose the target segment: roll over once the current one reaches the
         // size target (rollover only at record boundaries, so segments contain
@@ -354,6 +363,16 @@ impl SegmentedLog {
 
 // Reader half — only the applier (persistent) consumes the log.
 #[cfg(feature = "persistent")]
+enum FrameParse {
+    /// A complete, CRC-valid frame.
+    Complete(RawRecord),
+    /// A short / implausible frame at EOF (a torn tail, or a live writer mid-append).
+    Torn,
+    /// A fully-present frame whose CRC does not match — committed-interior corruption.
+    Corrupt,
+}
+
+#[cfg(feature = "persistent")]
 impl SegmentedLog {
     /// Read the next record at or after `pos`, advancing across segment
     /// boundaries. Returns `Ok(None)` when caught up (or on a quarantined torn
@@ -388,21 +407,28 @@ impl SegmentedLog {
                 return Ok(None);
             }
             let is_last = cur.segment == max_index;
-            return self.read_frame_at(&seg.path, cur, seg.len, is_last);
+            return match self.parse_frame_at(&seg.path, cur, seg.len)? {
+                FrameParse::Complete(rec) => Ok(Some(rec)),
+                FrameParse::Corrupt => Err(MemoryError::LogCorruption {
+                    segment: cur.segment,
+                    offset: cur.offset,
+                }),
+                FrameParse::Torn => self.quarantine_torn_tail(&seg.path, cur, is_last),
+            };
         }
     }
 
-    /// Read and validate a single frame at `pos` within `seg_path`.
-    fn read_frame_at(
+    /// Parse the single frame at `pos` within a segment of length `seg_len`,
+    /// classifying it as complete, torn (short at EOF), or interior-corrupt.
+    fn parse_frame_at(
         &self,
         seg_path: &std::path::Path,
         pos: LogOffset,
         seg_len: u64,
-        is_last: bool,
-    ) -> Result<Option<RawRecord>> {
+    ) -> Result<FrameParse> {
         let remaining = seg_len - pos.offset;
         if remaining < FRAME_OVERHEAD {
-            return self.torn_or_corrupt(seg_path, pos, is_last);
+            return Ok(FrameParse::Torn);
         }
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -416,11 +442,11 @@ impl SegmentedLog {
             .map_err(|e| io_err("read-frame-len", e))?;
         let payload_len = u32::from_be_bytes(len_buf);
         if u64::from(payload_len) > u64::from(self.config.max_frame_bytes) {
-            return self.torn_or_corrupt(seg_path, pos, is_last);
+            return Ok(FrameParse::Torn);
         }
         let need = 4 + u64::from(payload_len) + 4;
         if remaining < need {
-            return self.torn_or_corrupt(seg_path, pos, is_last);
+            return Ok(FrameParse::Torn);
         }
         let mut payload = vec![0u8; payload_len as usize];
         file.read_exact(&mut payload)
@@ -430,14 +456,9 @@ impl SegmentedLog {
             .map_err(|e| io_err("read-frame-crc", e))?;
         let stored_crc = u32::from_be_bytes(crc_buf);
         if crc32(&payload) != stored_crc {
-            // A fully-present frame with a bad CRC is committed-interior
-            // corruption — NEVER skipped (would break PrefixConsistency).
-            return Err(MemoryError::LogCorruption {
-                segment: pos.segment,
-                offset: pos.offset,
-            });
+            return Ok(FrameParse::Corrupt);
         }
-        Ok(Some(RawRecord {
+        Ok(FrameParse::Complete(RawRecord {
             payload,
             next: LogOffset {
                 segment: pos.segment,
@@ -446,28 +467,51 @@ impl SegmentedLog {
         }))
     }
 
-    /// A short/implausible frame: a torn tail on the last segment is quarantined
-    /// (truncated, since it was never acked); anywhere else it is corruption.
-    fn torn_or_corrupt(
+    /// A short/implausible frame at EOF. This can be a genuine torn tail (a
+    /// writer that died mid-append before its `fsync`/ack) **or** a writer that
+    /// is *currently* mid-`write_all`. We must never truncate the latter, so we
+    /// take the same `.append.lock` the writers hold, re-stat the segment, and
+    /// re-parse: if a writer completed the frame in the meantime it is a normal
+    /// record; if it is still short with no writer holding the lock it is a
+    /// genuine torn tail and is truncated (it was never acked). A short frame in
+    /// a non-last segment is interior corruption and is never truncated.
+    fn quarantine_torn_tail(
         &self,
         seg_path: &std::path::Path,
         pos: LogOffset,
         is_last: bool,
     ) -> Result<Option<RawRecord>> {
-        if is_last {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(seg_path)
-                .map_err(|e| io_err("open-truncate-tail", e))?;
-            file.set_len(pos.offset)
-                .map_err(|e| io_err("truncate-tail", e))?;
-            file.sync_all().map_err(|e| io_err("fsync-truncate", e))?;
-            Ok(None)
-        } else {
-            Err(MemoryError::LogCorruption {
+        if !is_last {
+            return Err(MemoryError::LogCorruption {
                 segment: pos.segment,
                 offset: pos.offset,
-            })
+            });
+        }
+        // Serialize against live appends before any destructive action.
+        let (_lock_file, _guard) = self.acquire_append_lock()?;
+        let seg_len = std::fs::metadata(seg_path)
+            .map(|m| m.len())
+            .map_err(|e| io_err("stat-tail", e))?;
+        match self.parse_frame_at(seg_path, pos, seg_len)? {
+            // A writer completed the frame between our unlocked read and the
+            // lock — it is a normal record, not a torn tail.
+            FrameParse::Complete(rec) => Ok(Some(rec)),
+            FrameParse::Corrupt => Err(MemoryError::LogCorruption {
+                segment: pos.segment,
+                offset: pos.offset,
+            }),
+            // Still short with the append lock held: no writer is mid-write, so
+            // this is a genuine never-acked torn tail. Truncate it away.
+            FrameParse::Torn => {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(seg_path)
+                    .map_err(|e| io_err("open-truncate-tail", e))?;
+                file.set_len(pos.offset)
+                    .map_err(|e| io_err("truncate-tail", e))?;
+                file.sync_all().map_err(|e| io_err("fsync-truncate", e))?;
+                Ok(None)
+            }
         }
     }
 }
