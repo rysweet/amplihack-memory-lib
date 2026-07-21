@@ -12,6 +12,8 @@
 //! Each agent gets full isolation via an `agent_id` property stored on every
 //! graph node.
 
+#[cfg(feature = "persistent")]
+mod applied_ledger;
 mod converters;
 mod dedup;
 mod episodic;
@@ -21,6 +23,8 @@ mod ranked;
 mod semantic;
 mod sensory;
 mod similarity;
+#[cfg(feature = "persistent")]
+mod store_lock;
 mod types;
 mod working;
 
@@ -63,6 +67,11 @@ pub struct CognitiveMemory {
     graph: Box<dyn GraphStore + Send>,
     sensory_order: i64,
     temporal_index: i64,
+    /// Single-writer OS lock held for a persistent store's lifetime (F4,
+    /// `NoSplitBrain`). `None` for the in-memory backend, which has no shared
+    /// on-disk state to guard. Released on drop so a sequential reopen succeeds.
+    #[cfg(feature = "persistent")]
+    _store_lock: Option<store_lock::StoreWriterLock>,
 }
 
 impl CognitiveMemory {
@@ -104,6 +113,8 @@ impl CognitiveMemory {
             graph: store,
             sensory_order: 0,
             temporal_index: 0,
+            #[cfg(feature = "persistent")]
+            _store_lock: None,
         };
         cm.recover_counters();
         Ok(cm)
@@ -162,6 +173,10 @@ impl CognitiveMemory {
     ) -> Result<Self> {
         let trimmed = Self::validate_agent_name(agent_name)?;
         let store_id = format!("cognitive-{trimmed}");
+        // F4: take the exclusive single-writer OS lock BEFORE opening the store,
+        // so a second concurrent writer over the same single-writer store fails
+        // closed here rather than proceeding to mutate the WAL in parallel.
+        let store_lock = store_lock::StoreWriterLock::acquire(path.as_ref())?;
         let (store, recovery) = crate::graph::lbug_store::LbugGraphStore::open_with_recovery(
             path.as_ref(),
             Some(&store_id),
@@ -202,7 +217,9 @@ impl CognitiveMemory {
                 "CognitiveMemory::open_persistent recovered from a corrupt WAL"
             );
         }
-        Self::with_store(agent_name, Box::new(store))
+        let mut cm = Self::with_store(agent_name, Box::new(store))?;
+        cm._store_lock = Some(store_lock);
+        Ok(cm)
     }
 
     /// Flush durable state: force the backend to checkpoint its write-ahead log
@@ -406,8 +423,16 @@ impl CognitiveMemory {
     // ======================================================================
 
     /// Release graph resources.
+    ///
+    /// Also releases the single-writer OS lock (F4) so a subsequent reopen of
+    /// the same persistent store in this process succeeds — `close` is an
+    /// explicit, clean handoff of ownership.
     pub fn close(&mut self) {
         self.graph.close();
+        #[cfg(feature = "persistent")]
+        {
+            self._store_lock = None;
+        }
     }
 }
 

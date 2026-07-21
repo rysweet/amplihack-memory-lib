@@ -7,7 +7,7 @@
 //! is rejected. Process **liveness (`kill(pid, 0)`) is never consulted** — there
 //! is no PID/liveness API here at all, by design.
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 
@@ -53,23 +53,17 @@ impl Lease {
     pub fn acquire(config: &CoordConfig, holder: &str) -> Result<Self> {
         ensure_coord_dirs(config)?;
 
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(config.lease_path())
-            .map_err(|e| io_err("open-lease", e))?;
+        // Serialize the read-modify-write on the STABLE lock file, not the lease
+        // record (whose inode changes under the atomic temp+rename write below).
+        let lock_file = open_lease_lock(config)?;
+        let _guard = FlockGuard::acquire(lock_file.as_raw_fd())?;
 
-        let _guard = FlockGuard::acquire(file.as_raw_fd())?;
-
-        let current = read_epoch(&mut file)?.unwrap_or(0);
+        let current = read_epoch(config)?.unwrap_or(0);
         let next = current
             .checked_add(1)
             .ok_or_else(|| MemoryError::Storage("lease epoch overflow".into()))?;
 
-        write_record(&mut file, next, holder)?;
+        write_record(config, next, holder)?;
 
         Ok(Self {
             config: config.clone(),
@@ -83,20 +77,14 @@ impl Lease {
     /// # Errors
     /// [`MemoryError::Storage`] on any I/O or corrupt-record failure.
     pub fn renew(&mut self) -> Result<Epoch> {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(self.config.lease_path())
-            .map_err(|e| io_err("open-lease-renew", e))?;
+        let lock_file = open_lease_lock(&self.config)?;
+        let _guard = FlockGuard::acquire(lock_file.as_raw_fd())?;
 
-        let _guard = FlockGuard::acquire(file.as_raw_fd())?;
-
-        let current = read_epoch(&mut file)?.unwrap_or(0);
+        let current = read_epoch(&self.config)?.unwrap_or(0);
         let next = current
             .checked_add(1)
             .ok_or_else(|| MemoryError::Storage("lease epoch overflow".into()))?;
-        write_record(&mut file, next, &self.holder)?;
+        write_record(&self.config, next, &self.holder)?;
         self.epoch = next;
         Ok(next)
     }
@@ -120,47 +108,75 @@ impl Lease {
     /// written (a missing/empty lease is not epoch `0`, which a stale writer
     /// could then match) or if the record is corrupt.
     pub fn current_epoch(config: &CoordConfig) -> Result<Epoch> {
-        let mut file = match std::fs::OpenOptions::new()
-            .read(true)
-            .open(config.lease_path())
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(MemoryError::Storage(
-                    "no store lease exists (fail closed)".into(),
-                ));
-            }
-            Err(e) => return Err(io_err("open-lease-read", e)),
-        };
-        let _guard = FlockGuard::acquire(file.as_raw_fd())?;
-        read_epoch(&mut file)?
+        // Fail closed BEFORE creating any lock file if no lease has ever been
+        // written — a missing lease must not be silently provisioned as epoch 0.
+        if !config.lease_path().exists() {
+            return Err(MemoryError::Storage(
+                "no store lease exists (fail closed)".into(),
+            ));
+        }
+        let lock_file = open_lease_lock(config)?;
+        let _guard = FlockGuard::acquire(lock_file.as_raw_fd())?;
+        read_epoch(config)?
             .ok_or_else(|| MemoryError::Storage("store lease is empty (fail closed)".into()))
     }
 }
 
-/// Read and validate the lease record, returning its epoch, or `None` if the
-/// file is empty (freshly created, not yet written).
-fn read_epoch(file: &mut std::fs::File) -> Result<Option<Epoch>> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| io_err("seek-lease", e))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|e| io_err("read-lease", e))?;
+/// Open (creating if absent) the stable lease lock file used only to `flock`-
+/// serialize the acquire/renew/read RMW. It is never the record itself, so its
+/// inode is stable across the atomic-rename lease writes.
+fn open_lease_lock(config: &CoordConfig) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(config.lease_lock_path())
+        .map_err(|e| io_err("open-lease-lock", e))
+}
+
+/// Read and validate the on-disk lease record, returning its epoch, or `None` if
+/// the file is absent or empty (freshly created, not yet written). Because the
+/// record is written via atomic rename it is always observed whole — never torn.
+fn read_epoch(config: &CoordConfig) -> Result<Option<Epoch>> {
+    let bytes = match std::fs::read(config.lease_path()) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_err("read-lease", e)),
+    };
     if bytes.is_empty() {
         return Ok(None);
     }
     decode_record(&bytes).map(Some)
 }
 
-/// Encode + atomically-in-place write the lease record, then `fsync`.
-fn write_record(file: &mut std::fs::File, epoch: Epoch, holder: &str) -> Result<()> {
+/// Durably, atomically replace the lease record: write it to a temp file,
+/// `fsync`, `rename` it over the lease path, then `fsync` the directory — the
+/// same temp+fsync+rename+dir-fsync idiom `persist_applied_index` uses. A crash
+/// at any point leaves the lease path pointing at either the old complete record
+/// or the new complete record, never an empty/torn file, so the epoch can never
+/// reset. The caller holds the lease `flock`, so the fixed temp name never races.
+fn write_record(config: &CoordConfig, epoch: Epoch, holder: &str) -> Result<()> {
     let record = encode_record(epoch, holder)?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| io_err("seek-lease-write", e))?;
-    file.set_len(0).map_err(|e| io_err("truncate-lease", e))?;
-    file.write_all(&record)
-        .map_err(|e| io_err("write-lease", e))?;
-    file.sync_all().map_err(|e| io_err("fsync-lease", e))?;
+    let final_path = config.lease_path();
+    let tmp_path = config.base_dir.join(".lease.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| io_err("open-lease-tmp", e))?;
+        f.write_all(&record)
+            .map_err(|e| io_err("write-lease-tmp", e))?;
+        f.sync_all().map_err(|e| io_err("fsync-lease-tmp", e))?;
+    }
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| io_err("rename-lease", e))?;
+    if let Ok(dir) = std::fs::File::open(&config.base_dir) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 

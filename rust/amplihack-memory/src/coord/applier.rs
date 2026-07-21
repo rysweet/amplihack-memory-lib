@@ -83,10 +83,18 @@ impl Applier {
             }
             let intent: WriteIntent = serde_json::from_slice(&rec.payload)
                 .map_err(|_| MemoryError::UnsupportedIntentVersion)?;
-            if self.seen.insert(intent.intent_id()) {
+            let id = intent.intent_id();
+            // Exactly-once across restart: the in-memory `seen` set is a fast
+            // path, but the DURABLE boundary is the in-store applied-intent
+            // ledger — it survives a crash that rewound the applied-index, so a
+            // replay never re-applies an effect. Effect then ledger-mark ride the
+            // same checkpoint below.
+            if !self.seen.contains(&id) && !self.memory.intent_applied(id) {
                 apply_intent(&mut self.memory, &intent)?;
+                self.memory.mark_intent_applied(id)?;
                 applied += 1;
             }
+            self.seen.insert(id);
             pos = rec.next;
         }
 
@@ -304,14 +312,14 @@ impl Coordinator {
             }
             let intent: WriteIntent = serde_json::from_slice(&rec.payload)
                 .map_err(|_| MemoryError::UnsupportedIntentVersion)?;
-            let first_time = self
-                .seen
-                .lock()
-                .expect("seen mutex")
-                .insert(intent.intent_id());
-            if first_time {
-                let mut mem = self.memory.lock().expect("store mutex");
+            let id = intent.intent_id();
+            let mut mem = self.memory.lock().expect("store mutex");
+            let seen_new = self.seen.lock().expect("seen mutex").insert(id);
+            // Durable exactly-once: consult the in-store ledger (survives a
+            // restart with an empty `seen`) before applying, then mark it.
+            if seen_new && !mem.intent_applied(id) {
                 apply_intent(&mut mem, &intent)?;
+                mem.mark_intent_applied(id)?;
             }
             pos = rec.next;
         }

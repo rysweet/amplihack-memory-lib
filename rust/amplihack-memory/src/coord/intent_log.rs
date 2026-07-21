@@ -283,9 +283,20 @@ impl SegmentedLog {
         // assignment so records never interleave.
         let (_lock_file, _guard) = self.acquire_append_lock()?;
 
-        // Choose the target segment: roll over once the current one reaches the
-        // size target (rollover only at record boundaries, so segments contain
-        // whole frames).
+        // F1: BEFORE choosing a write position, recover any torn PARTIAL tail
+        // left by a writer that was killed mid-`write_all` (flock releases on
+        // death). Appending after an unvalidated tail would either bury an acked
+        // frame behind garbage (interior corruption) or make the reader truncate
+        // the acked frame away. Only the LAST segment can carry a torn tail —
+        // rollover happens only at frame boundaries, so earlier segments are
+        // whole. Recovery truncates ONLY a trailing torn partial, never a
+        // complete fsynced frame.
+        if let Some(last_index) = self.segments()?.last().map(|s| s.index) {
+            self.recover_tail(last_index)?;
+        }
+
+        // Re-stat after recovery: a truncated tail changes segment lengths, which
+        // drive both rollover and the assigned offset.
         let segs = self.segments()?;
         let target_index = match segs.last() {
             None => 0,
@@ -293,10 +304,12 @@ impl SegmentedLog {
             Some(last) => last.index,
         };
         let seg_path = self.segment_path(target_index);
-        let existing_len = segs
-            .iter()
-            .find(|s| s.index == target_index)
-            .map_or(0, |s| s.len);
+        let seg_existing = segs.iter().find(|s| s.index == target_index);
+        let existing_len = seg_existing.map_or(0, |s| s.len);
+        // A brand-new segment file (first append, or a rollover) needs its
+        // directory entry fsync'd, or a power loss after the data fsync could
+        // vanish the whole segment (losing an acked write). See F3.
+        let is_new_segment = seg_existing.is_none();
 
         let mut frame = Vec::with_capacity(frame_len as usize);
         frame.extend_from_slice(&payload_len.to_be_bytes());
@@ -311,8 +324,13 @@ impl SegmentedLog {
             .map_err(|e| io_err("open-segment", e))?;
         file.write_all(&frame)
             .map_err(|e| io_err("append-frame", e))?;
-        if self.config.fsync_on_append {
-            file.sync_all().map_err(|e| io_err("fsync-segment", e))?;
+        // The `fsync` IS the durability ack: always persist the record's data,
+        // and — when this call created the segment file — its parent directory
+        // entry, before returning success. This is unconditional; `fsync_on_append`
+        // must never be able to downgrade an ack to a non-durable append (F3).
+        file.sync_all().map_err(|e| io_err("fsync-segment", e))?;
+        if is_new_segment {
+            crate::coord::fsync_dir(&self.config.intent_log_dir())?;
         }
 
         Ok(LogOffset {
@@ -358,6 +376,92 @@ impl SegmentedLog {
         self.config
             .intent_log_dir()
             .join(format!("{index:012}.seg"))
+    }
+
+    /// F1 recovery: scan segment `index` forward, CRC-validating every frame,
+    /// and truncate away a trailing torn PARTIAL so the segment ends on the last
+    /// complete, CRC-valid frame boundary. Called under the append flock before
+    /// a write.
+    ///
+    /// It only ever discards a trailing torn partial — a frame that is shorter
+    /// than its declared length, has an implausible length prefix, or is a
+    /// bad-CRC *final* frame (never acked, since a writer that finished its
+    /// `fsync` ack must have written a complete valid frame). A bad-CRC frame
+    /// that is followed by further bytes is committed-interior corruption: it is
+    /// NEVER truncated (that would eat an acked frame) and instead surfaces as a
+    /// hard [`MemoryError::LogCorruption`], so we never append onto corruption.
+    fn recover_tail(&self, index: u64) -> Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let seg_path = self.segment_path(index);
+        let seg_len = match std::fs::metadata(&seg_path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io_err("stat-recover-tail", e)),
+        };
+        if seg_len == 0 {
+            return Ok(());
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&seg_path)
+            .map_err(|e| io_err("open-recover-tail", e))?;
+
+        let mut boundary: u64 = 0;
+        loop {
+            let remaining = seg_len - boundary;
+            if remaining == 0 {
+                break; // clean: segment ends exactly on a frame boundary
+            }
+            if remaining < FRAME_OVERHEAD {
+                break; // trailing bytes shorter than framing overhead -> torn
+            }
+            file.seek(SeekFrom::Start(boundary))
+                .map_err(|e| io_err("seek-recover-tail", e))?;
+            let mut len_buf = [0u8; 4];
+            file.read_exact(&mut len_buf)
+                .map_err(|e| io_err("read-recover-len", e))?;
+            let payload_len = u32::from_be_bytes(len_buf);
+            if u64::from(payload_len) > u64::from(self.config.max_frame_bytes) {
+                break; // implausible length prefix -> torn partial
+            }
+            let need = FRAME_OVERHEAD + u64::from(payload_len);
+            if remaining < need {
+                break; // declared frame does not fit -> torn partial
+            }
+            let mut payload = vec![0u8; payload_len as usize];
+            file.read_exact(&mut payload)
+                .map_err(|e| io_err("read-recover-payload", e))?;
+            let mut crc_buf = [0u8; 4];
+            file.read_exact(&mut crc_buf)
+                .map_err(|e| io_err("read-recover-crc", e))?;
+            if crc32(&payload) != u32::from_be_bytes(crc_buf) {
+                // A full-length frame whose CRC does not match.
+                if boundary + need == seg_len {
+                    break; // it is the final frame and was never acked -> torn
+                }
+                // Bytes follow a bad frame: committed-interior corruption.
+                return Err(MemoryError::LogCorruption {
+                    segment: index,
+                    offset: boundary,
+                });
+            }
+            boundary += need;
+        }
+
+        if boundary < seg_len {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&seg_path)
+                .map_err(|e| io_err("open-truncate-recover", e))?;
+            file.set_len(boundary)
+                .map_err(|e| io_err("truncate-recover", e))?;
+            file.sync_all()
+                .map_err(|e| io_err("fsync-truncate-recover", e))?;
+            crate::coord::fsync_dir(&self.config.intent_log_dir())?;
+        }
+        Ok(())
     }
 }
 

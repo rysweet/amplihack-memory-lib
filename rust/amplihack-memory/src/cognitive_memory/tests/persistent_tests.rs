@@ -348,15 +348,20 @@ fn mark_episode_distilled_latch_and_ownership() {
     assert!(alice.mark_episode_distilled(&ep));
     assert!(alice.mark_episode_distilled(&ep));
 
-    // A different agent sharing the DB cannot distill alice's episode.
+    // Alice's episode is distilled; she owns nothing undistilled.
+    assert!(alice.list_undistilled_episodes(10).is_empty());
+
+    // Single-writer discipline (F4): a second agent takes over the store only
+    // after alice releases it. `close` hands off the exclusive writer lock, and
+    // bob then reads the SAME durable store to prove the cross-agent ownership
+    // check — a different agent cannot distill alice's episode.
+    alice.close();
+
     let mut bob = CognitiveMemory::open_persistent(&path, "bob").unwrap();
     assert!(
         !bob.mark_episode_distilled(&ep),
         "cross-agent distill must be rejected (ownership check)"
     );
-
-    // Alice's episode is still distilled; bob owns nothing undistilled.
-    assert!(alice.list_undistilled_episodes(10).is_empty());
     assert!(bob.list_undistilled_episodes(10).is_empty());
 }
 
@@ -831,6 +836,11 @@ fn checkpoint_then_reopen_returns_all_records_and_needs_no_replay() {
             wal_len == 0 || !wal.exists(),
             "WAL should be empty/absent after checkpoint, was {wal_len} bytes"
         );
+        // Release ONLY the exclusive writer lock (F4) so a fresh owner can
+        // reopen the same store in this process, but do NOT cleanly close: the
+        // handle is then forgotten so the graph's Drop-time flush never runs.
+        // This proves durability rests solely on the explicit checkpoint above.
+        cm._store_lock = None;
         std::mem::forget(cm); // no clean close: rely solely on the checkpoint
     }
 

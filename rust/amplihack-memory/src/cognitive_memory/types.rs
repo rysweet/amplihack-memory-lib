@@ -61,6 +61,12 @@ pub(crate) const NT_PROSPECTIVE: &str = "ProspectiveMemory";
 /// Node-type label for consolidated episode nodes.
 pub(crate) const NT_CONSOLIDATED: &str = "ConsolidatedEpisode";
 
+/// Node-type label for the exactly-once applied-intent ledger (F2). Each node's
+/// id is derived from a `WriteIntent`'s `intent_id`, so a replay after a crash
+/// finds the marker already present and skips re-applying the effect.
+#[cfg(feature = "persistent")]
+pub(crate) const NT_APPLIED_INTENT: &str = "AppliedIntent";
+
 // Edge-type labels
 /// Edge-type label for sensory-to-working attention transitions.
 pub(crate) const ET_ATTENDED_TO: &str = "ATTENDED_TO";
