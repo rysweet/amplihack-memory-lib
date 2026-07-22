@@ -21,7 +21,7 @@ dirs = "5"
 sha2 = "0.10"
 thiserror = "2"
 tracing = "0.1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 ladybug-graph-rs = { path = "../../ladybug-graph-rs", optional = true }
 # Published LadybugDB (Kùzu) bindings used by the persistent GraphStore backend.
 # Same crate/version Simard depends on; only pulled in by the `persistent` feature.
@@ -43,6 +43,15 @@ harness = false
 
 [features]
 default = []
+# Design C multi-writer coordination layer (Lease/Epoch, intent-log/WriteIntent,
+# WriterClient, RankedRecallClient). The CONSUMER surface: builds standalone
+# WITHOUT `persistent`, so an engineer binary that enables only `coord` cannot
+# name `open_persistent`/`lbug`. See docs/coordination_layer.md.
+coord = []
+# Framed-JSON UDS read transport for the coordination layer. The client
+# (`RankedRecallClient`) needs only `ipc`; the server (`IpcServer`) additionally
+# requires `persistent` (it reads the daemon-owned lbug store).
+ipc = []
 kuzu = ["dep:pyo3", "pyo3/auto-initialize"]
 # Enables the PyO3 bindings (the `#[pyclass]` wrappers). On its own this links
 # against libpython, so `cargo test --features python` / `cargo clippy` work in

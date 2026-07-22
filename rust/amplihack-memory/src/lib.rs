@@ -59,6 +59,11 @@ pub mod cognitive_memory;
 pub mod connector;
 /// Contradiction detection between memory facts.
 pub mod contradiction;
+/// Design C multi-writer coordination layer (durable intent log + fenced
+/// applier + IPC reads) over the single-writer `lbug` store. Gated by the
+/// `coord` feature; the daemon-only pieces additionally need `persistent`/`ipc`.
+#[cfg(feature = "coord")]
+pub mod coord;
 /// Creative-idea prospective memory type: lifecycle state machine + typed links.
 pub mod creative_idea;
 /// Deterministic episodic→semantic distillation heuristics and fact-yield benchmark.

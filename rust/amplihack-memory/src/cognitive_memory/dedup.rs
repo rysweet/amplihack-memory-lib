@@ -66,7 +66,7 @@ pub fn compute_content_hash(concept: &str, content: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Strategy for detecting that a fact being stored duplicates an existing one.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum DedupMode {
     /// No deduplication: every upsert inserts a fresh fact.
     #[default]
@@ -85,7 +85,7 @@ pub enum DedupMode {
 ///
 /// [`Default`] disables deduplication (`mode = None`) with a `0.60` similarity
 /// threshold and same-concept restriction, so it is a safe no-op default.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DedupOptions {
     /// The duplicate-detection strategy.
     pub mode: DedupMode,
@@ -109,7 +109,7 @@ impl Default for DedupOptions {
 /// Provenance inputs for an [`upsert_fact`](CognitiveMemory::upsert_fact) insert.
 ///
 /// [`Default`] links no episodes and is lenient (`strict = false`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProvenanceOptions {
     /// Episode ids the new fact derives from (each gets a `DERIVES_FROM` edge).
     pub source_episode_ids: Vec<String>,
@@ -124,7 +124,7 @@ pub struct ProvenanceOptions {
 /// [`Default`] performs a plain insert: no similarity linking, no provenance
 /// edges, and no deduplication — observably identical to
 /// [`store_fact`](CognitiveMemory::store_fact).
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct StoreFactOptions {
     /// When `Some(opts)` (and `opts.enabled`), a freshly inserted fact is
     /// auto-linked to its above-threshold neighbours.
@@ -138,7 +138,7 @@ pub struct StoreFactOptions {
 /// A fact to store via [`upsert_fact`](CognitiveMemory::upsert_fact).
 ///
 /// Construct with [`FactInput::new`] and set the optional fields as needed.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct FactInput {
     /// The concept / topic key.
     pub concept: String,

@@ -35,7 +35,7 @@ use super::CognitiveMemory;
 /// [`Default`] enables linking with a `0.60` composite threshold, scoring up to
 /// `50` candidate facts per source and storing reciprocal (bidirectional)
 /// edges.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SimilarityOptions {
     /// When `false`, linking methods are inert no-ops (return `0` / an empty
     /// report and write no edges). Lets a single options value also gate the
