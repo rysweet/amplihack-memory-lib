@@ -242,6 +242,12 @@ pub trait GraphStore {
         Ok(())
     }
 
+    /// Set the auto-checkpoint interval — the number of mutating writes between
+    /// automatic WAL→main-database folds. `0` disables auto-checkpointing so the
+    /// backend folds its WAL only at explicit [`checkpoint`](Self::checkpoint)
+    /// points. A no-op for volatile backends (the default).
+    fn set_checkpoint_interval(&self, _writes: u64) {}
+
     /// Release resources held by the store.
     fn close(&mut self);
 }

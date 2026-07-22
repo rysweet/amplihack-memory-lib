@@ -47,6 +47,14 @@ impl Applier {
         let lease = Lease::acquire(config, agent_name)?;
         let epoch = lease.epoch();
         let memory = CognitiveMemory::open_persistent(store_path, agent_name)?;
+        // F2 (defense-in-depth): disable the store's mid-drain auto-checkpoint so
+        // the only WAL→main-DB fold points are this applier's explicit
+        // end-of-drain `checkpoint()` and `close`. This narrows the physical
+        // effect↔marker durability window. NOTE: it does NOT by itself close the
+        // exactly-once residual — un-checkpointed WAL writes are still replayed on
+        // reopen (see `dedup::reuse_fact`'s per-intent stamp guard, which is the
+        // load-bearing fix). Keep the applier's per-effect replay-safety.
+        memory.set_checkpoint_interval(0);
         let log = SegmentedLog::open(config)?;
         let applied_index = load_applied_index(config)?;
         Ok(Self {
@@ -71,6 +79,8 @@ impl Applier {
     pub fn drain(&mut self) -> Result<usize> {
         let mut applied = 0usize;
         let mut pos = self.applied_index;
+        let crash_after = crash_after_effects();
+        let mut effects_this_pass = 0usize;
 
         while let Some(rec) = self.log.read_next(pos)? {
             // Fence BEFORE applying: a stale epoch must never mutate the store.
@@ -83,10 +93,28 @@ impl Applier {
             }
             let intent: WriteIntent = serde_json::from_slice(&rec.payload)
                 .map_err(|_| MemoryError::UnsupportedIntentVersion)?;
-            if self.seen.insert(intent.intent_id()) {
+            let id = intent.intent_id();
+            // Exactly-once across restart: the in-memory `seen` set is a fast
+            // path, but the DURABLE boundary is the in-store applied-intent
+            // ledger — it survives a crash that rewound the applied-index, so a
+            // replay never re-applies an effect. The effect is ALSO replay-safe
+            // (deterministic node ids), so even the effect↔marker window is
+            // harmless (F2).
+            if !self.seen.contains(&id) && !self.memory.intent_applied(id) {
                 apply_intent(&mut self.memory, &intent)?;
+                effects_this_pass += 1;
+                // Crash-injection seam (test-only): checkpoint the effect
+                // durable, then fail BEFORE the marker + index advance.
+                if crash_after == Some(effects_this_pass) {
+                    self.memory.checkpoint()?;
+                    return Err(MemoryError::Storage(
+                        "injected crash after effect (test seam)".into(),
+                    ));
+                }
+                self.memory.mark_intent_applied(id, &pos.order_key())?;
                 applied += 1;
             }
+            self.seen.insert(id);
             pos = rec.next;
         }
 
@@ -98,6 +126,10 @@ impl Applier {
             self.memory.checkpoint()?;
             persist_applied_index(&self.config, pos)?;
             self.applied_index = pos;
+            // N2: the cursor is now durably past every marker below it, so those
+            // markers can never be needed again — prune them (delete-after-
+            // persist, hence crash-safe). Bounds the ledger.
+            self.memory.prune_applied_below(&pos.order_key())?;
         }
         Ok(applied)
     }
@@ -119,11 +151,22 @@ impl Applier {
     pub fn applied_index(&self) -> LogOffset {
         self.applied_index
     }
+
+    /// Number of live applied-intent ledger markers in the store. Bounded by the
+    /// prune-below-watermark step (N2); exposed for tests that assert the ledger
+    /// does not grow without bound.
+    pub fn applied_intent_count(&self) -> usize {
+        self.memory.applied_intent_count()
+    }
 }
 
 /// Apply one intent to the store via the single-writer mutator surface. Each
-/// variant maps 1:1 to an existing [`CognitiveMemory`] method.
+/// variant is made **replay-safe** (F2 exactly-once): create-family intents mint
+/// their node under a deterministic id derived from `intent_id` so a crash-window
+/// replay upserts the same node instead of duplicating it; links are idempotent;
+/// `RecordAccess` is stamped so its counter increment is not double-applied.
 fn apply_intent(memory: &mut CognitiveMemory, intent: &WriteIntent) -> Result<()> {
+    let id = intent.intent_id();
     match intent {
         WriteIntent::StoreFact {
             concept,
@@ -134,7 +177,8 @@ fn apply_intent(memory: &mut CognitiveMemory, intent: &WriteIntent) -> Result<()
             metadata,
             ..
         } => {
-            memory.store_fact(
+            memory.apply_store_fact(
+                id,
                 concept,
                 content,
                 *confidence,
@@ -149,6 +193,8 @@ fn apply_intent(memory: &mut CognitiveMemory, intent: &WriteIntent) -> Result<()
             prerequisites,
             ..
         } => {
+            // Already idempotent: upsert-by-(agent,name) reuses the canonical
+            // node, so a replay updates it in place rather than duplicating.
             memory.store_procedure(name, steps, prerequisites.as_deref())?;
         }
         WriteIntent::StoreEpisode {
@@ -158,7 +204,13 @@ fn apply_intent(memory: &mut CognitiveMemory, intent: &WriteIntent) -> Result<()
             metadata,
             ..
         } => {
-            memory.store_episode(content, source_label, *temporal_index, metadata.as_ref())?;
+            memory.apply_store_episode(
+                id,
+                content,
+                source_label,
+                *temporal_index,
+                metadata.as_ref(),
+            )?;
         }
         WriteIntent::StoreProspective {
             description,
@@ -167,7 +219,8 @@ fn apply_intent(memory: &mut CognitiveMemory, intent: &WriteIntent) -> Result<()
             priority,
             ..
         } => {
-            memory.store_prospective(
+            memory.apply_store_prospective(
+                id,
                 description,
                 trigger_condition,
                 action_on_trigger,
@@ -179,6 +232,7 @@ fn apply_intent(memory: &mut CognitiveMemory, intent: &WriteIntent) -> Result<()
             episode_ids,
             ..
         } => {
+            // Idempotent edges: a replay does not accumulate duplicate links.
             memory.link_fact_to_episodes(fact_id, episode_ids)?;
         }
         WriteIntent::LinkSimilarFacts {
@@ -190,13 +244,26 @@ fn apply_intent(memory: &mut CognitiveMemory, intent: &WriteIntent) -> Result<()
             memory.link_similar_facts(fact_id_a, fact_id_b, *similarity_score)?;
         }
         WriteIntent::UpsertFact { input, options, .. } => {
-            memory.upsert_fact(input.clone(), options)?;
+            memory.apply_upsert_fact(id, input.clone(), options)?;
         }
         WriteIntent::RecordAccess { node_id, kind, .. } => {
-            memory.record_access(node_id, *kind)?;
+            memory.apply_record_access(id, node_id, *kind)?;
         }
     }
     Ok(())
+}
+
+/// Test-only crash-injection seam (see `tests/coord_f2_crash_injection.rs`). When
+/// `AMPLIHACK_COORD_CRASH_AFTER_EFFECTS=<N>` is set, both drain paths — after
+/// applying the N-th effect of a pass AND `checkpoint()`-ing the store (so the
+/// effect is durable) — return an injected error BEFORE writing that intent's
+/// ledger marker and BEFORE persisting the applied-index. This faithfully models
+/// an auto-checkpoint@128 / `SIGKILL` landing in the effect→marker gap, so a test
+/// can prove the deterministic-id fix makes the replay exactly-once.
+fn crash_after_effects() -> Option<usize> {
+    std::env::var("AMPLIHACK_COORD_CRASH_AFTER_EFFECTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
 }
 
 /// Load the durable applied-index, or the log origin if none has been written.
@@ -265,6 +332,10 @@ impl Coordinator {
         let lease = Lease::acquire(&config, agent_name)?;
         let epoch = lease.epoch();
         let memory = CognitiveMemory::open_persistent(store_path, agent_name)?;
+        // F2 (defense-in-depth): see `Applier::open`. Disable mid-drain
+        // auto-checkpoint so the only fold-points are the explicit end-of-drain
+        // checkpoints; exactly-once still rests on per-effect replay-safety.
+        memory.set_checkpoint_interval(0);
         let log = SegmentedLog::open(&config)?;
         let applied_index = load_applied_index(&config)?;
         Ok(Self {
@@ -294,6 +365,8 @@ impl Coordinator {
     fn drain_once(&self) -> Result<()> {
         let mut pos = *self.applied_index.lock().expect("applied-index mutex");
         let start = pos;
+        let crash_after = crash_after_effects();
+        let mut effects_this_pass = 0usize;
         while let Some(rec) = self.log.read_next(pos)? {
             let live = Lease::current_epoch(&self.config)?;
             if live != self.epoch {
@@ -304,14 +377,23 @@ impl Coordinator {
             }
             let intent: WriteIntent = serde_json::from_slice(&rec.payload)
                 .map_err(|_| MemoryError::UnsupportedIntentVersion)?;
-            let first_time = self
-                .seen
-                .lock()
-                .expect("seen mutex")
-                .insert(intent.intent_id());
-            if first_time {
-                let mut mem = self.memory.lock().expect("store mutex");
+            let id = intent.intent_id();
+            let mut mem = self.memory.lock().expect("store mutex");
+            let seen_new = self.seen.lock().expect("seen mutex").insert(id);
+            // Durable exactly-once: consult the in-store ledger (survives a
+            // restart with an empty `seen`) before applying, then mark it. The
+            // effect is replay-safe (deterministic ids), so the effect↔marker
+            // window is harmless (F2).
+            if seen_new && !mem.intent_applied(id) {
                 apply_intent(&mut mem, &intent)?;
+                effects_this_pass += 1;
+                if crash_after == Some(effects_this_pass) {
+                    mem.checkpoint()?;
+                    return Err(MemoryError::Storage(
+                        "injected crash after effect (test seam)".into(),
+                    ));
+                }
+                mem.mark_intent_applied(id, &pos.order_key())?;
             }
             pos = rec.next;
         }
@@ -319,6 +401,12 @@ impl Coordinator {
             self.memory.lock().expect("store mutex").checkpoint()?;
             persist_applied_index(&self.config, pos)?;
             *self.applied_index.lock().expect("applied-index mutex") = pos;
+            // N2: prune markers below the now-durable cursor (crash-safe
+            // delete-after-persist).
+            self.memory
+                .lock()
+                .expect("store mutex")
+                .prune_applied_below(&pos.order_key())?;
         }
         Ok(())
     }

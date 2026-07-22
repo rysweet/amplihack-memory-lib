@@ -340,6 +340,35 @@ impl CognitiveMemory {
         input: FactInput,
         options: &StoreFactOptions,
     ) -> Result<StoreFactOutcome> {
+        self.upsert_fact_inner(input, options, None)
+    }
+
+    /// Fenced-applier entry point for an `UpsertFact` intent: identical to
+    /// [`upsert_fact`](Self::upsert_fact) but any node this call CREATES (an
+    /// insert, or the new version of a supersede) is minted under a DETERMINISTIC
+    /// id (`sem_{intent_id}`) so a crash-window replay upserts the same node
+    /// instead of duplicating it (F2 exactly-once). Reuse of an existing fact
+    /// remains gated by the applier's durable idempotency ledger.
+    ///
+    /// # Errors
+    /// As [`upsert_fact`](Self::upsert_fact).
+    #[cfg(feature = "persistent")]
+    pub(crate) fn apply_upsert_fact(
+        &mut self,
+        intent_id: uuid::Uuid,
+        input: FactInput,
+        options: &StoreFactOptions,
+    ) -> Result<StoreFactOutcome> {
+        let forced = format!("sem_{intent_id}");
+        self.upsert_fact_inner(input, options, Some(&forced))
+    }
+
+    fn upsert_fact_inner(
+        &mut self,
+        input: FactInput,
+        options: &StoreFactOptions,
+        forced_id: Option<&str>,
+    ) -> Result<StoreFactOutcome> {
         if input.confidence.is_nan() || !(0.0..=1.0).contains(&input.confidence) {
             return Err(MemoryError::InvalidInput(
                 "confidence must be between 0.0 and 1.0".into(),
@@ -352,22 +381,22 @@ impl CognitiveMemory {
         match (&options.dedup.mode, hit) {
             (DedupMode::CallerKey(k), Some(existing)) => {
                 if existing.content_hash == content_hash {
-                    self.reuse_fact(existing, &input, content_hash)
+                    self.reuse_fact(existing, &input, content_hash, forced_id)
                 } else {
                     let key = k.clone();
-                    self.supersede_with_new(existing, input, options, content_hash, key)
+                    self.supersede_with_new(existing, input, options, content_hash, key, forced_id)
                 }
             }
             (DedupMode::CallerKey(k), None) => {
                 let mut input = input;
                 input.dedup_key = Some(k.clone());
-                self.insert_fact(input, options, content_hash)
+                self.insert_fact(input, options, content_hash, forced_id)
             }
             (DedupMode::ExactContentHash, Some(existing))
             | (DedupMode::SameConceptSimilarity, Some(existing)) => {
-                self.reuse_fact(existing, &input, content_hash)
+                self.reuse_fact(existing, &input, content_hash, forced_id)
             }
-            _ => self.insert_fact(input, options, content_hash),
+            _ => self.insert_fact(input, options, content_hash, forced_id),
         }
     }
 
@@ -564,6 +593,7 @@ impl CognitiveMemory {
         input: FactInput,
         options: &StoreFactOptions,
         content_hash: String,
+        forced_id: Option<&str>,
     ) -> Result<StoreFactOutcome> {
         let node_id = self.store_fact_with_provenance_inner(
             &input.concept,
@@ -577,6 +607,7 @@ impl CognitiveMemory {
             input.importance,
             input.expires_at,
             input.dedup_key.clone(),
+            forced_id,
         )?;
 
         let provenance_edges_created = self.fact_provenance(&node_id).len();
@@ -596,7 +627,37 @@ impl CognitiveMemory {
         existing: SemanticFact,
         input: &FactInput,
         content_hash: String,
+        reuse_stamp: Option<&str>,
     ) -> Result<StoreFactOutcome> {
+        // F2 exactly-once (reuse path): `reuse_fact` is a NON-idempotent
+        // read-modify-write (`usage_count += 1`). On the fenced-applier replay
+        // path (`reuse_stamp = Some("sem_{intent_id}")`) a crash landing in the
+        // effect->marker window would otherwise re-apply the bump and double it.
+        // Guard it with a durable per-intent stamp on the node (mirrors
+        // `apply_record_access`'s `last_access_intent`): if this exact intent
+        // already bumped this node, the replay is a no-op. The direct (non-
+        // applier) `upsert_fact` path passes `None` and bumps every call,
+        // preserving its user-visible "each dedup hit refreshes usage" semantics.
+        if let Some(stamp) = reuse_stamp {
+            if self
+                .graph
+                .get_node(&existing.node_id)
+                .and_then(|n| n.properties.get("last_reuse_intent").cloned())
+                .as_deref()
+                == Some(stamp)
+            {
+                return Ok(StoreFactOutcome {
+                    node_id: existing.node_id.clone(),
+                    dedup_action: DedupAction::Reused {
+                        existing_id: existing.node_id,
+                    },
+                    content_hash,
+                    similarity_links_created: 0,
+                    provenance_edges_created: 0,
+                });
+            }
+        }
+
         let mut props = HashMap::new();
         props.insert(
             "usage_count".to_string(),
@@ -604,6 +665,9 @@ impl CognitiveMemory {
         );
         props.insert("last_accessed_at".to_string(), ts_now().to_string());
         props.insert("confidence".to_string(), input.confidence.to_string());
+        if let Some(stamp) = reuse_stamp {
+            props.insert("last_reuse_intent".to_string(), stamp.to_string());
+        }
         if !self.graph.update_node(&existing.node_id, props) {
             return Err(MemoryError::Storage(format!(
                 "failed to update reused fact {}",
@@ -629,6 +693,7 @@ impl CognitiveMemory {
         options: &StoreFactOptions,
         content_hash: String,
         key: String,
+        forced_id: Option<&str>,
     ) -> Result<StoreFactOutcome> {
         input.dedup_key = Some(key);
         let node_id = self.store_fact_with_provenance_inner(
@@ -643,6 +708,7 @@ impl CognitiveMemory {
             input.importance,
             input.expires_at,
             input.dedup_key.clone(),
+            forced_id,
         )?;
 
         let provenance_edges_created = self.fact_provenance(&node_id).len();

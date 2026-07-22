@@ -118,6 +118,15 @@ impl CoordConfig {
         self.base_dir.join("lease")
     }
 
+    /// Path of the **stable** lease lock file. The lease record itself is
+    /// rewritten via atomic temp+rename (so its inode changes on every write);
+    /// serialization of the acquire/renew read-modify-write must therefore
+    /// `flock` a separate, never-renamed file whose inode is stable across
+    /// writes — otherwise two acquirers could `flock` different inodes and race.
+    pub(crate) fn lease_lock_path(&self) -> PathBuf {
+        self.base_dir.join("lease.lock")
+    }
+
     /// Directory holding the segmented, append-only intent log.
     pub(crate) fn intent_log_dir(&self) -> PathBuf {
         self.base_dir.join("intent-log")
@@ -139,6 +148,18 @@ impl CoordConfig {
 /// free) context label.
 pub(crate) fn io_err(context: &str, e: io::Error) -> MemoryError {
     MemoryError::Storage(format!("coord {context}: {e}"))
+}
+
+/// `fsync` a directory so a newly-created (or renamed) entry within it is
+/// durably linked — `sync_all` on a file persists its data+inode but NOT the
+/// parent directory entry mapping name -> inode. Mirrors the dir-fsync in
+/// `persist_applied_index`. Best-effort on open (a directory that cannot be
+/// opened cannot be fsync'd), but a failed `sync_all` is surfaced.
+pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
+    match std::fs::File::open(dir) {
+        Ok(f) => f.sync_all().map_err(|e| io_err("fsync-dir", e)),
+        Err(e) => Err(io_err("open-dir-fsync", e)),
+    }
 }
 
 /// Create the coordination directory tree (`base_dir` and `intent-log/`) with

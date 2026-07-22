@@ -485,9 +485,57 @@ impl CognitiveMemory {
         Ok(())
     }
 
-    // ======================================================================
-    // SCORING (internal)
-    // ======================================================================
+    /// Fenced-applier entry point for a `RecordAccess` intent: an idempotent
+    /// read-modify-write. `record_access` increments `usage_count`, which is NOT
+    /// replay-safe — a crash-window replay would double-count. This stamps the
+    /// applying `intent_id` onto the node in the SAME update, and skips the
+    /// increment when the node already carries this stamp, so replaying the same
+    /// intent is a no-op (F2 exactly-once) while distinct accesses still count.
+    ///
+    /// # Errors
+    /// As [`record_access`](Self::record_access).
+    #[cfg(feature = "persistent")]
+    pub(crate) fn apply_record_access(
+        &mut self,
+        intent_id: uuid::Uuid,
+        node_id: &str,
+        kind: AccessKind,
+    ) -> Result<()> {
+        let _ = kind; // Read and Recall increment identically (reserved).
+
+        let node = self.graph.get_node(node_id).ok_or_else(|| {
+            MemoryError::Storage(format!("record_access: node {node_id} not found"))
+        })?;
+
+        if node.properties.get("agent_id").map(String::as_str) != Some(self.agent_name.as_str()) {
+            return Err(MemoryError::SecurityViolation(
+                "record_access: node not owned by current agent".into(),
+            ));
+        }
+
+        // Already applied this exact intent (a replay across the F2 crash
+        // window): the stamp is durable with the prior increment, so skip.
+        let stamp = intent_id.to_string();
+        if node.properties.get("last_access_intent") == Some(&stamp) {
+            return Ok(());
+        }
+
+        let prev = prop_i64(&node.properties, "usage_count");
+        let mut props = HashMap::new();
+        props.insert(
+            "usage_count".to_string(),
+            prev.saturating_add(1).to_string(),
+        );
+        props.insert("last_accessed_at".to_string(), ts_now().to_string());
+        props.insert("last_access_intent".to_string(), stamp);
+
+        if !self.graph.update_node(node_id, props) {
+            return Err(MemoryError::Storage(format!(
+                "record_access: update failed for {node_id}"
+            )));
+        }
+        Ok(())
+    }
 
     /// Compute the combined score and `reasons` for one candidate.
     ///

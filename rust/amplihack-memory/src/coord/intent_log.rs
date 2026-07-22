@@ -47,6 +47,45 @@ impl LogOffset {
             offset: 0,
         }
     }
+
+    /// A fixed-width, lexicographically-ordered key for this position
+    /// (`{segment:020}:{offset:020}`). Two keys compare as strings in the same
+    /// total order the offsets compare numerically, which lets the applied-intent
+    /// ledger store each marker's offset as an opaque string and prune every
+    /// marker strictly below a durable watermark with a plain `<` comparison
+    /// (N2, `prune_applied_below`).
+    #[cfg(feature = "persistent")]
+    pub(crate) fn order_key(&self) -> String {
+        format!("{:020}:{:020}", self.segment, self.offset)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// N1: bounded append-path recovery scan instrumentation
+// ---------------------------------------------------------------------------
+
+/// Process-global count of frames CRC-validated by the append-path tail
+/// recovery ([`SegmentedLog::recover_tail_from`]). On a known-clean tail the
+/// clean-tail fast path skips recovery entirely, so this stays flat regardless
+/// of segment fill; without the fast path it grows ~O(n) per append. Exposed so
+/// a test can assert the append scan cost is bounded and independent of fill
+/// (N1). Best-effort observability only — never affects durability.
+static FRAMES_SCANNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total frames the append-path tail recovery has CRC-validated since the last
+/// [`reset_frames_scanned`]. See [`FRAMES_SCANNED`].
+pub fn frames_scanned() -> u64 {
+    FRAMES_SCANNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reset the [`frames_scanned`] counter to zero (test observability).
+pub fn reset_frames_scanned() {
+    FRAMES_SCANNED.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record that the append-path recovery CRC-validated one more frame.
+fn note_frame_scanned() {
+    FRAMES_SCANNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// A versioned, `serde`-tagged mutation intent. One variant per store mutation a
@@ -283,9 +322,52 @@ impl SegmentedLog {
         // assignment so records never interleave.
         let (_lock_file, _guard) = self.acquire_append_lock()?;
 
-        // Choose the target segment: roll over once the current one reaches the
-        // size target (rollover only at record boundaries, so segments contain
-        // whole frames).
+        // F1: BEFORE choosing a write position, recover any torn PARTIAL tail
+        // left by a writer that was killed mid-`write_all` (flock releases on
+        // death). Appending after an unvalidated tail would either bury an acked
+        // frame behind garbage (interior corruption) or make the reader truncate
+        // the acked frame away. Only the LAST segment can carry a torn tail —
+        // rollover happens only at frame boundaries, so earlier segments are
+        // whole. Recovery truncates ONLY a trailing torn partial, never a
+        // complete fsynced frame.
+        //
+        // N1: skip the whole-segment re-CRC when the tail is already a known
+        // clean frame boundary. `.clean-tail` is a durable, monotone lower bound
+        // on how far the last segment is verified-clean; when the observed tail
+        // equals it there is nothing new to validate, so recovery is a no-op.
+        // Otherwise recovery scans ONLY the unverified suffix past the clean-tail
+        // hint (or the whole segment when no hint exists), preserving F1 exactly:
+        // a torn partial is truncated, a bad-CRC frame followed by bytes is a
+        // hard `LogCorruption`. The hint is only ever advanced to a genuinely
+        // verified boundary, and recovery always re-scans any suffix past it, so
+        // a crash between an append's fsync-ack and its clean-tail update simply
+        // re-validates that acked frame on the next append (never loses it).
+        if let Some(last) = self.segments()?.last() {
+            let last_index = last.index;
+            let last_len = last.len;
+            let clean = self.read_clean_tail();
+            let clean_offset = match clean {
+                Some(ct) if ct.segment == last_index && ct.offset <= last_len => ct.offset,
+                _ => 0,
+            };
+            let tail_is_known_clean = clean
+                == Some(LogOffset {
+                    segment: last_index,
+                    offset: last_len,
+                });
+            if !tail_is_known_clean {
+                let verified = self.recover_tail_from(last_index, clean_offset)?;
+                // A clean scan (no truncation) verified the segment through
+                // `verified`; publish it so the next append skips the re-scan.
+                self.write_clean_tail(LogOffset {
+                    segment: last_index,
+                    offset: verified,
+                });
+            }
+        }
+
+        // Re-stat after recovery: a truncated tail changes segment lengths, which
+        // drive both rollover and the assigned offset.
         let segs = self.segments()?;
         let target_index = match segs.last() {
             None => 0,
@@ -293,10 +375,12 @@ impl SegmentedLog {
             Some(last) => last.index,
         };
         let seg_path = self.segment_path(target_index);
-        let existing_len = segs
-            .iter()
-            .find(|s| s.index == target_index)
-            .map_or(0, |s| s.len);
+        let seg_existing = segs.iter().find(|s| s.index == target_index);
+        let existing_len = seg_existing.map_or(0, |s| s.len);
+        // A brand-new segment file (first append, or a rollover) needs its
+        // directory entry fsync'd, or a power loss after the data fsync could
+        // vanish the whole segment (losing an acked write). See F3.
+        let is_new_segment = seg_existing.is_none();
 
         let mut frame = Vec::with_capacity(frame_len as usize);
         frame.extend_from_slice(&payload_len.to_be_bytes());
@@ -311,14 +395,76 @@ impl SegmentedLog {
             .map_err(|e| io_err("open-segment", e))?;
         file.write_all(&frame)
             .map_err(|e| io_err("append-frame", e))?;
-        if self.config.fsync_on_append {
-            file.sync_all().map_err(|e| io_err("fsync-segment", e))?;
+        // The `fsync` IS the durability ack: always persist the record's data,
+        // and — when this call created the segment file — its parent directory
+        // entry, before returning success. This is unconditional; `fsync_on_append`
+        // must never be able to downgrade an ack to a non-durable append (F3).
+        file.sync_all().map_err(|e| io_err("fsync-segment", e))?;
+        if is_new_segment {
+            crate::coord::fsync_dir(&self.config.intent_log_dir())?;
         }
+
+        // The tail is now a complete, fsynced, CRC-valid frame boundary. Advance
+        // the durable clean-tail hint so the NEXT append skips re-CRC'ing this
+        // segment (N1). This is a hint only: it never gates durability (the frame
+        // is already acked above), and a crash before it lands just makes the
+        // next append re-validate this one frame.
+        self.write_clean_tail(LogOffset {
+            segment: target_index,
+            offset: existing_len + frame_len,
+        });
 
         Ok(LogOffset {
             segment: target_index,
             offset: existing_len,
         })
+    }
+
+    /// Path of the durable clean-tail sidecar under the intent-log dir.
+    fn clean_tail_path(&self) -> PathBuf {
+        self.config.intent_log_dir().join(".clean-tail")
+    }
+
+    /// Read the persisted clean-tail hint, or `None` if absent/unreadable. A
+    /// missing or malformed hint is treated as "no hint" (recovery falls back to
+    /// a full scan), so a lost sidecar only costs one extra scan, never
+    /// correctness.
+    fn read_clean_tail(&self) -> Option<LogOffset> {
+        let bytes = std::fs::read(self.clean_tail_path()).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Atomically publish the clean-tail hint (temp + fsync + rename + dir-fsync,
+    /// the same durability discipline as the applied-index). Best-effort: a
+    /// failure to persist the hint is swallowed — it is a performance hint, and
+    /// the append itself already succeeded and was acked, so a missing hint only
+    /// costs a re-scan on the next append (never a lost or duplicated write).
+    fn write_clean_tail(&self, off: LogOffset) {
+        let final_path = self.clean_tail_path();
+        let tmp_path = self.config.intent_log_dir().join(".clean-tail.tmp");
+        let Ok(bytes) = serde_json::to_vec(&off) else {
+            return;
+        };
+        let write_tmp = || -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+            Ok(())
+        };
+        if write_tmp().is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return;
+        }
+        if std::fs::rename(&tmp_path, &final_path).is_ok() {
+            let _ = crate::coord::fsync_dir(&self.config.intent_log_dir());
+        } else {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
     }
 
     /// Sorted list of segment files under the intent-log dir.
@@ -358,6 +504,101 @@ impl SegmentedLog {
         self.config
             .intent_log_dir()
             .join(format!("{index:012}.seg"))
+    }
+
+    /// F1 recovery: scan segment `index` from byte `start` forward, CRC-validating
+    /// every frame, and truncate away a trailing torn PARTIAL so the segment ends
+    /// on the last complete, CRC-valid frame boundary. Called under the append
+    /// flock before a write. Returns the verified clean boundary (the offset the
+    /// segment ends on after any truncation).
+    ///
+    /// `start` MUST be a real frame boundary (0, or a previously-verified
+    /// clean-tail offset). Scanning from a verified lower bound (N1) skips
+    /// re-CRC'ing the already-validated prefix while preserving F1 exactly for
+    /// the unverified suffix.
+    ///
+    /// It only ever discards a trailing torn partial — a frame that is shorter
+    /// than its declared length, has an implausible length prefix, or is a
+    /// bad-CRC *final* frame (never acked, since a writer that finished its
+    /// `fsync` ack must have written a complete valid frame). A bad-CRC frame
+    /// that is followed by further bytes is committed-interior corruption: it is
+    /// NEVER truncated (that would eat an acked frame) and instead surfaces as a
+    /// hard [`MemoryError::LogCorruption`], so we never append onto corruption.
+    fn recover_tail_from(&self, index: u64, start: u64) -> Result<u64> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let seg_path = self.segment_path(index);
+        let seg_len = match std::fs::metadata(&seg_path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(start),
+            Err(e) => return Err(io_err("stat-recover-tail", e)),
+        };
+        if seg_len == 0 {
+            return Ok(0);
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&seg_path)
+            .map_err(|e| io_err("open-recover-tail", e))?;
+
+        let mut boundary: u64 = start.min(seg_len);
+        loop {
+            let remaining = seg_len - boundary;
+            if remaining == 0 {
+                break; // clean: segment ends exactly on a frame boundary
+            }
+            if remaining < FRAME_OVERHEAD {
+                break; // trailing bytes shorter than framing overhead -> torn
+            }
+            file.seek(SeekFrom::Start(boundary))
+                .map_err(|e| io_err("seek-recover-tail", e))?;
+            let mut len_buf = [0u8; 4];
+            file.read_exact(&mut len_buf)
+                .map_err(|e| io_err("read-recover-len", e))?;
+            let payload_len = u32::from_be_bytes(len_buf);
+            if u64::from(payload_len) > u64::from(self.config.max_frame_bytes) {
+                break; // implausible length prefix -> torn partial
+            }
+            let need = FRAME_OVERHEAD + u64::from(payload_len);
+            if remaining < need {
+                break; // declared frame does not fit -> torn partial
+            }
+            let mut payload = vec![0u8; payload_len as usize];
+            file.read_exact(&mut payload)
+                .map_err(|e| io_err("read-recover-payload", e))?;
+            let mut crc_buf = [0u8; 4];
+            file.read_exact(&mut crc_buf)
+                .map_err(|e| io_err("read-recover-crc", e))?;
+            // Count only fully-present frames we actually CRC-validate; this is
+            // the O(n) work the clean-tail fast path eliminates on a clean tail.
+            note_frame_scanned();
+            if crc32(&payload) != u32::from_be_bytes(crc_buf) {
+                // A full-length frame whose CRC does not match.
+                if boundary + need == seg_len {
+                    break; // it is the final frame and was never acked -> torn
+                }
+                // Bytes follow a bad frame: committed-interior corruption.
+                return Err(MemoryError::LogCorruption {
+                    segment: index,
+                    offset: boundary,
+                });
+            }
+            boundary += need;
+        }
+
+        if boundary < seg_len {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&seg_path)
+                .map_err(|e| io_err("open-truncate-recover", e))?;
+            file.set_len(boundary)
+                .map_err(|e| io_err("truncate-recover", e))?;
+            file.sync_all()
+                .map_err(|e| io_err("fsync-truncate-recover", e))?;
+            crate::coord::fsync_dir(&self.config.intent_log_dir())?;
+        }
+        Ok(boundary)
     }
 }
 
