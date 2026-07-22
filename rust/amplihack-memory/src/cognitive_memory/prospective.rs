@@ -59,7 +59,54 @@ impl CognitiveMemory {
         priority: i32,
         status: &str,
     ) -> Result<String> {
-        let node_id = new_id("pro");
+        self.store_prospective_with_status_inner(
+            description,
+            trigger_condition,
+            action_on_trigger,
+            priority,
+            status,
+            None,
+        )
+    }
+
+    /// Fenced-applier entry point for a `StoreProspective` intent: store the
+    /// prospective memory under a DETERMINISTIC node id (`pro_{intent_id}`) so a
+    /// crash-window replay upserts the same node instead of duplicating it
+    /// (F2 exactly-once).
+    ///
+    /// # Errors
+    /// As [`store_prospective`](Self::store_prospective).
+    #[cfg(feature = "persistent")]
+    pub(crate) fn apply_store_prospective(
+        &mut self,
+        intent_id: uuid::Uuid,
+        description: &str,
+        trigger_condition: &str,
+        action_on_trigger: &str,
+        priority: i32,
+    ) -> Result<String> {
+        let forced = format!("pro_{intent_id}");
+        self.store_prospective_with_status_inner(
+            description,
+            trigger_condition,
+            action_on_trigger,
+            priority,
+            DEFAULT_PROSPECTIVE_STATUS,
+            Some(&forced),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_prospective_with_status_inner(
+        &mut self,
+        description: &str,
+        trigger_condition: &str,
+        action_on_trigger: &str,
+        priority: i32,
+        status: &str,
+        forced_id: Option<&str>,
+    ) -> Result<String> {
+        let node_id = forced_id.map(String::from).unwrap_or_else(|| new_id("pro"));
         let now = ts_now();
 
         let status = if status.is_empty() {

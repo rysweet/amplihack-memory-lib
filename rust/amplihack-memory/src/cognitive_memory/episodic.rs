@@ -65,7 +65,73 @@ impl CognitiveMemory {
         Ok(node_id)
     }
 
-    /// Retrieve episodic memories, sorted by temporal_index descending.
+    /// Fenced-applier entry point for a `StoreEpisode` intent: store the episode
+    /// under a DETERMINISTIC node id (`epi_{intent_id}`) so a crash-window replay
+    /// upserts the same node instead of duplicating it, and bump the
+    /// `temporal_index` **create-only** (get-before-put) so a replay never
+    /// double-advances episodic ordering (F2 exactly-once).
+    ///
+    /// # Errors
+    /// As [`store_episode`](Self::store_episode).
+    #[cfg(feature = "persistent")]
+    pub(crate) fn apply_store_episode(
+        &mut self,
+        intent_id: uuid::Uuid,
+        content: &str,
+        source_label: &str,
+        temporal_index: Option<i64>,
+        metadata: Option<&HashMap<String, serde_json::Value>>,
+    ) -> Result<String> {
+        let node_id = format!("epi_{intent_id}");
+
+        // Get-before-put: if this intent's episode already exists (a replay
+        // across the effect↔marker crash window), it is already applied — return
+        // it WITHOUT re-bumping `temporal_index`. A create-time re-bump would move
+        // the index and corrupt episodic ordering.
+        if self.graph.get_node(&node_id).is_some() {
+            return Ok(node_id);
+        }
+
+        let now = ts_now();
+        let tidx = match temporal_index {
+            Some(idx) => {
+                if idx > self.temporal_index {
+                    self.temporal_index = idx;
+                }
+                idx
+            }
+            None => {
+                self.temporal_index += 1;
+                self.temporal_index
+            }
+        };
+
+        let meta_json = metadata
+            .map(|m| {
+                serde_json::to_string(m).unwrap_or_else(|e| {
+                    warn!("apply_store_episode: failed to serialize metadata: {e}");
+                    "{}".into()
+                })
+            })
+            .unwrap_or_else(|| "{}".into());
+
+        let mut props = HashMap::new();
+        props.insert("node_id".to_string(), node_id.clone());
+        props.insert("agent_id".to_string(), self.agent_name.clone());
+        props.insert("content".to_string(), content.to_string());
+        props.insert("source_label".to_string(), source_label.to_string());
+        props.insert("temporal_index".to_string(), tidx.to_string());
+        props.insert("compressed".to_string(), "false".to_string());
+        props.insert("distilled".to_string(), "false".to_string());
+        props.insert("metadata".to_string(), meta_json);
+        props.insert("created_at".to_string(), now.to_string());
+
+        self.graph
+            .add_node(NT_EPISODIC, props, Some(&node_id))
+            .map_err(|e| MemoryError::Storage(e.to_string()))?;
+
+        Ok(node_id)
+    }
     ///
     /// If `include_compressed` is false (default), compressed episodes are excluded.
     pub fn get_episodes(&self, limit: usize, include_compressed: bool) -> Vec<EpisodicMemory> {

@@ -340,6 +340,35 @@ impl CognitiveMemory {
         input: FactInput,
         options: &StoreFactOptions,
     ) -> Result<StoreFactOutcome> {
+        self.upsert_fact_inner(input, options, None)
+    }
+
+    /// Fenced-applier entry point for an `UpsertFact` intent: identical to
+    /// [`upsert_fact`](Self::upsert_fact) but any node this call CREATES (an
+    /// insert, or the new version of a supersede) is minted under a DETERMINISTIC
+    /// id (`sem_{intent_id}`) so a crash-window replay upserts the same node
+    /// instead of duplicating it (F2 exactly-once). Reuse of an existing fact
+    /// remains gated by the applier's durable idempotency ledger.
+    ///
+    /// # Errors
+    /// As [`upsert_fact`](Self::upsert_fact).
+    #[cfg(feature = "persistent")]
+    pub(crate) fn apply_upsert_fact(
+        &mut self,
+        intent_id: uuid::Uuid,
+        input: FactInput,
+        options: &StoreFactOptions,
+    ) -> Result<StoreFactOutcome> {
+        let forced = format!("sem_{intent_id}");
+        self.upsert_fact_inner(input, options, Some(&forced))
+    }
+
+    fn upsert_fact_inner(
+        &mut self,
+        input: FactInput,
+        options: &StoreFactOptions,
+        forced_id: Option<&str>,
+    ) -> Result<StoreFactOutcome> {
         if input.confidence.is_nan() || !(0.0..=1.0).contains(&input.confidence) {
             return Err(MemoryError::InvalidInput(
                 "confidence must be between 0.0 and 1.0".into(),
@@ -355,19 +384,19 @@ impl CognitiveMemory {
                     self.reuse_fact(existing, &input, content_hash)
                 } else {
                     let key = k.clone();
-                    self.supersede_with_new(existing, input, options, content_hash, key)
+                    self.supersede_with_new(existing, input, options, content_hash, key, forced_id)
                 }
             }
             (DedupMode::CallerKey(k), None) => {
                 let mut input = input;
                 input.dedup_key = Some(k.clone());
-                self.insert_fact(input, options, content_hash)
+                self.insert_fact(input, options, content_hash, forced_id)
             }
             (DedupMode::ExactContentHash, Some(existing))
             | (DedupMode::SameConceptSimilarity, Some(existing)) => {
                 self.reuse_fact(existing, &input, content_hash)
             }
-            _ => self.insert_fact(input, options, content_hash),
+            _ => self.insert_fact(input, options, content_hash, forced_id),
         }
     }
 
@@ -564,6 +593,7 @@ impl CognitiveMemory {
         input: FactInput,
         options: &StoreFactOptions,
         content_hash: String,
+        forced_id: Option<&str>,
     ) -> Result<StoreFactOutcome> {
         let node_id = self.store_fact_with_provenance_inner(
             &input.concept,
@@ -577,6 +607,7 @@ impl CognitiveMemory {
             input.importance,
             input.expires_at,
             input.dedup_key.clone(),
+            forced_id,
         )?;
 
         let provenance_edges_created = self.fact_provenance(&node_id).len();
@@ -629,6 +660,7 @@ impl CognitiveMemory {
         options: &StoreFactOptions,
         content_hash: String,
         key: String,
+        forced_id: Option<&str>,
     ) -> Result<StoreFactOutcome> {
         input.dedup_key = Some(key);
         let node_id = self.store_fact_with_provenance_inner(
@@ -643,6 +675,7 @@ impl CognitiveMemory {
             input.importance,
             input.expires_at,
             input.dedup_key.clone(),
+            forced_id,
         )?;
 
         let provenance_edges_created = self.fact_provenance(&node_id).len();

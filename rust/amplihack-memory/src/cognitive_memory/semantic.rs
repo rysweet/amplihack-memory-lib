@@ -85,6 +85,7 @@ impl CognitiveMemory {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -122,6 +123,7 @@ impl CognitiveMemory {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -139,6 +141,7 @@ impl CognitiveMemory {
         importance: Option<f64>,
         expires_at: Option<DateTime<Utc>>,
         dedup_key: Option<String>,
+        forced_id: Option<&str>,
     ) -> Result<String> {
         if confidence.is_nan() || !(0.0..=1.0).contains(&confidence) {
             return Err(MemoryError::InvalidInput(
@@ -158,7 +161,11 @@ impl CognitiveMemory {
             }
         }
 
-        let node_id = new_id("sem");
+        // `forced_id` makes the fenced applier's effect replay-safe (F2): a
+        // deterministic `sem_{intent_id}` collapses a crash-window replay onto
+        // the SAME node via the store's same-PK upsert instead of minting a
+        // duplicate. Normal callers pass `None` and get a fresh id.
+        let node_id = forced_id.map(String::from).unwrap_or_else(|| new_id("sem"));
         let now = ts_now();
         let tags_json = tags
             .map(|t| {
@@ -315,18 +322,60 @@ impl CognitiveMemory {
     }
 
     /// Link two semantic facts with a SIMILAR_TO edge.
+    ///
+    /// Idempotent: a repeat call (including a fenced-applier replay of a
+    /// `LinkSimilarFacts` intent across the F2 crash window) does not add a
+    /// duplicate edge when one already links the pair in this direction.
     pub fn link_similar_facts(
         &mut self,
         fact_id_a: &str,
         fact_id_b: &str,
         similarity_score: f64,
     ) -> Result<()> {
+        if self.edge_of_type_exists(fact_id_a, fact_id_b, ET_SIMILAR_TO) {
+            return Ok(());
+        }
         let mut props = HashMap::new();
         props.insert("similarity_score".to_string(), similarity_score.to_string());
         self.graph
             .add_edge(fact_id_a, fact_id_b, ET_SIMILAR_TO, Some(props))
             .map_err(|e| MemoryError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    /// Fenced-applier entry point for a `StoreFact` intent: store the fact under
+    /// a DETERMINISTIC node id (`sem_{intent_id}`) so a crash-window replay
+    /// upserts the same node instead of minting a duplicate (F2 exactly-once).
+    ///
+    /// # Errors
+    /// As [`store_fact`](Self::store_fact).
+    #[cfg(feature = "persistent")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_store_fact(
+        &mut self,
+        intent_id: uuid::Uuid,
+        concept: &str,
+        content: &str,
+        confidence: f64,
+        source_id: &str,
+        tags: Option<&[String]>,
+        metadata: Option<&HashMap<String, serde_json::Value>>,
+    ) -> Result<String> {
+        let forced = format!("sem_{intent_id}");
+        self.store_fact_with_provenance_inner(
+            concept,
+            content,
+            confidence,
+            source_id,
+            tags,
+            metadata,
+            &[],
+            false,
+            None,
+            None,
+            None,
+            Some(&forced),
+        )
     }
 
     /// Link a semantic fact to its source episode.

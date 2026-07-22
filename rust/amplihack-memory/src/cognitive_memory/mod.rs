@@ -394,18 +394,40 @@ impl CognitiveMemory {
 
     /// Create a provenance edge `source_id --edge_type--> episode_id` carrying a
     /// `derived_at` timestamp. Both endpoints must already exist.
+    ///
+    /// Idempotent: if a live `edge_type` edge already links these two nodes it is
+    /// a no-op. This makes replaying a link intent through the fenced applier
+    /// exactly-once — a re-applied `LinkFactToEpisodes` / provenance write does
+    /// not accumulate duplicate edges across the F2 effect↔marker crash window.
     fn add_provenance_edge(
         &mut self,
         source_id: &str,
         episode_id: &str,
         edge_type: &str,
     ) -> Result<()> {
+        if self.edge_of_type_exists(source_id, episode_id, edge_type) {
+            return Ok(());
+        }
         let mut props = HashMap::new();
         props.insert("derived_at".to_string(), ts_now().to_string());
         self.graph
             .add_edge(source_id, episode_id, edge_type, Some(props))
             .map_err(|e| MemoryError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    /// `true` if a live `edge_type` edge already runs from `source_id` to
+    /// `target_id`. Used to make link writes idempotent (exactly-once replay).
+    pub(super) fn edge_of_type_exists(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        edge_type: &str,
+    ) -> bool {
+        self.graph
+            .query_neighbors(source_id, Some(edge_type), Direction::Outgoing, usize::MAX)
+            .iter()
+            .any(|(_, node)| node.node_id == target_id)
     }
 
     /// Return the ids of every node reachable from `node_id` along an outgoing

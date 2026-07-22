@@ -1255,9 +1255,17 @@ impl LbugGraphStore {
         self.known_node_tables
             .borrow_mut()
             .insert(table.to_string());
+        // The table is created WITH the soft-delete tombstone column (above), so
+        // record it in the column cache alongside the user columns. Without this
+        // a table created in-session reads back as "no `_deleted` column", which
+        // disables tombstone filtering for its labeled reads until the handle is
+        // reopened — so soft-deleted rows would leak back into query results
+        // (e.g. a pruned applied-intent marker still counted).
+        let mut cached_cols = extra_cols.clone();
+        cached_cols.insert(DELETED_COL.to_string());
         self.node_table_columns
             .borrow_mut()
-            .insert(table.to_string(), extra_cols.clone());
+            .insert(table.to_string(), cached_cols);
         Ok(())
     }
 
