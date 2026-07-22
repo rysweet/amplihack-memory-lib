@@ -34,6 +34,7 @@ TLA+ model.
    - [Idempotent links](#idempotent-links)
    - [Episode `temporal_index` is create-only](#episode-temporal_index-is-create-only)
    - [`RecordAccess` is stamp-guarded](#recordaccess-is-stamp-guarded)
+   - [`UpsertFact` dedup-reuse is stamp-guarded](#upsertfact-dedup-reuse-is-stamp-guarded)
 3. [N2 — bounded applied-intent ledger](#n2--bounded-applied-intent-ledger)
 4. [N1 — verified clean-tail log recovery](#n1--verified-clean-tail-log-recovery)
 5. [On-disk layout additions](#on-disk-layout-additions)
@@ -79,6 +80,21 @@ rather than trying to wrap effect + marker in one transaction or disabling
 checkpoints. A replay-safe effect makes the `effect ↔ marker` window **harmless**
 *and* makes N2 pruning inherently safe — a pruned-but-durable intent that happens
 to replay simply upserts the same nodes/edges again.
+
+> **Why not just disable the store's auto-checkpoint?** The applier *does* call
+> `memory.set_checkpoint_interval(0)` at both open sites (`Applier::open`,
+> `Coordinator::open`), but **strictly as defense-in-depth, not as the mechanism**.
+> A store write becomes durable at its **own `fsync`**, not at a checkpoint —
+> un-checkpointed WAL writes are *replayed on reopen* (the store's
+> `open_with_recovery_survives_corrupt_wal*` tests depend on exactly that). So the
+> `effect ↔ marker` boundary is **per-write, not per-checkpoint**; changing the
+> checkpoint cadence only moves when the WAL folds into the main DB file and
+> **cannot** close the exactly-once window on its own. This was confirmed
+> empirically: with `set_checkpoint_interval(0)` and no stamp guard, the reuse-path
+> crash test still double-increments (`usage_count == base + 2`). The per-effect
+> replay-safety below is the load-bearing fix; the checkpoint-disable only narrows
+> the physical un-marked-effect window. **Do not** remove the stamp guards on the
+> assumption the checkpoint-disable covers them.
 
 ---
 
@@ -135,7 +151,7 @@ beyond the existing escaped-parameter path.
 | `StoreEpisode` | Upsert node `epi_{intent_id}`; **`temporal_index` bumped create-only** (see below). |
 | `StoreProcedure` | Upsert-by-(agent,name) (unchanged); already idempotent, so a replay overwrites the same canonical node with identical steps. |
 | `StoreProspective` | Upsert node `pro_{intent_id}`; status/priority overwritten identically. |
-| `UpsertFact` | **Both arms** are made deterministic: the create arm writes `sem_{intent_id}`; the supersede arm mutates the existing target *and* writes its new superseding revision node with a deterministic id derived from `intent_id` — so replay neither duplicates the revision node nor re-supersedes. |
+| `UpsertFact` | **All three arms** are replay-safe. *Create* arm: writes `sem_{intent_id}` (deterministic upsert). *Supersede* arm: mutates the existing target *and* writes its new superseding revision node with a deterministic id derived from `intent_id` — so replay neither duplicates the revision node nor re-supersedes. *Dedup-reuse* arm (an upsert that dedup-hits an existing fact and bumps `usage_count`): [stamp-guarded RMW](#upsertfact-dedup-reuse-is-stamp-guarded) via `last_reuse_intent` — the bump is **not** re-applied if this intent already reused the node. |
 | `LinkFactToEpisodes` | Edges written via [idempotent link](#idempotent-links) — a `DERIVES_FROM` edge that already exists is a no-op, so no duplicate edges accrue on replay. |
 | `LinkSimilarFacts` | Same idempotent-link path for the `SIMILAR_TO` edge. |
 | `RecordAccess` | [Stamp-guarded RMW](#recordaccess-is-stamp-guarded): `usage_count` is **not** re-incremented if the intent was already applied. |
@@ -188,6 +204,38 @@ sets `last_access_intent = {intent_id}`. On replay, if the node's stored
 `last_access_intent` already equals the intent's id, the `usage_count` bump is
 skipped (the timestamp refresh is naturally idempotent). One logical access =
 exactly one increment, regardless of replays.
+
+### `UpsertFact` dedup-reuse is stamp-guarded
+
+`RecordAccess` is not the only path that mutates `usage_count`. When an
+`UpsertFact` intent **dedup-hits** an existing fact (any dedup mode —
+`ExactContentHash` / `SameConceptSimilarity` / `CallerKey`), the store reuses the
+target instead of creating a node and bumps its `usage_count` in a non-idempotent
+read-modify-write (`dedup::reuse_fact`). Left unguarded, a crash in the
+`effect ↔ marker` window replays the bump on restart and double-increments
+`usage_count` (e.g. 5→6 then 6→7) — the exact residual that the deterministic-id
+create arm did **not** cover, because the reuse arm never mints a node.
+
+The fix mirrors `RecordAccess`: on the applier replay path the reused node is
+stamped with `last_reuse_intent = sem_{intent_id}` in the same `update_node` that
+bumps the counter. On replay, if the node's stored `last_reuse_intent` already
+equals this intent's id, the bump is a no-op:
+
+```rust
+// cognitive_memory/dedup.rs :: reuse_fact (illustrative)
+let stored = self.graph.get_node(&existing.node_id)
+    .and_then(|n| n.properties.get("last_reuse_intent").cloned());
+if reuse_stamp.is_some() && stored.as_deref() == reuse_stamp {
+    return Ok(/* Reused: no bump */);
+}
+// else: usage_count += 1 AND set last_reuse_intent = reuse_stamp
+```
+
+The stamp is threaded from the applier's `apply_upsert_fact` via the intent id
+(`reuse_stamp = Some("sem_{intent_id}")`). The **direct**, non-applier
+`upsert_fact` path passes `None` and bumps on **every** call, preserving its
+user-visible "each dedup hit refreshes usage" semantics — determinism is opt-in on
+the fenced-applier path only, exactly as for the deterministic-id create arms.
 
 ---
 
@@ -453,7 +501,11 @@ what each tutorial pins down.
 assert_eq!(memory.count_nodes(NT_SEMANTIC)?, expected);      // no duplicate node
 assert_eq!(memory.temporal_index(), expected_tidx);          // no double bump
 assert_eq!(edges_between(fact, episode).len(), 1);           // no duplicate edge
-// This test FAILS without the F2 fix (duplicate node + double temporal_index).
+assert_eq!(reused_fact.usage_count, base + 1);               // reuse bumped once, not twice
+// This test FAILS without the F2 fix (duplicate node, double temporal_index,
+// or — for the dedup-reuse arm — usage_count == base + 2). The reuse-path
+// variant lives in the same file and fails if the `last_reuse_intent` stamp
+// guard is removed.
 ```
 
 ### Tutorial 2 — assert the ledger is bounded (N2)
