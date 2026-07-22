@@ -245,7 +245,12 @@ impl CognitiveMemory {
     /// [`checkpoint`](Self::checkpoint) points. Used by the fenced applier so the
     /// only durability fold-points are its explicit end-of-drain checkpoints. A
     /// no-op on volatile backends.
-    #[cfg(feature = "coord")]
+    ///
+    /// Gated on `persistent` as well as `coord`: the only caller is the fenced
+    /// applier (`coord::applier`, itself `#[cfg(feature = "persistent")]`), which
+    /// opens the store via `open_persistent`. Without this narrower gate the
+    /// method is dead code under `--features coord` alone.
+    #[cfg(all(feature = "coord", feature = "persistent"))]
     pub(crate) fn set_checkpoint_interval(&self, writes: u64) {
         self.graph.set_checkpoint_interval(writes);
     }
