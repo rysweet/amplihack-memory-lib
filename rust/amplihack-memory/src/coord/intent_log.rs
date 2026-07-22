@@ -18,7 +18,8 @@ use std::io::Write;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -218,15 +219,22 @@ pub(crate) struct RawRecord {
 struct Segment {
     index: u64,
     // Read only by the persistent-only reader (`read_frame_at`); the writer path
-    // uses `index`/`len` alone.
+    // selects the target segment by `index` and recovers/derives the append
+    // offset via `recover_tail_len`, so it no longer consults `len`/`path`.
     #[cfg_attr(not(feature = "persistent"), allow(dead_code))]
     path: PathBuf,
+    #[cfg_attr(not(feature = "persistent"), allow(dead_code))]
     len: u64,
 }
 
 /// A handle onto the segmented, append-only intent log under a coord dir.
 pub(crate) struct SegmentedLog {
     config: CoordConfig,
+    /// Fast-path cache of the last segment this handle left ending on a clean,
+    /// complete frame boundary: `(segment_index, clean_len)`. Lets the common
+    /// single-writer steady state skip a full torn-tail scan when the on-disk
+    /// length still matches what we last committed (nobody else appended).
+    verified_tail: Mutex<Option<(u64, u64)>>,
 }
 
 impl SegmentedLog {
@@ -240,6 +248,7 @@ impl SegmentedLog {
         }
         Ok(Self {
             config: config.clone(),
+            verified_tail: Mutex::new(None),
         })
     }
 
@@ -283,20 +292,35 @@ impl SegmentedLog {
         // assignment so records never interleave.
         let (_lock_file, _guard) = self.acquire_append_lock()?;
 
-        // Choose the target segment: roll over once the current one reaches the
-        // size target (rollover only at record boundaries, so segments contain
-        // whole frames).
+        // F1: recover a never-acked torn tail BEFORE choosing the target segment
+        // or computing the append offset. A writer SIGKILL'd mid-`write_all`
+        // leaves a partial final frame; if the next append lands after it the
+        // torn bytes become committed-interior garbage (poisoning the reader) or
+        // get lazily truncated at read time together with a following acked
+        // frame. Truncating the incomplete tail here — under the same append
+        // flock — means we only ever append after a complete frame boundary and
+        // never discard a complete, fsynced frame.
         let segs = self.segments()?;
-        let target_index = match segs.last() {
-            None => 0,
-            Some(last) if last.len >= self.config.segment_bytes => last.index + 1,
-            Some(last) => last.index,
+        let (last_index, last_clean_len) = match segs.last() {
+            None => (0u64, 0u64),
+            Some(last) => {
+                let clean = self.recover_tail_len(last.index, &self.segment_path(last.index))?;
+                (last.index, clean)
+            }
+        };
+
+        // Choose the target segment from the RECOVERED length: roll over once the
+        // current one reaches the size target (rollover only at record
+        // boundaries, so segments contain whole frames).
+        let (target_index, existing_len) = if segs.is_empty() {
+            (0, 0)
+        } else if last_clean_len >= self.config.segment_bytes {
+            (last_index + 1, 0)
+        } else {
+            (last_index, last_clean_len)
         };
         let seg_path = self.segment_path(target_index);
-        let existing_len = segs
-            .iter()
-            .find(|s| s.index == target_index)
-            .map_or(0, |s| s.len);
+        let seg_is_new = !seg_path.exists();
 
         let mut frame = Vec::with_capacity(frame_len as usize);
         frame.extend_from_slice(&payload_len.to_be_bytes());
@@ -311,14 +335,97 @@ impl SegmentedLog {
             .map_err(|e| io_err("open-segment", e))?;
         file.write_all(&frame)
             .map_err(|e| io_err("append-frame", e))?;
-        if self.config.fsync_on_append {
-            file.sync_all().map_err(|e| io_err("fsync-segment", e))?;
+        // F3: the `fsync` IS the durability ack (`append` returns the offset only
+        // once the write is durable), so it is UNCONDITIONAL — never gated on the
+        // `fsync_on_append` knob. A non-fsync'd append must not be treated as an
+        // ack (that would violate `NoLostAckedWrite`).
+        file.sync_all().map_err(|e| io_err("fsync-segment", e))?;
+        // F3: `fsync` persists the file's data+inode but NOT the parent directory
+        // entry that links the new segment's name to its inode. On a newly
+        // created segment, fsync the intent-log directory too so a power loss
+        // after the ack cannot vanish the whole segment file.
+        if seg_is_new {
+            let dir = std::fs::File::open(self.config.intent_log_dir())
+                .map_err(|e| io_err("open-log-dir-fsync", e))?;
+            dir.sync_all().map_err(|e| io_err("fsync-log-dir", e))?;
         }
+
+        // Steady-state fast path: record the clean length we just left behind so
+        // the next append on this handle can skip a full torn-tail scan while the
+        // on-disk length still matches (single-writer common case).
+        *self.verified_tail.lock().expect("verified-tail mutex") =
+            Some((target_index, existing_len + frame_len));
 
         Ok(LogOffset {
             segment: target_index,
             offset: existing_len,
         })
+    }
+
+    /// Return the length of `seg_path` after truncating away any trailing torn
+    /// (never-acked, incomplete) frame, so the log ends on a complete frame
+    /// boundary. Only ever discards an INCOMPLETE trailing partial — every
+    /// complete frame (whether or not its CRC validates) is preserved, so a
+    /// committed-interior corruption is left for the reader to surface rather
+    /// than silently truncated. Must be called under the append flock.
+    fn recover_tail_len(&self, index: u64, seg_path: &Path) -> Result<u64> {
+        let meta_len = match std::fs::metadata(seg_path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(io_err("stat-recover-tail", e)),
+        };
+        if let Some((ci, cl)) = *self.verified_tail.lock().expect("verified-tail mutex") {
+            // We left this segment clean at `cl` and nothing has changed its
+            // length since — no torn tail is possible, skip the scan.
+            if ci == index && cl == meta_len {
+                return Ok(meta_len);
+            }
+        }
+        let clean = self.scan_clean_len(seg_path, meta_len)?;
+        if clean < meta_len {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(seg_path)
+                .map_err(|e| io_err("open-truncate-torn-tail", e))?;
+            file.set_len(clean)
+                .map_err(|e| io_err("truncate-torn-tail", e))?;
+            file.sync_all()
+                .map_err(|e| io_err("fsync-truncate-torn-tail", e))?;
+        }
+        *self.verified_tail.lock().expect("verified-tail mutex") = Some((index, clean));
+        Ok(clean)
+    }
+
+    /// Scan `seg_path` from the origin over complete frames and return the byte
+    /// offset at which the last complete frame ends (i.e. the length with any
+    /// trailing incomplete partial removed). A frame is "complete" when its
+    /// length prefix is plausible (`<= max_frame_bytes`) and all
+    /// `len | payload | crc` bytes are present; such a frame is always kept
+    /// (CRC is validated by the reader, not here), so this never discards a
+    /// complete fsynced record.
+    fn scan_clean_len(&self, seg_path: &Path, meta_len: u64) -> Result<u64> {
+        let bytes = std::fs::read(seg_path).map_err(|e| io_err("read-recover-tail", e))?;
+        let n = std::cmp::min(meta_len, bytes.len() as u64);
+        let max = u64::from(self.config.max_frame_bytes);
+        let mut o: u64 = 0;
+        loop {
+            let remaining = n - o;
+            if remaining < FRAME_OVERHEAD {
+                break; // incomplete trailing bytes (torn short tail)
+            }
+            let lo = o as usize;
+            let payload_len =
+                u32::from_be_bytes([bytes[lo], bytes[lo + 1], bytes[lo + 2], bytes[lo + 3]]);
+            if u64::from(payload_len) > max {
+                break; // implausible length prefix (garbage / torn tail)
+            }
+            let need = FRAME_OVERHEAD + u64::from(payload_len);
+            if remaining < need {
+                break; // frame body not fully present (torn tail)
+            }
+            o += need; // complete frame — keep it
+        }
+        Ok(o)
     }
 
     /// Sorted list of segment files under the intent-log dir.

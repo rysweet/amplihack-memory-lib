@@ -49,6 +49,11 @@ impl Applier {
         let memory = CognitiveMemory::open_persistent(store_path, agent_name)?;
         let log = SegmentedLog::open(config)?;
         let applied_index = load_applied_index(config)?;
+        // F2: seed the in-memory fast-path set from the durable applied-intent
+        // ledger, so a restart (which starts with an empty in-memory set and may
+        // resume from a cursor that a crash left behind the store effects) still
+        // recognises already-applied records and does not double-apply them.
+        let seen = memory.applied_intent_ids();
         Ok(Self {
             config: config.clone(),
             memory,
@@ -56,7 +61,7 @@ impl Applier {
             epoch,
             log,
             applied_index,
-            seen: HashSet::new(),
+            seen,
         })
     }
 
@@ -83,8 +88,13 @@ impl Applier {
             }
             let intent: WriteIntent = serde_json::from_slice(&rec.payload)
                 .map_err(|_| MemoryError::UnsupportedIntentVersion)?;
-            if self.seen.insert(intent.intent_id()) {
+            let intent_id = intent.intent_id();
+            if self.seen.insert(intent_id) {
+                // F2: apply the effect and record the intent in the durable
+                // ledger; the checkpoint below co-commits both so a crash before
+                // the cursor advances cannot re-apply this record on restart.
                 apply_intent(&mut self.memory, &intent)?;
+                self.memory.record_intent_applied(intent_id)?;
                 applied += 1;
             }
             pos = rec.next;
@@ -267,6 +277,9 @@ impl Coordinator {
         let memory = CognitiveMemory::open_persistent(store_path, agent_name)?;
         let log = SegmentedLog::open(&config)?;
         let applied_index = load_applied_index(&config)?;
+        // F2: seed dedup state from the durable applied-intent ledger (see
+        // `Applier::open`).
+        let seen = memory.applied_intent_ids();
         Ok(Self {
             config,
             memory: Arc::new(Mutex::new(memory)),
@@ -274,7 +287,7 @@ impl Coordinator {
             epoch,
             log,
             applied_index: Mutex::new(applied_index),
-            seen: Mutex::new(HashSet::new()),
+            seen: Mutex::new(seen),
         })
     }
 
@@ -304,14 +317,13 @@ impl Coordinator {
             }
             let intent: WriteIntent = serde_json::from_slice(&rec.payload)
                 .map_err(|_| MemoryError::UnsupportedIntentVersion)?;
-            let first_time = self
-                .seen
-                .lock()
-                .expect("seen mutex")
-                .insert(intent.intent_id());
+            let intent_id = intent.intent_id();
+            let first_time = self.seen.lock().expect("seen mutex").insert(intent_id);
             if first_time {
+                // F2: co-commit the effect and its ledger marker (see `drain`).
                 let mut mem = self.memory.lock().expect("store mutex");
                 apply_intent(&mut mem, &intent)?;
+                mem.record_intent_applied(intent_id)?;
             }
             pos = rec.next;
         }

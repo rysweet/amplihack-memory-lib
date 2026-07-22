@@ -23,6 +23,8 @@ mod sensory;
 mod similarity;
 mod types;
 mod working;
+#[cfg(feature = "persistent")]
+mod writer_lock;
 
 pub use dedup::{
     compute_content_hash, DedupAction, DedupMode, DedupOptions, DuplicateFactGroup, FactInput,
@@ -51,6 +53,12 @@ use types::{
 // CognitiveMemory
 // ---------------------------------------------------------------------------
 
+/// Node type of the store-resident exactly-once ledger (F2): one node per
+/// durably-applied `intent_id`, co-committed with the intent's effect under the
+/// applier's checkpoint barrier so that replay after a crash is idempotent.
+#[cfg(feature = "persistent")]
+const NT_APPLIED_INTENT: &str = "coord_applied_intent";
+
 /// Six-type cognitive memory over a pluggable [`GraphStore`] backend.
 ///
 /// The struct owns a `Box<dyn GraphStore + Send>` and provides methods corresponding
@@ -63,6 +71,11 @@ pub struct CognitiveMemory {
     graph: Box<dyn GraphStore + Send>,
     sensory_order: i64,
     temporal_index: i64,
+    /// F4: the single-writer ownership lock on the persistent store, held for
+    /// this handle's lifetime and released on `Drop`. `None` for the in-memory
+    /// backend (nothing to lock).
+    #[cfg(feature = "persistent")]
+    writer_lock: Option<writer_lock::WriterLock>,
 }
 
 impl CognitiveMemory {
@@ -104,6 +117,8 @@ impl CognitiveMemory {
             graph: store,
             sensory_order: 0,
             temporal_index: 0,
+            #[cfg(feature = "persistent")]
+            writer_lock: None,
         };
         cm.recover_counters();
         Ok(cm)
@@ -162,6 +177,10 @@ impl CognitiveMemory {
     ) -> Result<Self> {
         let trimmed = Self::validate_agent_name(agent_name)?;
         let store_id = format!("cognitive-{trimmed}");
+        // F4: take the exclusive, non-blocking single-writer ownership lock
+        // BEFORE opening the store, so a second concurrent writer fails closed
+        // without ever touching the store. Held for the handle's lifetime.
+        let writer_lock = writer_lock::WriterLock::acquire(path.as_ref())?;
         let (store, recovery) = crate::graph::lbug_store::LbugGraphStore::open_with_recovery(
             path.as_ref(),
             Some(&store_id),
@@ -202,7 +221,10 @@ impl CognitiveMemory {
                 "CognitiveMemory::open_persistent recovered from a corrupt WAL"
             );
         }
-        Self::with_store(agent_name, Box::new(store))
+        Self::with_store(agent_name, Box::new(store)).map(|mut cm| {
+            cm.writer_lock = Some(writer_lock);
+            cm
+        })
     }
 
     /// Flush durable state: force the backend to checkpoint its write-ahead log
@@ -220,6 +242,42 @@ impl CognitiveMemory {
     /// the flush fails.
     pub fn checkpoint(&self) -> Result<()> {
         self.graph.checkpoint()
+    }
+
+    /// All `intent_id`s durably recorded in the store-resident applied-intent
+    /// ledger for this agent (F2). Used to seed the applier's in-memory
+    /// fast-path set at open so a restart — whose in-memory dedup state is empty
+    /// — still recognises replayed records as already-applied and does not
+    /// double-apply them.
+    #[cfg(feature = "persistent")]
+    pub(crate) fn applied_intent_ids(&self) -> std::collections::HashSet<uuid::Uuid> {
+        let filter = agent_filter(&self.agent_name);
+        self.graph
+            .query_nodes(NT_APPLIED_INTENT, Some(&filter), usize::MAX)
+            .iter()
+            .filter_map(|n| n.properties.get("intent_id").and_then(|v| v.parse().ok()))
+            .collect()
+    }
+
+    /// Record `intent_id` in the store-resident applied-intent ledger (F2).
+    ///
+    /// The marker is written through the SAME single-writer graph as the
+    /// intent's effect, so the applier's subsequent `checkpoint()` co-commits
+    /// BOTH under one durability barrier. A crash in the old checkpoint↔cursor
+    /// window can therefore never re-apply the effect: on restart the ledger
+    /// (already durable) makes the replay a no-op. Idempotent on the marker
+    /// itself (`node_id` keyed on `intent_id`).
+    #[cfg(feature = "persistent")]
+    pub(crate) fn record_intent_applied(&mut self, intent_id: uuid::Uuid) -> Result<()> {
+        let id = intent_id.to_string();
+        let node_id = format!("coord_applied_{id}");
+        let mut props = HashMap::new();
+        props.insert("node_id".to_string(), node_id.clone());
+        props.insert("agent_id".to_string(), self.agent_name.clone());
+        props.insert("intent_id".to_string(), id);
+        self.graph
+            .add_node(NT_APPLIED_INTENT, props, Some(&node_id))?;
+        Ok(())
     }
 
     fn validate_agent_name(agent_name: &str) -> Result<String> {

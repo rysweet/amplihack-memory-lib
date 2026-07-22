@@ -79,8 +79,10 @@ pub struct CoordConfig {
     pub socket_name: String,
     /// Hard cap on a single log record / IPC frame (hostile-input defence).
     pub max_frame_bytes: u32,
-    /// Whether `append` `fsync`s before returning. **Leave `true`** — this is
-    /// the durability ack.
+    /// Retained for wire/config compatibility. **Non-authoritative:** the append
+    /// ack always `fsync`s the record + directory regardless of this flag (F3) —
+    /// the `fsync` *is* the durability ack, so it can never be disabled. A
+    /// non-`fsync`'d append is never treated as an ack.
     pub fsync_on_append: bool,
 }
 
@@ -116,6 +118,13 @@ impl CoordConfig {
     /// Path of the on-disk lease file.
     pub(crate) fn lease_path(&self) -> PathBuf {
         self.base_dir.join("lease")
+    }
+
+    /// Path of the dedicated lease RMW lock file. Kept separate from the lease
+    /// record itself so the `flock` serialization survives the atomic-`rename`
+    /// lease update (F5), which replaces the lease inode.
+    pub(crate) fn lease_lock_path(&self) -> PathBuf {
+        self.base_dir.join("lease.lock")
     }
 
     /// Directory holding the segmented, append-only intent log.

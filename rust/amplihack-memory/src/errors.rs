@@ -84,6 +84,20 @@ pub enum MemoryError {
     #[error("unsupported intent kind or version in durable log")]
     UnsupportedIntentVersion,
 
+    /// Another process (or another live handle in this process) already holds
+    /// the single-writer ownership lock on the persistent store. Opening the
+    /// store for writing takes an exclusive, non-blocking `flock` and **fails
+    /// closed** with this error rather than opening a second concurrent writer
+    /// over the same `lbug` store (which would be split-brain at the store
+    /// layer). This is the store-ownership half of `NoSplitBrain`
+    /// (`specs/FencedApplier.tla`); the lock releases when the holding handle is
+    /// dropped. `path` is the store path whose lock is held (structural only).
+    #[error("store already locked by another single-writer owner: {path}")]
+    AlreadyLocked {
+        /// The persistent store path whose writer lock is already held.
+        path: String,
+    },
+
     /// Generic internal error.
     #[error("{0}")]
     Internal(String),

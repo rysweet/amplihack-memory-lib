@@ -80,6 +80,7 @@ cog.store_prospective(
 | [Cognitive Memory](cognitive_memory.md) | Six-type cognitive memory system (sensory, working, episodic, semantic, procedural, prospective) |
 | [Fact Lifecycle](fact_lifecycle.md) | Semantic-fact deduplication, SUPERSEDES supersession, and retention/pruning |
 | [Kuzu Backend](kuzu_backend.md) | How the Kuzu graph database works, schema, query patterns |
+| [Coordination Layer](coordination_layer.md) | Design C durability contract (F1–F5): torn-tail recovery (shipped), exactly-once apply & durable append (partial), single-writer ownership & atomic lease write (planned) — see the in-page status banner |
 | [API Reference](api_reference.md) | Complete API reference for all public classes |
 | [Extending](extending.md) | Custom backends, new edge types, custom classifiers, integration patterns |
 
