@@ -381,7 +381,7 @@ impl CognitiveMemory {
         match (&options.dedup.mode, hit) {
             (DedupMode::CallerKey(k), Some(existing)) => {
                 if existing.content_hash == content_hash {
-                    self.reuse_fact(existing, &input, content_hash)
+                    self.reuse_fact(existing, &input, content_hash, forced_id)
                 } else {
                     let key = k.clone();
                     self.supersede_with_new(existing, input, options, content_hash, key, forced_id)
@@ -394,7 +394,7 @@ impl CognitiveMemory {
             }
             (DedupMode::ExactContentHash, Some(existing))
             | (DedupMode::SameConceptSimilarity, Some(existing)) => {
-                self.reuse_fact(existing, &input, content_hash)
+                self.reuse_fact(existing, &input, content_hash, forced_id)
             }
             _ => self.insert_fact(input, options, content_hash, forced_id),
         }
@@ -627,7 +627,37 @@ impl CognitiveMemory {
         existing: SemanticFact,
         input: &FactInput,
         content_hash: String,
+        reuse_stamp: Option<&str>,
     ) -> Result<StoreFactOutcome> {
+        // F2 exactly-once (reuse path): `reuse_fact` is a NON-idempotent
+        // read-modify-write (`usage_count += 1`). On the fenced-applier replay
+        // path (`reuse_stamp = Some("sem_{intent_id}")`) a crash landing in the
+        // effect->marker window would otherwise re-apply the bump and double it.
+        // Guard it with a durable per-intent stamp on the node (mirrors
+        // `apply_record_access`'s `last_access_intent`): if this exact intent
+        // already bumped this node, the replay is a no-op. The direct (non-
+        // applier) `upsert_fact` path passes `None` and bumps every call,
+        // preserving its user-visible "each dedup hit refreshes usage" semantics.
+        if let Some(stamp) = reuse_stamp {
+            if self
+                .graph
+                .get_node(&existing.node_id)
+                .and_then(|n| n.properties.get("last_reuse_intent").cloned())
+                .as_deref()
+                == Some(stamp)
+            {
+                return Ok(StoreFactOutcome {
+                    node_id: existing.node_id.clone(),
+                    dedup_action: DedupAction::Reused {
+                        existing_id: existing.node_id,
+                    },
+                    content_hash,
+                    similarity_links_created: 0,
+                    provenance_edges_created: 0,
+                });
+            }
+        }
+
         let mut props = HashMap::new();
         props.insert(
             "usage_count".to_string(),
@@ -635,6 +665,9 @@ impl CognitiveMemory {
         );
         props.insert("last_accessed_at".to_string(), ts_now().to_string());
         props.insert("confidence".to_string(), input.confidence.to_string());
+        if let Some(stamp) = reuse_stamp {
+            props.insert("last_reuse_intent".to_string(), stamp.to_string());
+        }
         if !self.graph.update_node(&existing.node_id, props) {
             return Err(MemoryError::Storage(format!(
                 "failed to update reused fact {}",

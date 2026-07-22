@@ -1106,6 +1106,10 @@ impl GraphStore for LbugGraphStore {
         self.do_checkpoint()
     }
 
+    fn set_checkpoint_interval(&self, writes: u64) {
+        self.checkpoint_interval.set(writes);
+    }
+
     fn close(&mut self) {
         let _guard = self.acquire_lock();
         // Best-effort: flush the WAL into the main DB file so a subsequent open

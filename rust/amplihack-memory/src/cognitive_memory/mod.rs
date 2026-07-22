@@ -239,6 +239,17 @@ impl CognitiveMemory {
         self.graph.checkpoint()
     }
 
+    /// Set the backing store's auto-checkpoint interval (mutating writes between
+    /// automatic WAL→main-database folds); `0` disables auto-checkpointing so the
+    /// store folds its WAL into the main file only at explicit
+    /// [`checkpoint`](Self::checkpoint) points. Used by the fenced applier so the
+    /// only durability fold-points are its explicit end-of-drain checkpoints. A
+    /// no-op on volatile backends.
+    #[cfg(feature = "coord")]
+    pub(crate) fn set_checkpoint_interval(&self, writes: u64) {
+        self.graph.set_checkpoint_interval(writes);
+    }
+
     fn validate_agent_name(agent_name: &str) -> Result<String> {
         let trimmed = agent_name.trim();
         if trimmed.is_empty() {

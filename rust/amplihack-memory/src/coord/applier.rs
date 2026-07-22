@@ -47,6 +47,14 @@ impl Applier {
         let lease = Lease::acquire(config, agent_name)?;
         let epoch = lease.epoch();
         let memory = CognitiveMemory::open_persistent(store_path, agent_name)?;
+        // F2 (defense-in-depth): disable the store's mid-drain auto-checkpoint so
+        // the only WAL→main-DB fold points are this applier's explicit
+        // end-of-drain `checkpoint()` and `close`. This narrows the physical
+        // effect↔marker durability window. NOTE: it does NOT by itself close the
+        // exactly-once residual — un-checkpointed WAL writes are still replayed on
+        // reopen (see `dedup::reuse_fact`'s per-intent stamp guard, which is the
+        // load-bearing fix). Keep the applier's per-effect replay-safety.
+        memory.set_checkpoint_interval(0);
         let log = SegmentedLog::open(config)?;
         let applied_index = load_applied_index(config)?;
         Ok(Self {
@@ -324,6 +332,10 @@ impl Coordinator {
         let lease = Lease::acquire(&config, agent_name)?;
         let epoch = lease.epoch();
         let memory = CognitiveMemory::open_persistent(store_path, agent_name)?;
+        // F2 (defense-in-depth): see `Applier::open`. Disable mid-drain
+        // auto-checkpoint so the only fold-points are the explicit end-of-drain
+        // checkpoints; exactly-once still rests on per-effect replay-safety.
+        memory.set_checkpoint_interval(0);
         let log = SegmentedLog::open(&config)?;
         let applied_index = load_applied_index(&config)?;
         Ok(Self {

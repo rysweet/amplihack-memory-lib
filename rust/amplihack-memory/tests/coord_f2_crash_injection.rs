@@ -55,11 +55,21 @@
 #![cfg(all(feature = "coord", feature = "persistent"))]
 
 use amplihack_memory::coord::{Applier, CoordConfig, Lease, WriteIntent, WriterClient};
-use amplihack_memory::{CognitiveMemory, RecallOptions};
+use amplihack_memory::{CognitiveMemory, DedupMode, FactInput, RecallOptions, StoreFactOptions};
 use uuid::Uuid;
 
 /// Env seam name the applier must honor in BOTH drain paths (see file header).
 const CRASH_AFTER_EFFECTS: &str = "AMPLIHACK_COORD_CRASH_AFTER_EFFECTS";
+
+/// The crash seam is driven by a PROCESS-GLOBAL env var, so these tests must not
+/// run concurrently (one test's armed seam would fire in another's clean drain).
+/// Serialize them regardless of the harness thread count. Poison-tolerant: a
+/// panicking test still releases a usable guard to the next.
+static SEAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn seam_guard() -> std::sync::MutexGuard<'static, ()> {
+    SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn provision(cfg: &CoordConfig) {
     let lease = Lease::acquire(cfg, "provision").expect("provision coord dir");
@@ -88,6 +98,49 @@ fn episode(content: &str) -> WriteIntent {
         temporal_index: None,
         metadata: None,
     }
+}
+
+/// An `UpsertFact` intent with exact-content-hash dedup, so a second one with the
+/// same `concept`+`content` HITS the first and drives `reuse_fact` (the
+/// non-idempotent `usage_count += 1` read-modify-write).
+fn upsert_exact(concept: &str, content: &str) -> WriteIntent {
+    let input = FactInput::new(concept, content, 0.9);
+    let options = StoreFactOptions {
+        dedup: amplihack_memory::DedupOptions {
+            mode: DedupMode::ExactContentHash,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    WriteIntent::UpsertFact {
+        intent_id: Uuid::new_v4(),
+        agent_name: "daemon".into(),
+        input,
+        options,
+    }
+}
+
+/// `usage_count` of the (single) live fact whose content matches `needle`.
+fn usage_count(store: &std::path::Path, needle: &str) -> i64 {
+    let mut mem = CognitiveMemory::open_persistent(store, "daemon").expect("reopen store");
+    let hits = mem
+        .recall_facts_ranked(
+            "reuse fact usage count",
+            RecallOptions {
+                limit: 1000,
+                record_access: false,
+                ..Default::default()
+            },
+        )
+        .expect("recall");
+    let matching: Vec<_> = hits.iter().filter(|h| h.item.content == needle).collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one live fact with content {needle:?}, found {}",
+        matching.len()
+    );
+    matching[0].item.usage_count
 }
 
 fn fact_count(store: &std::path::Path, needle: &str) -> usize {
@@ -136,6 +189,7 @@ fn drain_crashing_after_first_effect(store: &std::path::Path, cfg: &CoordConfig)
 
 #[test]
 fn crash_between_effect_and_marker_applies_fact_exactly_once() {
+    let _seam = seam_guard();
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = tmp.path().join("store");
     let cfg = CoordConfig::for_store(&store);
@@ -178,6 +232,7 @@ fn crash_between_effect_and_marker_applies_fact_exactly_once() {
 
 #[test]
 fn crash_between_effect_and_marker_does_not_duplicate_or_double_bump_episode() {
+    let _seam = seam_guard();
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = tmp.path().join("store");
     let cfg = CoordConfig::for_store(&store);
@@ -218,5 +273,83 @@ fn crash_between_effect_and_marker_does_not_duplicate_or_double_bump_episode() {
         after_replay[0], temporal_after_crash,
         "the episode's temporal_index must not be double-bumped on replay \
          (create-only bump / get-before-put)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// [F2-residual, MEDIUM] non-idempotent UpsertFact reuse (`dedup::reuse_fact`)
+// ---------------------------------------------------------------------------
+//
+// Round-2 made the CREATE-family effects replay-safe with deterministic ids, and
+// `RecordAccess` replay-safe with a `last_access_intent` stamp. But `reuse_fact`
+// (reached when an `UpsertFact` dedup-HITS an existing fact) was left as a
+// non-idempotent read-modify-write: `usage_count = existing.usage_count + 1`.
+// It gets no deterministic id and no intent stamp, so a crash landing in the
+// effect->marker window makes the durable-but-un-marked bump replay and
+// double-count (5 -> 6 on the first apply, 6 -> 7 on the replay).
+//
+// NOTE ON THE FIX. `set_checkpoint_interval(0)` on the applier store (applied in
+// `src/coord/applier.rs`) does NOT by itself close this: un-checkpointed WAL
+// writes are replayed on reopen (the store's own `open_with_recovery_survives_*`
+// tests rely on exactly that), so the effect is durable at its own write, not at
+// a checkpoint — the effect<->marker window is a per-write boundary. The
+// load-bearing fix is per-effect replay-safety: `reuse_fact` now stamps the node
+// with `last_reuse_intent = sem_{intent_id}` (the applier's per-intent id) and
+// skips the bump when the stamp already matches, mirroring `apply_record_access`.
+//
+// This test proves that stamp guard is present and NON-VACUOUS: removing the
+// `last_reuse_intent` stamp/skip from `reuse_fact` reintroduces the
+// double-increment (final `usage_count == base + 2` instead of `base + 1`).
+#[test]
+fn crash_between_effect_and_marker_bumps_reused_fact_usage_exactly_once() {
+    let _seam = seam_guard();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = tmp.path().join("store");
+    let cfg = CoordConfig::for_store(&store);
+    provision(&cfg);
+
+    let w = WriterClient::connect(&cfg).expect("connect");
+
+    // Seed the fact (first UpsertFact INSERTs — no dedup hit yet). Drain cleanly
+    // so it is applied, marked, and the applied-index advances past it.
+    w.append(&upsert_exact("reuse", "reuse-me"))
+        .expect("append seed");
+    {
+        let mut a = Applier::open(&store, "daemon", &cfg).expect("seed daemon opens");
+        a.drain().expect("seed daemon drains cleanly");
+    }
+    let base = usage_count(&store, "reuse-me");
+
+    // A second UpsertFact with identical concept+content HITS the seed via
+    // ExactContentHash -> `reuse_fact` runs and bumps usage_count.
+    w.append(&upsert_exact("reuse", "reuse-me"))
+        .expect("append reuse");
+
+    // Daemon crashes in the effect->marker window: the reuse effect is applied +
+    // checkpointed (usage_count durably base+1), then the crash fires BEFORE the
+    // marker and BEFORE the applied-index advances.
+    drain_crashing_after_first_effect(&store, &cfg);
+
+    assert_eq!(
+        usage_count(&store, "reuse-me"),
+        base + 1,
+        "the reuse must bump usage_count exactly once and be durable after the \
+         injected crash (effect checkpointed, marker not yet written)"
+    );
+
+    // Fresh daemon: marker absent + index un-advanced, so it RE-READS the same
+    // UpsertFact and re-applies `reuse_fact`. The `last_reuse_intent` stamp
+    // (durable with the prior bump) must collapse the replay to a no-op bump.
+    {
+        let mut a = Applier::open(&store, "daemon", &cfg).expect("resuming daemon opens");
+        a.drain().expect("resuming daemon drains cleanly");
+    }
+
+    assert_eq!(
+        usage_count(&store, "reuse-me"),
+        base + 1,
+        "usage_count must advance by EXACTLY 1 across the effect<->marker crash \
+         window (the reuse intent-stamp guard collapses the replay). Removing the \
+         `last_reuse_intent` stamp reintroduces the double-increment (base + 2)."
     );
 }
