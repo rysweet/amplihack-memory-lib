@@ -22,11 +22,17 @@
 //!   process is visible after `close` + reopen.
 //! * **Durability** — writes are serialized through a [`Mutex`](std::sync::Mutex), every mutating
 //!   operation issues a per-write `fsync` barrier (data file + parent
-//!   directory), and `close` issues a `CHECKPOINT` so a subsequent reopen sees
-//!   all committed writes. Without the barrier a crash between two writes could
-//!   lose an acknowledged write, since LadybugDB only flushes its WAL on
-//!   `Database::drop`.
-//! * **Bounded crash loss** — the store auto-checkpoints after every
+//!   directory), and `close` issues a `CHECKPOINT` **followed by that same fsync
+//!   barrier** so a subsequent reopen sees all committed writes. Without the
+//!   barrier a crash between two writes — or immediately after a clean close —
+//!   could lose an acknowledged write, since LadybugDB only flushes its WAL on
+//!   `Database::drop`, and a checkpoint whose WAL fold + rename never reached
+//!   disk would leave the next open a torn WAL that fails checksum (#4687).
+//! * **Bounded crash loss** — the store is the *single* checkpoint owner: the
+//!   engine's own background auto-checkpoint is **disabled** on the read-write
+//!   path ([`RW_ENGINE_AUTO_CHECKPOINT`](crate::graph::lbug_store::RW_ENGINE_AUTO_CHECKPOINT))
+//!   so it cannot race the store on the WAL rename, and the store instead
+//!   checkpoints after every
 //!   [`AUTO_CHECKPOINT_WRITES`](crate::graph::lbug_store::AUTO_CHECKPOINT_WRITES) mutating operations (and always on `close` /
 //!   `Drop`), flushing the write-ahead log into the main database file. An
 //!   unclean shutdown therefore loses at most the handful of writes accumulated
@@ -76,7 +82,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lbug::{Connection, Database, SystemConfig, Value};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::graph::protocol::GraphStore;
 use crate::graph::types::{Direction, GraphEdge, GraphNode};
@@ -87,6 +93,26 @@ use crate::MemoryError;
 /// much acknowledged-but-uncheckpointed data an unclean shutdown can strand in
 /// the WAL (and therefore put at risk if that WAL is later found corrupt).
 pub const AUTO_CHECKPOINT_WRITES: u64 = 128;
+
+/// Whether the LadybugDB engine's **own** background auto-checkpoint is enabled
+/// on a read-write open.
+///
+/// It is **disabled** (#4687). This wrapper is the *single* checkpoint owner:
+/// it checkpoints every [`AUTO_CHECKPOINT_WRITES`] writes
+/// ([`LbugGraphStore::note_write_and_maybe_checkpoint`]) and once more on
+/// [`Drop`](LbugGraphStore::drop), each followed by an fsync durability barrier.
+/// Leaving the engine's background checkpointer enabled created a *second*
+/// checkpoint owner that raced the wrapper on the
+/// `<db>.wal -> <db>.wal.checkpoint` rename: the loser observed the WAL already
+/// renamed and failed with `Error renaming file … No such file or directory`,
+/// and the concurrent WAL manipulation corrupted the log checksum, so the next
+/// open failed replay ("Checksum verification failed, the WAL file is
+/// corrupted") and silently truncated the tail. Disabling the engine's
+/// checkpointer makes the wrapper the sole owner, so the rename can never race
+/// and the WAL can never be mutated by two checkpointers at once. The read-only
+/// peek config (`read_only_system_config`) already disables it; this pins the
+/// same invariant on the read-write path.
+pub(crate) const RW_ENGINE_AUTO_CHECKPOINT: bool = false;
 
 /// Environment variable overriding the LadybugDB buffer-pool size cap, in bytes.
 ///
@@ -367,11 +393,18 @@ impl LbugGraphStore {
                             recovered_records: recovered,
                             quarantined_wal: copied.clone(),
                         };
-                        warn!(
+                        let events = wal_metrics::record_wal_recovery_event();
+                        error!(
                             db_path = %db_path.display(),
                             recovered_records = recovered,
                             quarantined_wal = ?copied,
-                            "lbug_store: recovered from corrupt WAL (good prefix replayed + checkpointed)"
+                            monotonic_counter.cognitive_memory_wal_recovery_total = 1_u64,
+                            wal_recovery_events = events,
+                            "lbug_store: recovered from corrupt WAL — replayed the good prefix \
+                             and checkpointed it; the corrupt tail was quarantined and its \
+                             most-recent (uncheckpointed) writes could not be replayed. \
+                             Surfaced as an explicit error + metric (#4687), never a silent \
+                             truncation. A cleanly-closed store never reaches this path."
                         );
                         Ok((store, report))
                     }
@@ -416,10 +449,16 @@ impl LbugGraphStore {
                             recovered_records: recovered,
                             quarantined_wal: moved.or(copied),
                         };
-                        warn!(
+                        let events = wal_metrics::record_wal_recovery_event();
+                        error!(
                             db_path = %db_path.display(),
                             recovered_records = recovered,
-                            "lbug_store: opened from last checkpoint after unrecoverable WAL"
+                            monotonic_counter.cognitive_memory_wal_recovery_total = 1_u64,
+                            wal_recovery_events = events,
+                            "lbug_store: opened from last checkpoint after an unrecoverable WAL — \
+                             the entire uncheckpointed WAL tail was quarantined and could not be \
+                             replayed. Surfaced as an explicit error + metric (#4687); committed \
+                             writes made since the last checkpoint may have been lost."
                         );
                         Ok((store, report))
                     }
@@ -834,8 +873,17 @@ impl LbugGraphStore {
             *self.last_checkpoint_error.borrow_mut() = Some(e.to_string());
             return Err(e);
         }
+        // fsync the folded main database file and its parent directory BEFORE
+        // advancing the write counter, so the checkpoint's WAL fold + rename is
+        // durable and a crash can never leave it half-applied with the counter
+        // already reset (#4687 fsync-before-advance ordering). A barrier failure
+        // is surfaced (not swallowed) and leaves the counter unreset so the next
+        // write retries the checkpoint.
+        if let Err(e) = self.post_write_barrier() {
+            *self.last_checkpoint_error.borrow_mut() = Some(e.to_string());
+            return Err(e);
+        }
         self.writes_since_checkpoint.set(0);
-        self.post_write_barrier()?;
         *self.last_checkpoint_error.borrow_mut() = None;
         Ok(())
     }
@@ -1303,8 +1351,20 @@ impl LbugGraphStore {
 impl Drop for LbugGraphStore {
     /// Always-on durability: checkpoint the WAL into the main database file when
     /// the store is dropped, so even a forgotten `close` leaves the data durable
-    /// without an unbounded WAL to replay. Best-effort and silent on error —
-    /// LadybugDB also force-checkpoints on its own drop as a backstop.
+    /// without an unbounded WAL to replay.
+    ///
+    /// Unlike a bare `CHECKPOINT`, this runs the full [`do_checkpoint`] path,
+    /// which fsyncs the folded main file and its parent directory *after* the
+    /// checkpoint (#4687). Without that barrier a clean shutdown could return
+    /// before the engine's WAL fold + `<db>.wal -> <db>.wal.checkpoint` rename
+    /// reached disk, so the next open would find a dangling / torn WAL and fail
+    /// checksum verification — the exact "corrupt WAL on every start" incident.
+    /// With the barrier, a cleanly-closed store replays with zero loss.
+    ///
+    /// Best-effort and silent on error — LadybugDB also force-checkpoints on its
+    /// own drop as a backstop.
+    ///
+    /// [`do_checkpoint`]: LbugGraphStore::do_checkpoint
     fn drop(&mut self) {
         // #107: a sealed store must never checkpoint on drop either — that would
         // upgrade an apparently-empty store to v41 and destroy the rollback path.
@@ -1314,7 +1374,9 @@ impl Drop for LbugGraphStore {
             );
             return;
         }
-        if let Err(e) = self.execute("CHECKPOINT") {
+        // The store is being dropped (`&mut self`, sole owner) so no other thread
+        // can hold the write lock; `do_checkpoint` needs no additional guard.
+        if let Err(e) = self.do_checkpoint() {
             debug!("lbug_store: checkpoint on drop failed (engine will retry): {e}");
         }
     }
@@ -1323,6 +1385,41 @@ impl Drop for LbugGraphStore {
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// Process-global observability for corrupt-WAL recovery events (#4687).
+///
+/// The crate emits only `tracing`, so a "metric" is a structured tracing event a
+/// downstream OTel layer scrapes (`monotonic_counter.*` fields are consumed by
+/// `tracing-opentelemetry`'s `MetricsLayer`). This counter additionally exposes
+/// the same event to in-process consumers and tests.
+///
+/// It counts every store open that had to recover a good WAL prefix while a
+/// corrupt tail was quarantined — i.e. every open where the most-recent,
+/// uncheckpointed writes were at risk. A **cleanly-closed** store must NEVER
+/// increment it (its WAL replays in full after the fsync-durable drop
+/// checkpoint); a non-zero count is an explicit, alertable signal that committed
+/// writes may have been dropped, replacing the previously-silent "recovered from
+/// corrupt WAL (good prefix)" truncation.
+pub mod wal_metrics {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static WAL_RECOVERY_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+    /// Record one corrupt-WAL recovery event; returns the new running total.
+    pub(crate) fn record_wal_recovery_event() -> u64 {
+        WAL_RECOVERY_EVENTS.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Total corrupt-WAL recovery events observed this process.
+    ///
+    /// A non-zero, growing count is the explicit #4687 signal that a store had to
+    /// recover a good WAL prefix while a corrupt tail was quarantined — i.e. that
+    /// the most-recent uncheckpointed writes may have been lost. Exposed so
+    /// consumers can surface it as a health metric.
+    pub fn wal_recovery_event_count() -> u64 {
+        WAL_RECOVERY_EVENTS.load(Ordering::Relaxed)
+    }
+}
 
 /// An in-memory snapshot of every live node and edge in a store.
 ///
@@ -1495,12 +1592,14 @@ pub(crate) fn force_read_error_for_test() -> bool {
 /// `max_db_size` is only an mmap reservation, so the larger caps cost nothing
 /// until data actually needs them.
 ///
-/// `auto_checkpoint(true)` lets LadybugDB bound the WAL on its own as a safety
-/// net; the store additionally checkpoints every [`AUTO_CHECKPOINT_WRITES`]
-/// writes (see [`LbugGraphStore::note_write_and_maybe_checkpoint`]).
-/// `throw_on_wal_replay_failure` selects strict vs. resilient WAL replay: strict
-/// (`true`) errors on a corrupt WAL, resilient (`false`) replays the good prefix
-/// and ignores the unreplayable tail.
+/// `auto_checkpoint` is **disabled** on the read-write path (see
+/// [`RW_ENGINE_AUTO_CHECKPOINT`]): this wrapper is the single checkpoint owner,
+/// so the engine's background checkpointer cannot race it on the WAL rename
+/// (#4687). The store checkpoints every [`AUTO_CHECKPOINT_WRITES`] writes (see
+/// [`LbugGraphStore::note_write_and_maybe_checkpoint`]) and once more on drop,
+/// each with an fsync barrier. `throw_on_wal_replay_failure` selects strict vs.
+/// resilient WAL replay: strict (`true`) errors on a corrupt WAL, resilient
+/// (`false`) replays the good prefix and ignores the unreplayable tail.
 fn system_config(throw_on_wal_replay_failure: bool) -> SystemConfig {
     let buffer_env = std::env::var(ENV_BUFFER_POOL_BYTES).ok();
     let max_db_env = std::env::var(ENV_MAX_DB_BYTES).ok();
@@ -1509,7 +1608,7 @@ fn system_config(throw_on_wal_replay_failure: bool) -> SystemConfig {
     SystemConfig::default()
         .max_db_size(max_db)
         .buffer_pool_size(buffer_pool)
-        .auto_checkpoint(true)
+        .auto_checkpoint(RW_ENGINE_AUTO_CHECKPOINT)
         .throw_on_wal_replay_failure(throw_on_wal_replay_failure)
 }
 

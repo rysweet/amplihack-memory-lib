@@ -28,6 +28,9 @@ pub use in_memory_store::InMemoryGraphStore;
 /// Kùzu-backed graph store implementation.
 #[cfg(feature = "kuzu")]
 pub use kuzu_store::KuzuGraphStore;
+/// Process-global count of corrupt-WAL recovery events (#4687 telemetry).
+#[cfg(feature = "persistent")]
+pub use lbug_store::wal_metrics::wal_recovery_event_count;
 /// LadybugDB-backed persistent graph store implementation.
 #[cfg(feature = "persistent")]
 pub use lbug_store::{LbugGraphStore, WalRecovery, WalRecoveryOutcome};
