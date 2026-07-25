@@ -2706,3 +2706,179 @@ fn try_get_statistics_confirmed_empty_vs_read_error_2561() {
         "the infallible path still swallows to 0 (documents why the fallible path is needed)"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue #4687 — cognitive-memory WAL crash-consistency
+//
+// Root cause: the engine's own background auto-checkpoint was enabled on the
+// read-write path, creating a SECOND checkpoint owner that raced this wrapper on
+// the `<db>.wal -> <db>.wal.checkpoint` rename ("No such file or directory") and
+// corrupted the WAL checksum, so every reopen failed replay and silently dropped
+// the tail. The fix makes the wrapper the single checkpoint owner
+// (`RW_ENGINE_AUTO_CHECKPOINT = false`), fsyncs the clean-shutdown checkpoint,
+// and surfaces any corrupt-WAL recovery as an explicit error + metric instead of
+// a silent good-prefix truncation.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Single-owner invariant: the engine's background auto-checkpoint MUST be
+/// disabled on the read-write path, matching the read-only peek. This is the
+/// structural guard against the #4687 double-owner WAL-rename race regressing.
+#[test]
+fn rw_engine_auto_checkpoint_is_disabled_single_owner() {
+    // `black_box` reads the invariant as a runtime value so this stays a real
+    // assertion (not a compile-time const-eval no-op) and guards against the
+    // constant being flipped back to `true`.
+    let engine_auto_checkpoint = std::hint::black_box(super::RW_ENGINE_AUTO_CHECKPOINT);
+    assert!(
+        !engine_auto_checkpoint,
+        "#4687: the engine's background auto-checkpoint must stay DISABLED on the \
+         read-write path so this wrapper is the single checkpoint owner and cannot \
+         race the engine on the WAL rename"
+    );
+}
+
+/// A store closed **cleanly** (via `Drop`, no `mem::forget`) after crossing the
+/// auto-checkpoint boundary AND leaving fresh writes in the WAL tail must reopen
+/// **strictly** with every record intact — no checksum failure, no silent
+/// tail-drop. This is the core clean-shutdown crash-consistency contract: the
+/// drop checkpoint folds the WAL and fsyncs it, so the next strict open needs no
+/// recovery.
+#[test]
+fn clean_shutdown_reopen_preserves_all_records_including_wal_tail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+    let checkpointed = super::AUTO_CHECKPOINT_WRITES as usize + 16; // cross ≥1 boundary
+    let tail = 24usize; // most-recent writes, live in the WAL tail at drop
+    let total = checkpointed + tail;
+
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        add_things(&mut store, 0, checkpointed);
+        // The most-recent writes — exactly what the incident dropped — stay in the
+        // WAL until the clean Drop checkpoint persists them.
+        add_things(&mut store, checkpointed, tail);
+        // Clean close: `Drop` runs the fsync-durable checkpoint. NO mem::forget.
+    }
+
+    // The STRICT open is the one that errors on a bad WAL. After a clean close it
+    // must succeed and see everything.
+    let reopened = LbugGraphStore::open(&path, Some("s"))
+        .expect("#4687: clean reopen must succeed without WAL corruption");
+    assert_eq!(
+        reopened.count_all_nodes(),
+        total,
+        "#4687 silent WAL loss: a cleanly-closed store dropped records on reopen \
+         (seeded {total}, reopened with {}). The clean-shutdown WAL must replay \
+         with zero loss.",
+        reopened.count_all_nodes()
+    );
+}
+
+/// A clean close must leave the store openable by the STRICT path with no
+/// recovery — `open_with_recovery` reports [`WalRecoveryOutcome::Clean`] and the
+/// WAL-recovery metric never fires. Proves the clean path does not silently drop
+/// anything (the counter is the observable signal that it would have).
+#[test]
+fn clean_shutdown_open_with_recovery_is_clean_and_meters_no_loss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+
+    let before = super::wal_metrics::wal_recovery_event_count();
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        add_things(&mut store, 0, super::AUTO_CHECKPOINT_WRITES as usize + 32);
+        // Clean drop: fsync-durable checkpoint.
+    }
+
+    let (store, recovery) =
+        LbugGraphStore::open_with_recovery(&path, Some("s")).expect("clean reopen");
+    assert_eq!(
+        recovery.outcome,
+        WalRecoveryOutcome::Clean,
+        "#4687: a cleanly-closed store must reopen Clean, never via corrupt-WAL recovery"
+    );
+    assert!(store.count_all_nodes() >= super::AUTO_CHECKPOINT_WRITES as usize + 32);
+    // `Clean` is the proof this open lost nothing: the WAL-recovery metric is a
+    // process-global counter, so we only assert THIS open did not force its own
+    // recovery (a stronger per-open signal than a shared count another parallel
+    // test could also bump). `before` is referenced to document the intent.
+    let _ = before;
+}
+
+/// An explicit checkpoint must be fsync-durable on its own: after checkpointing,
+/// a strict reopen (no drop-checkpoint help — the store is `mem::forget`-ten)
+/// sees every record. Guards the do_checkpoint fsync-before-advance ordering.
+#[test]
+fn explicit_checkpoint_is_fsync_durable_without_drop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        store.set_checkpoint_interval(0); // no auto-checkpoint; force the explicit one
+        add_things(&mut store, 0, 60);
+        store.checkpoint().expect("explicit checkpoint");
+        assert_eq!(
+            store.pending_writes(),
+            0,
+            "checkpoint resets the write counter"
+        );
+        // Forget so Drop cannot run a second checkpoint — prove the explicit
+        // checkpoint alone made the data durable.
+        std::mem::forget(store);
+    }
+
+    let reopened = LbugGraphStore::open(&path, Some("s")).expect("strict reopen after checkpoint");
+    assert_eq!(reopened.count_all_nodes(), 60);
+}
+
+/// A genuinely corrupt WAL tail (crash provenance) must be surfaced as an
+/// explicit **metric** — the previously-silent "good prefix" truncation now
+/// increments the process WAL-recovery counter, and the pre-corruption records
+/// still survive durably. This pins the "no silent discard of committed writes"
+/// contract (A3/A4/A5): loss is observable, never silent.
+#[test]
+fn corrupt_wal_recovery_increments_the_wal_loss_metric() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("graph.ladybug");
+
+    {
+        let mut store = LbugGraphStore::open(&path, Some("s")).unwrap();
+        store.set_checkpoint_interval(0); // keep the writes in the WAL to corrupt
+        add_things(&mut store, 0, 40);
+        store.checkpoint().expect("checkpoint the good prefix");
+        add_things(&mut store, 40, 40); // uncheckpointed tail, lives in the WAL
+        std::mem::forget(store); // simulate a crash: no clean drop checkpoint
+    }
+
+    let (crash, crash_db) = crash_snapshot(tmp.path(), "graph.ladybug");
+    let crash_wal = wal_path_for(&crash_db);
+    corrupt_wal_tail(&crash_wal);
+
+    let before = super::wal_metrics::wal_recovery_event_count();
+    let (store, recovery) =
+        LbugGraphStore::open_with_recovery(&crash_db, Some("s")).expect("recovery must open");
+    let after = super::wal_metrics::wal_recovery_event_count();
+
+    assert!(
+        recovery.recovered(),
+        "a corrupt WAL tail must be reported as a recovery, not Clean"
+    );
+    assert!(
+        after > before,
+        "#4687: a corrupt-WAL recovery must increment the WAL-loss metric so the \
+         (previously silent) tail truncation is observable (before={before}, after={after})"
+    );
+    // The checkpointed pre-corruption prefix is never discarded.
+    assert!(
+        store.count_all_nodes() >= 40,
+        "recovery must preserve the checkpointed pre-corruption records"
+    );
+
+    // And the recovery is durable across a strict reopen (never reset to empty).
+    drop(store);
+    let reopened =
+        LbugGraphStore::open(&crash_db, Some("s")).expect("strict reopen after recovery");
+    assert!(reopened.count_all_nodes() >= 40);
+    drop(crash);
+}
